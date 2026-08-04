@@ -325,3 +325,55 @@ fn unknown_one_time_prekey_id_is_rejected() {
     );
     assert!(matches!(result, Err(Error::UnknownOneTimePreKey)));
 }
+
+/// `PreKeyBundle::write`/`read` take this crate's own private
+/// `Writer`/`Reader`, so nothing outside the crate could previously
+/// serialize a bundle at all — a real gap, since this module's own doc
+/// calls the bundle "published key material" and X3DH's entire
+/// asynchronous property depends on a bundle actually reaching an
+/// initiator somehow. `to_bytes`/`from_bytes` are the public door;
+/// this proves the round trip preserves everything `initiate` needs,
+/// with and without a one-time prekey.
+#[test]
+fn bundle_survives_a_to_bytes_from_bytes_round_trip() {
+    for with_opk in [false, true] {
+        let responder = make_responder(with_opk);
+        let peer_bundle = bundle(&responder);
+
+        let bytes = peer_bundle.to_bytes();
+        let recovered = PreKeyBundle::from_bytes(&bytes).unwrap();
+        recovered.verify().unwrap();
+
+        let initiator_identity = Identity::generate();
+        let initiator_dh = DhIdentity::generate();
+        let initiated = initiate(
+            &initiator_identity.public(),
+            &initiator_dh,
+            &recovered,
+            b"round-tripped bundle still works",
+        )
+        .unwrap();
+
+        let mut responder = responder;
+        let responded = respond(
+            &responder.dh_identity,
+            &responder.spk,
+            &mut responder.opks,
+            &initiated.message.bytes,
+        )
+        .unwrap();
+
+        assert_eq!(
+            responded.initial_payload,
+            b"round-tripped bundle still works"
+        );
+    }
+}
+
+/// Bytes that aren't a valid bundle at all — not just a corrupted real
+/// one — are rejected with an error, not a panic.
+#[test]
+fn from_bytes_rejects_garbage() {
+    let result = PreKeyBundle::from_bytes(&[0u8; 4]);
+    assert!(result.is_err());
+}

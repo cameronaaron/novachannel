@@ -319,4 +319,25 @@ impl PreKeyBundle {
             one_time_prekey,
         })
     }
+
+    /// Serializes this bundle to bytes — the actual "publish this
+    /// somewhere fetchable" step X3DH's asynchrony depends on
+    /// (this module's own doc: the bundle "is published key material").
+    /// [`Self::write`]/[`Self::read`] exist but take this crate's own
+    /// private [`Writer`]/[`Reader`], so nothing outside the crate could
+    /// previously call them — the bundle had a documented purpose and no
+    /// public way to fulfil it. Same shape as `winterfell::Proof::to_bytes`,
+    /// which this workspace's own `novachannel-rln` integration already
+    /// relies on for the equivalent problem.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.write(&mut w);
+        w.into_bytes()
+    }
+
+    /// Inverse of [`Self::to_bytes`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes);
+        Self::read(&mut r)
+    }
 }
