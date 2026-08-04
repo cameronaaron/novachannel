@@ -1,0 +1,10 @@
+[package]
+name = "novachannel-rln"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Zero-knowledge rate-limiting nullifiers (RLN) with STARK-proved, hash-based (post-quantum) Merkle membership."
+
+[dependencies]
+winterfell = "0.13"
+rand = "0.8"

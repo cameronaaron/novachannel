@@ -1,0 +1,39 @@
+[package]
+name = "novachannel"
+version = "0.1.0"
+edition = "2021"
+description = "A hybrid classical/post-quantum secure channel: authenticated key exchange plus an AEAD transport."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# Classical AEAD for the data-plane transport.
+chacha20poly1305 = "0.11"
+# Key derivation for the handshake -> transport key schedule.
+hkdf = "0.12"
+sha2 = "0.10"
+# Classical authentication + key exchange.
+ed25519-dalek = { version = "3", features = ["rand_core"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
+# Post-quantum authentication (ML-DSA-65, FIPS 204) + key exchange (ML-KEM-768,
+# FIPS 203) — the final NIST-ratified standards (as of the 2024 finalization),
+# not the pre-standardization "Dilithium"/"Kyber" round-3 submissions this
+# crate used before. Pure Rust (RustCrypto), no C FFI, composed with the
+# classical primitives above so breaking either alone is insufficient.
+ml-dsa = "0.1"
+ml-kem = "0.3"
+kem = "0.3"
+# HMAC-based hash ratchet for the per-message chain key in `ratchet` —
+# already a transitive dependency of `hkdf`, declared directly here because
+# `ratchet.rs` calls it itself rather than going through HKDF-expand.
+hmac = "0.12"
+rand_core = "0.10"
+getrandom = { version = "0.4", features = ["sys_rng"] }
+zeroize = { version = "1", features = ["derive"] }
+thiserror = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
+
+[[example]]
+name = "echo"
+path = "examples/echo.rs"

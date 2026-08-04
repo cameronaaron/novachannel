@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup component add rustfmt clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # This is ENGINEERING-STANDARDS.md §6.1's gate, run exactly as a
+      # human runs it locally — one script, not a shadow copy of its steps
+      # reimplemented in YAML that could silently drift from what
+      # `scripts/check.sh` actually checks.
+      - name: Run the gate
+        run: ./scripts/check.sh

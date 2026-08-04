@@ -1,0 +1,19 @@
+[package]
+name = "novachannel-mpc"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Pedersen/Feldman DKG, FROST threshold signatures, and threshold decryption for distributed mixnode keys — no single operator ever holds the full secret."
+
+[dependencies]
+curve25519-dalek = { version = "5", features = ["rand_core"] }
+rand_core = "0.10"
+getrandom = { version = "0.4", features = ["sys_rng"] }
+sha2 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# Only for tests/frost_signs_rln_root.rs, demonstrating the FROST-signed
+# membership root pattern — not a real dependency of this crate's public
+# API, which stays untied to novachannel-rln (see that test's module doc).
+novachannel-rln = { path = "../rln" }
