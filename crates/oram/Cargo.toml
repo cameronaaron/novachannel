@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Path ORAM: an O(log n)-per-access oblivious storage layer for server-side per-user state."
 
+[lints]
+workspace = true
+
 [dependencies]
 rand = "0.8"
 sha2 = "0.10"

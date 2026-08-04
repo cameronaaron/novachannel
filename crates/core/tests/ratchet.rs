@@ -21,8 +21,18 @@ fn run_handshake() -> (RatchetedSession, RatchetedSession) {
 fn expect_application(opened: Opened) -> Vec<u8> {
     match opened {
         Opened::Application(bytes) => bytes,
-        Opened::RatchetAdvanced { .. } => panic!("expected an application message"),
+        Opened::RatchetAdvanced { .. } => wrong_variant(),
     }
+}
+
+/// Split out from `expect_application` so tarpaulin's item-level exclusion
+/// (`#[cfg(not(tarpaulin_include))]`, see `ENGINEERING-STANDARDS.md` §6.16)
+/// can target just this arm — it fires only when a test itself asserts the
+/// wrong `Opened` variant, never in a passing suite, and isn't reachable
+/// any other way.
+#[cfg(not(tarpaulin_include))]
+fn wrong_variant() -> ! {
+    panic!("expected an application message")
 }
 
 #[test]

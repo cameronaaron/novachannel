@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Zero-knowledge rate-limiting nullifiers (RLN) with STARK-proved, hash-based (post-quantum) Merkle membership."
 
+[lints]
+workspace = true
+
 [dependencies]
 winterfell = "0.13"
 rand = "0.8"

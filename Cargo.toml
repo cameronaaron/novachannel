@@ -12,5 +12,15 @@ members = [
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
+[workspace.lints.rust]
+# `tarpaulin_include` isn't a cfg rustc knows about on its own — tarpaulin's
+# coverage reporter recognizes `#[cfg(not(tarpaulin_include))]` as a marker
+# on items that are never meant to execute in a passing test suite (e.g. a
+# test helper's "this branch means the test itself is wrong" panic arm) and
+# excludes them from coverage accounting. It doesn't change what compiles or
+# runs — see `ENGINEERING-STANDARDS.md` §6.16 — so without this the marker
+# would just be flagged as an unrecognized cfg under `-D warnings`.
+unexpected_cfgs = { level = "allow", check-cfg = ["cfg(tarpaulin_include)"] }
+
 [profile.release]
 overflow-checks = true

@@ -788,3 +788,35 @@ as a real gap or hidden by writing tests to satisfy a number that may not
 reflect real coverage.
 
 Final state: 86 tests (up from 49), full `scripts/check.sh` green.
+
+**Coverage exemptions, applied narrowly.** Tarpaulin supports
+`#[cfg(not(tarpaulin_include))]` (declared in `[workspace.lints.rust]` in
+the root `Cargo.toml`, since it isn't a real cfg rustc knows about — it's a
+marker tarpaulin's own reporter parses, which is why it needs a
+`check-cfg` allowlist entry to avoid an `unexpected_cfgs` warning under
+`-D warnings`, and why it changes nothing about what compiles or runs).
+It only excludes whole *items*, not individual lines within a function —
+which doesn't fit this codebase's actual pattern of inline `.expect()`
+calls, and after this pass there's little left in `core`/`dp`/`mpc`/`oram`
+that's genuinely unreachable rather than already tested. The one clean
+match: `crates/core/tests/ratchet.rs`'s `expect_application` test helper
+had a `panic!` arm that only fires if a test itself asserts the wrong
+`Opened` variant — never in a passing suite. Split into its own
+`wrong_variant() -> !` function tagged `#[cfg(not(tarpaulin_include))]` so
+the exclusion targets exactly that, without also hiding
+`expect_application`'s real (and genuinely exercised) success path.
+
+Two things were deliberately *not* exempted, because doing so would be
+dishonest rather than accurate:
+
+- `novachannel-rln`'s `air.rs`/`lib.rs` numbers, still low under
+  `--release` — that code **is** exercised by `tests/rln.rs` on every run;
+  tarpaulin just under-attributes it due to release-mode inlining (see
+  above). Marking it `tarpaulin_include`-excluded would misrepresent
+  tested code as "decided untestable," the opposite of what the exclusion
+  is for.
+- The match-arm *dispatch line* itself (`=> wrong_variant()`) still shows
+  as uncovered even after the split — hiding the panic's body doesn't
+  hide the fact that this branch was never taken, and it shouldn't: "this
+  branch never executed" is true, real information whether the branch
+  exists by design or by accident, and no coverage tool should erase it.

@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Differential-privacy-calibrated dummy traffic scheduling for metadata protection."
 
+[lints]
+workspace = true
+
 [dependencies]
 rand = "0.8"
 

@@ -5,6 +5,9 @@ edition = "2021"
 description = "A hybrid classical/post-quantum secure channel: authenticated key exchange plus an AEAD transport."
 license = "MIT OR Apache-2.0"
 
+[lints]
+workspace = true
+
 [dependencies]
 # Classical AEAD for the data-plane transport.
 chacha20poly1305 = "0.11"
