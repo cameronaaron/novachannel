@@ -49,14 +49,19 @@
 #![warn(clippy::unwrap_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+mod erasure;
 pub mod error;
 pub mod handshake;
 pub mod identity;
 pub mod kex;
+pub mod multidevice;
+pub mod prekey;
 pub mod ratchet;
 mod rng;
+pub mod sealed_sender;
 pub mod transport;
 mod wire;
+pub mod x3dh;
 
 pub use error::{Error, Result};
 pub use handshake::{
@@ -64,5 +69,13 @@ pub use handshake::{
     ResponderHandshakeState,
 };
 pub use identity::{HybridSignature, Identity, PublicIdentity};
-pub use ratchet::{Opened, RatchetedSession};
+pub use multidevice::{
+    DeviceId, DeviceListEntry, MultiDeviceSession, ReceivingDevice, RemoteAccount, SignedDeviceList,
+};
+pub use prekey::{
+    DhIdentity, OneTimePreKey, OneTimePreKeyStore, PreKeyBundle, SealingPublicKey, SignedPreKey,
+};
+pub use ratchet::{ChunkOutcome, ChunkProgress, Opened, RatchetedSession};
+pub use sealed_sender::{SealedEnvelope, SenderCertificate, UnsealedMessage};
 pub use transport::{Receiver, Sender};
+pub use x3dh::{initiate, respond, InitMessage, InitiatedSession, RespondedSession};

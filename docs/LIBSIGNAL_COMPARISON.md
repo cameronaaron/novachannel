@@ -83,6 +83,22 @@ tolerance the way the base transport has), and it has ordinary adversarial
 unit tests, not hax/F*/ProVerif-level formal verification. A real,
 useful, honestly-scoped gap-closer — not a claim of parity with SPQR.
 
+A subsequent addition (`ENGINEERING-STANDARDS.md` §6.17,
+`docs/SYSTEMIZATION.md` §4.1.1) narrows the *shape* gap further without
+closing the *verification* one: `initiate_incremental_ratchet` splits the
+same re-key material into erasure-coded chunks tolerant of losing some of
+them, closer to SPQR's chunked design than the one-shot path is. It still
+serializes ordinary ML-KEM-768 bytes and splits those, rather than
+re-encoding the KEM algorithm's internal structure the way SPQR's
+`incremental_mlkem768` does, and its erasure code has the same
+"reference implementation, not independently cryptanalyzed" status as
+`NovaRescue` (§1 below). Building it surfaced that chunks *cannot* be
+routed through the base ratchet's own strict-ordering `seal`/`open` — a
+finding demonstrated by a failing test, not just reasoned about — and a
+second real defect (stale-root-key derivation on chunks arriving after
+reconstruction already completed), both recorded in
+`ENGINEERING-STANDARDS.md` §6.17.
+
 ## 4. A genuine alternative worth naming, not necessarily adopting: Sigma protocols over STARKs
 
 Signal's `zkgroup` (group membership / profile credentials) and `poksho`
@@ -111,16 +127,45 @@ default "obviously correct" choice — a simpler Sigma-protocol RLN would be
 smaller and faster today, and would need replacing the day a
 cryptographically-relevant quantum computer exists.
 
+## 5. Gaps named in an earlier review of this workspace, since closed
+
+An earlier pass compared this workspace against Signal's full protocol
+suite (not just libsignal's Rust crates) and named several pieces Signal
+has that this workspace didn't: an asynchronous, prekey-based handshake
+(X3DH itself, as opposed to `crate::handshake`'s live 3-message
+exchange), sealed sender, and Sesame-style multi-device fan-out. All
+three are now implemented — `crate::x3dh`, `crate::sealed_sender`,
+`crate::multidevice` (`docs/SYSTEMIZATION.md` §4.2–§4.4) — each modeled
+on Signal's own design for the same problem, each with the same "reuse
+what's sound, state the real gap" treatment as everything else in this
+document. What that review also named as *not* attempted, and what
+remains true after this pass: a from-scratch, formally-verified
+post-quantum ratchet matching SPQR exactly (§3 above), Sigma-protocol
+anonymous group credentials matching `zkgroup` (§4 above — a deliberate
+non-adoption, not an oversight), and deniable authentication via a
+redesigned live handshake (`crate::x3dh` achieves deniability for its
+*own* asynchronous path; `crate::handshake`'s live, transcript-signing
+path is unchanged and remains non-repudiable by design, for callers that
+want that instead).
+
 ## Is this workspace production-ready?
 
 No, and the specific reasons (not a hedge):
 
 - `NovaRescue` (the RLN in-circuit hash) has had zero independent
   cryptanalysis (`docs/SYSTEMIZATION.md` §3.2, §9).
-- The ratchet added per §3 gives real forward secrecy and post-compromise
-  security, but is a synchronous, one-shot, hand-tested design, not
-  SPQR's chunked/erasure-coded, hax/F*/ProVerif-verified one — see §3 for
-  the precise gap that remains between the two.
+- The incremental ratchet's erasure code (`docs/SYSTEMIZATION.md` §4.1.1)
+  has the same status: a from-scratch construction, checked by this
+  project's own tests, not independently cryptanalyzed.
+- The ratchet (either variant) gives real forward secrecy and
+  post-compromise security, but is a hand-tested design, not SPQR's
+  hax/F*/ProVerif-verified one — see §3 for the precise gap that remains.
+- `crate::multidevice::SignedDeviceList` authenticates an account's
+  device list and blocks version rollback, but this crate still has no
+  directory service to deliver one over — fetching a list and trusting
+  its signer remain the caller's problem (`docs/SYSTEMIZATION.md` §4.4,
+  §9). `RemoteAccount::new`/`add_device` also remain available fully
+  unauthenticated, so using the signed path is opt-in, not enforced.
 - No fuzzing anywhere in this workspace. Signal fuzzes `libsignal-protocol`
   extensively; nothing here has been fuzzed at all.
 - No external security audit of anything in this workspace.

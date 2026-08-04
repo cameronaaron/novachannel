@@ -16,7 +16,7 @@ hkdf = "0.12"
 sha2 = "0.10"
 # Classical authentication + key exchange.
 ed25519-dalek = { version = "3", features = ["rand_core"] }
-x25519-dalek = { version = "3", features = ["static_secrets"] }
+x25519-dalek = { version = "3", features = ["static_secrets", "reusable_secrets", "zeroize"] }
 # Post-quantum authentication (ML-DSA-65, FIPS 204) + key exchange (ML-KEM-768,
 # FIPS 203) — the final NIST-ratified standards (as of the 2024 finalization),
 # not the pre-standardization "Dilithium"/"Kyber" round-3 submissions this

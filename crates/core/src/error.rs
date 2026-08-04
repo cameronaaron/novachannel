@@ -24,6 +24,16 @@ pub enum Error {
     RatchetInProgress,
     #[error("record's epoch is neither the current nor the immediately preceding one")]
     UnknownEpoch,
+    #[error("referenced one-time prekey is unknown or was already consumed")]
+    UnknownOneTimePreKey,
+    #[error("sender certificate's expiry has passed")]
+    CertificateExpired,
+    #[error("no session exists for the referenced device")]
+    UnknownDevice,
+    #[error("device's bundle does not match what the signed device list authorizes")]
+    UnauthorizedDevice,
+    #[error("signed device list version is not newer than the last one accepted")]
+    StaleDeviceList,
 }
 
 pub type Result<T> = core::result::Result<T, Error>;

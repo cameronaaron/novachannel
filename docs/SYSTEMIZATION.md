@@ -10,7 +10,9 @@ publishable, this document says that instead of asserting the claim.
 ## Abstract
 
 `novachannel` is a five-crate Rust workspace implementing a hybrid
-classical/post-quantum secure channel (`novachannel`), zero-knowledge
+classical/post-quantum secure channel (`novachannel`, with async/deniable
+X3DH session establishment, sealed sender, Sesame-style multi-device
+fan-out, and a one-shot or incremental/erasure-coded ratchet), zero-knowledge
 rate-limiting nullifiers over a hash-based STARK
 (`novachannel-rln`), differential-privacy-calibrated cover traffic
 (`novachannel-dp`), oblivious server-side storage
@@ -18,10 +20,12 @@ rate-limiting nullifiers over a hash-based STARK
 signing (`novachannel-mpc`, including FROST). Every non-trivial primitive
 composes standard, published constructions; the contribution here is a
 verified, tested, honestly-scoped *integration* of them into a coherent
-metadata-resistant messaging stack, not a new cryptographic primitive. One
-component (`novachannel-rln`'s in-circuit hash) is genuinely new code and
-is flagged as unvetted rather than presented as equivalent to a
-cryptanalyzed permutation.
+metadata-resistant messaging stack, not a new cryptographic primitive. Two
+components are genuinely new code and flagged as unvetted rather than
+presented as equivalent to a cryptanalyzed construction:
+`novachannel-rln`'s in-circuit hash (§3.2), and the Cauchy-Reed-Solomon
+erasure code the incremental ratchet uses to spread a re-key across
+loss-tolerant chunks (§4.1.1).
 
 ## 1. What "novel" means here, precisely
 
@@ -229,14 +233,153 @@ rather than assumed from its README, is a from-scratch incremental
 re-encoding of ML-KEM-768 spread across multiple round trips with
 Reed-Solomon erasure coding and hax/F*+ProVerif formal verification, which
 is out of reach for a from-scratch build checked only by hand-written
-tests. `novachannel::ratchet` instead does a synchronous, one-shot hybrid
-re-key — a full ~1.2KB KEM payload each way, not spread thin — giving the
-same two named properties through a mechanism small enough to actually
-verify here. It also, unlike the base transport, requires reliable
-in-order delivery (no reordering tolerance), and rejects concurrent
-ratchet initiation from both peers rather than trying to resolve it. Full
-scoping rationale in the module's own doc comment
-(`crates/core/src/ratchet.rs`) and `ENGINEERING-STANDARDS.md` §6.15.
+tests. `novachannel::ratchet`'s *default* re-key
+(`initiate_ratchet`/`handle_step1`/`handle_step2`) instead does a
+synchronous, one-shot hybrid re-key — a full ~1.2KB KEM payload each way,
+not spread thin — giving the same two named properties through a
+mechanism small enough to actually verify here. It also, unlike the base
+transport, requires reliable in-order delivery (no reordering tolerance),
+and rejects concurrent ratchet initiation from both peers rather than
+trying to resolve it. Full scoping rationale in the module's own doc
+comment (`crates/core/src/ratchet.rs`) and `ENGINEERING-STANDARDS.md`
+§6.15.
+
+#### 4.1.1 An incremental, erasure-coded alternative re-key
+
+`RatchetedSession::initiate_incremental_ratchet` /
+`open_ratchet_chunk` offer a second re-key mechanism, closer in *shape* to
+SPQR's chunked, loss-tolerant design without claiming parity with it. The
+same KEX material the one-shot path sends in one message is split into
+`data_shards + parity_shards` independently AEAD-sealed chunks via a new,
+from-scratch systematic Reed–Solomon-style erasure code over GF(2^8)
+(`novachannel::erasure`, Cauchy-matrix construction — the same MDS
+technique already used for `novachannel-rln`'s `NovaRescue` permutation,
+applied here to a linear code instead of a permutation's diffusion layer).
+Any `data_shards` of the resulting chunks, arriving in any order,
+interleaved with anything else, reconstruct the original bytes exactly.
+
+The one real architectural finding from building this: chunks cannot be
+sent through the base ratchet's existing `seal`/`open` — that mechanism
+requires strict, gapless in-order delivery by design (§4.1), so routing
+loss-tolerant chunks through it would mean a single lost chunk
+permanently desyncs the chain, defeating the entire point of erasure
+coding. The incremental re-key's chunks instead travel over their own
+independent AEAD key, derived via HKDF from the session's current
+`root_key` (a value both peers already agree on) mixed with a fresh
+random per-attempt nonce — authenticated and bound to the session without
+depending on the strict sequential chain at all. This was not the first
+design tried: an earlier version *did* route chunks through
+`seal`/`open`'s sequence numbers, and delivering all chunks with none
+missing failed outright (`Error::Replay`/`Decrypt` depending on delivery
+order) — a concrete demonstration, not just an argument, of why the
+strict-ordering assumption and chunk-level loss tolerance are
+incompatible in the same channel.
+
+A second real defect surfaced once chunks were decoupled this way:
+reconstruction completing early (once `data_shards` chunks arrive)
+advances the epoch and its `root_key` immediately, but `parity_shards`
+worth of already-in-flight chunks from that same attempt can still arrive
+*afterward*. Deriving their chunk key from the (now-changed) current
+`root_key` produced spurious AEAD failures on those stragglers — not a
+security bug (nothing forged verified), but a correctness one that would
+have broken any deployment sending more chunks than the strict minimum
+needed. Fixed by remembering the most recently *completed* attempt's
+nonce per direction and short-circuiting stragglers matching it before
+attempting to derive a key at all, found the same way every other defect
+in this workspace was: by testing the full, undiminished chunk set, not
+just a synthetic loss pattern chosen to avoid the bug by construction.
+
+What this does *not* claim relative to SPQR: it serializes the same
+ordinary ML-KEM-768 bytes `kex.rs` already produces and splits *those*
+into shards, rather than re-encoding the KEM algorithm's own internal
+structure the way SPQR's `incremental_mlkem768` does — simpler, but it
+doesn't shrink any single chunk's *meaning*, only its size on the wire.
+Nor is the erasure code itself formally verified — see
+`crates/core/src/erasure.rs`'s own module doc for what was and wasn't
+checked (an exhaustive any-`k`-of-`n` reconstruction test for one
+parameter set, not a proof for all of them).
+
+### 4.2 `x3dh`: asynchronous, deniable session establishment
+
+`crate::handshake` (§4) needs both peers online for a live 3-message
+round trip, and authenticates by *signing the transcript* with each
+party's long-term identity — a real audit-trail feature, and a real cost
+for private messaging, since a leaked or subpoenaed transcript then
+proves who authenticated that specific exchange. `crate::x3dh` is a
+second, additive session-establishment path (producing the same
+`EstablishedSession` type, so it plugs into `ratchet`/`transport`
+unmodified) built on the classic X3DH design Signal's own protocol
+originates from, extended with a hybrid ML-KEM-768 leg the way Signal's
+PQXDH extends it: `crate::prekey::PreKeyBundle` publishes a long-term DH
+identity key, a medium-term signed prekey (DH + ML-KEM, signed once by
+the owner's `Identity` and reused across many sessions), and an optional
+one-time prekey. An initiator combines four Diffie-Hellman terms plus one
+ML-KEM encapsulation (`DH1..DH4 + SS_pq`, module doc for exactly which
+term binds which identity) into the session key in a single message —
+no live round trip needed, and no signature over anything
+session-specific: the only signature anywhere in the scheme covers the
+reused signed-prekey pair, not this particular exchange, which is what
+makes a completed session deniable — either party could derive the same
+session key alone from their own secrets and the other's public keys, so
+neither can prove to a third party the other participated.
+
+### 4.3 `sealed_sender`: hiding who sent a message from whatever relays it
+
+Neither `crate::handshake` nor `crate::x3dh` hides the sender's identity
+from a server or relay routing the bytes between two peers — `crate::x3dh`
+encrypts the sender's identity so only the *recipient* can read it, but a
+relay never needs to open that payload to do its job. `crate::sealed_sender`
+is a distinct, one-shot envelope built for exactly the relay's-eye view,
+modeled on Signal's own sealed sender: a fresh, single-use ephemeral
+hybrid key (X25519 + ML-KEM-768), generated new per message and never
+reused, is the only value an outside observer sees. It's combined with
+the *recipient's* long-term key to derive a one-time AEAD key that seals
+a `SenderCertificate` (the sender's identity, signed by whatever the
+application designates as its trusted issuer — this crate has no
+server/CA of its own, the same stance `crate::handshake` already takes on
+peer-identity provisioning) together with the plaintext. Because nothing
+about the sender's long-term identity ever appears outside that
+encrypted payload, whatever relays the envelope cannot verify the sender
+is legitimate before delivering it — abuse filtering on sealed traffic
+has to happen after the recipient unseals it, the exact tradeoff Signal's
+own sealed sender makes, not an oversight specific to this
+implementation.
+
+### 4.4 `multidevice`: Sesame-style fan-out across an account's devices
+
+Every other module speaks in terms of one session between two parties;
+real accounts have more than one device, each needing its own
+`crate::x3dh` session since there's no secret shared *across* a peer's
+devices to encrypt under once. `crate::multidevice::MultiDeviceSession`
+is the bookkeeping that makes "send one message to this account" fan out
+to a `RatchetedSession` per device the account has published a bundle
+for — modeled on the role Signal's own "Sesame" algorithm plays over
+X3DH/Double Ratchet, and, like Sesame, introducing no new cryptographic
+primitive of its own. `ReceivingDevice` is the fan-*in* counterpart: one
+physical device filing sessions from any number of distinct peer devices
+(even across different peer accounts) into independent, isolated
+sessions keyed by (sender identity, device id).
+
+Trusting *which* devices belong to an account at all is a separate
+problem `RemoteAccount::new`/`add_device` don't solve on their own — a
+MITM controlling wherever bundles are fetched from could otherwise inject
+an unauthorized device. `SignedDeviceList` closes that: the account's own
+long-term signing identity (distinct from any one device's) attests to a
+versioned list of `(device id, identity, DH identity)` triples.
+`RemoteAccount::from_signed_device_list` verifies that signature and
+rejects any supplied bundle whose identity or DH identity doesn't match
+what the list authorizes for its device id, and
+`MultiDeviceSession::sync_from_signed_device_list` additionally rejects a
+list that isn't strictly newer than the last one accepted (blocking a
+rollback that would hide a revocation) and automatically drops sessions
+for devices a newer list no longer includes. What it still does not
+attempt: retroactive history sync to a newly linked device (each
+device's session starts exactly where its own `crate::x3dh` handshake
+began), and *delivering* a `SignedDeviceList` in the first place — this
+crate has no directory service, so fetching one and deciding which
+account key to trust as its signer remain the caller's problem, the same
+scope boundary `crate::handshake` already draws for peer-identity
+provisioning.
 
 ## 5. `novachannel-dp`: formal differential privacy on the presence bit
 
@@ -354,13 +497,23 @@ peer-identity pinning already uses.
 
 ## 8. What was actually verified, and how
 
-86 tests across the workspace, all adversarial where the claim is
-adversarial (not merely "does the happy path run"): tamper, replay,
-wrong-key, wrong-message, below-threshold-quorum, server-tampers-a-bucket,
-server-replays-a-stale-bucket, cross-epoch/same-epoch rate-limit tests, and
+132 tests across the workspace (up from 86), all adversarial where the
+claim is adversarial (not merely "does the happy path run"): tamper,
+replay, wrong-key, wrong-message, below-threshold-quorum,
+server-tampers-a-bucket, server-replays-a-stale-bucket,
+cross-epoch/same-epoch rate-limit tests,
 `novachannel::ratchet`'s epoch-transition/stale-epoch/concurrent-initiation
-tests (§4.1) each try to break a specific stated property rather than
-exercise code paths incidentally. A subsequent line-coverage pass
+tests (§4.1), `crate::x3dh`'s wrong-responder/tampered-payload/consumed-
+one-time-prekey tests (§4.2), `crate::sealed_sender`'s
+wrong-recipient/expired-certificate/swapped-identity tests (§4.3),
+`crate::multidevice`'s cross-account session-isolation test (§4.4), and
+the incremental ratchet's any-order/bounded-loss/exhaustive-shard-
+combination tests (§4.1.1) each try to break a specific stated property
+rather than exercise code paths incidentally — including two real defects
+the incremental ratchet's own test suite caught before this document was
+written (§4.1.1): a strict-ordering/loss-tolerance incompatibility, and
+a stale-root-key bug on chunks arriving after reconstruction already
+completed. A subsequent line-coverage pass
 (`ENGINEERING-STANDARDS.md` §6.16) closed the remaining genuinely-reachable
 gaps rather than chasing a literal 100% — which also found and removed one
 real piece of dead code (`permutation::hash2`, an unused duplicate of
@@ -395,6 +548,27 @@ Stated plainly, per §1:
   reduction (not just adversarial unit tests), comparison against related
   work with matched assumptions, and peer review. None of that exists in
   this repository, and this document does not claim it does.
+- The incremental ratchet's erasure code (§4.1.1) has the same "needs
+  independent cryptanalysis before any deployment claim beyond a
+  reference implementation" status as `NovaRescue` — it's a from-scratch
+  construction, checked against its own stated combinatorial property
+  (any `k`-of-`n` shards reconstruct) exhaustively for one parameter set,
+  not proven for all of them and not reviewed by anyone outside this
+  project.
+- `crate::multidevice::SignedDeviceList` (§4.4) authenticates *which*
+  devices an account currently has and rejects a rollback to a stale
+  version, but this crate still has no directory service to actually
+  deliver one — fetching a list and deciding which account key to trust
+  as its signer remain the caller's problem, the same "trust provisioning
+  is the caller's job" boundary the rest of this workspace draws
+  elsewhere. `RemoteAccount::new`/`add_device` also remain available
+  entirely unauthenticated, for callers that don't use the signed path —
+  using them is opting out of the protection `SignedDeviceList` provides,
+  not a limitation of the mechanism itself.
+- `crate::x3dh`'s deniability argument (§4.2) is the standard textbook
+  X3DH argument, not a formal proof specific to this implementation's
+  exact wire encoding — the property has not been independently checked
+  by anyone outside this project either.
 
 ## Reproducing the claims in this document
 
@@ -406,4 +580,8 @@ cargo test -p novachannel-mpc --release official_test_vector_matches_rfc9591
 cargo test -p novachannel-rln --release   # requires --release; see novachannel_rln::lib docs
 cargo run -p novachannel-rln --release --example proof_size   # §3.2's proof-size table
 cargo test -p novachannel-mpc --release --test frost_signs_rln_root
+cargo test -p novachannel --release --test x3dh
+cargo test -p novachannel --release --test sealed_sender
+cargo test -p novachannel --release --test multidevice
+cargo test -p novachannel --release --test incremental_ratchet
 ```

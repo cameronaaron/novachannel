@@ -53,6 +53,8 @@ was neither elliptic-curve arithmetic nor quantum-resistant). Concretely:
 | §6.14 `unsafe`/`unwrap` discipline promoted from audit to lint, per libsignal | `#![deny(unsafe_code)]` + `#![warn(clippy::unwrap_used)]` in every crate root; `docs/LIBSIGNAL_COMPARISON.md` |
 | §6.15 `novachannel::ratchet`: forward secrecy + post-compromise security, honestly scoped against SPQR | `crates/core/src/ratchet.rs` module docs (reads SPQR's real `src/v1/unchunked/send_ek.rs`, not just its README); `crates/core/tests/ratchet.rs` (10 tests: per-message key independence, tamper does not desync, in-order enforcement, epoch transition, in-flight-during-ratchet delivery, stale-epoch rejection, concurrent-initiation rejection) |
 | §6.16 Real line-coverage gaps closed (not chased to a literal 100%) | 86 tests total (up from 49); `permutation::hash2` (dead code) deleted; `MerkleTree::verify_path`, `share::recover_secret`'s degenerate branch, malformed/trailing-bytes parser paths in `handshake.rs`/`ratchet.rs`, in-order transport delivery now directly tested |
+| §6.17 X3DH, sealed sender, Sesame-style multi-device, and an incremental erasure-coded ratchet — each additive, none replacing already-tested code | `crates/core/src/{x3dh,prekey,sealed_sender,multidevice,erasure}.rs` + their module docs; `crates/core/tests/{x3dh,sealed_sender,multidevice,incremental_ratchet}.rs` (126 tests total, up from 86); two real defects found and fixed in the same change as their regression tests (below) |
+| §6.18 Signed, version-authenticated device lists close `crate::multidevice`'s trust-provisioning gap | `SignedDeviceList`/`RemoteAccount::from_signed_device_list`/`MultiDeviceSession::sync_from_signed_device_list`; `crates/core/tests/multidevice.rs` (6 new tests: mismatched-bundle rejection, unlisted-device rejection, wrong-signer rejection, version-rollback rejection, automatic revocation on a newer list) |
 | §6.2 A fix and its regression test are one change | the RLN Merkle off-by-one fix (§6.3) and `valid_membership_proof_verifies` |
 | §6.8 Dependency hygiene | every crate's declared dependencies are used; checked by grep audit (§6.8), no dead dependency left unresolved |
 | §9 Fair claims about proof/build status | `cargo test -p novachannel-rln --release` documented as the required invocation, with the debug-mode caveat explained rather than hidden |
@@ -820,3 +822,150 @@ dishonest rather than accurate:
   hide the fact that this branch was never taken, and it shouldn't: "this
   branch never executed" is true, real information whether the branch
   exists by design or by accident, and no coverage tool should erase it.
+
+---
+
+### 6.17 X3DH, sealed sender, Sesame-style multi-device, and an incremental erasure-coded ratchet
+
+Four additions, each landed as its own additive module rather than a
+change to already-tested code, each following this document's existing
+patterns rather than inventing new ones:
+
+- `crates/core/src/{prekey,x3dh}.rs`: an asynchronous, deniable
+  alternative to `handshake.rs`'s live 3-message exchange, following
+  X3DH/PQXDH's own design (`docs/SYSTEMIZATION.md` §4.2). Produces the
+  same `EstablishedSession` type `handshake.rs` does — proven directly by
+  `crates/core/tests/x3dh.rs::established_session_plugs_into_the_ratchet_unmodified`,
+  which runs a full `crate::ratchet` session (application message *and* a
+  real ratchet step) over an X3DH-established pair, not just asserted
+  from the type signature matching.
+- `crates/core/src/sealed_sender.rs`: a one-shot envelope hiding sender
+  identity from a relay, modeled on Signal's own sealed sender
+  (`docs/SYSTEMIZATION.md` §4.3). `SenderCertificate::verify` is a
+  separate step from `open` deliberately — the relay never learns enough
+  to check it either way, so pretending `open` could validate trust would
+  misstate what the function actually does.
+- `crates/core/src/multidevice.rs`: Sesame-style fan-out/fan-in across an
+  account's devices (`docs/SYSTEMIZATION.md` §4.4).
+  `two_peer_accounts_sending_to_the_same_receiving_device_stay_isolated`
+  is the sharper of its tests: two different senders' sessions to the
+  same physical device, keyed only by (sender identity, local device id),
+  must never cross-contaminate even when both use the same `DeviceId`
+  value locally — checked by actually decrypting each and asserting the
+  right plaintext comes back, not just checking the sessions are distinct
+  objects.
+- `crates/core/src/erasure.rs` + `ratchet.rs`'s
+  `initiate_incremental_ratchet`/`open_ratchet_chunk`: a from-scratch
+  Cauchy-Reed-Solomon-style erasure code (§0.3's "novelty requires
+  evidence" standard applies here exactly as it does to `NovaRescue` —
+  flagged as unvetted in the module's own doc, not presented as
+  equivalent to a reviewed erasure-coding library) used to split a
+  re-key into loss-tolerant chunks, narrowing (not closing) the gap to
+  SPQR's chunked design named in `docs/LIBSIGNAL_COMPARISON.md` §3.
+
+**Two real defects found building the incremental ratchet, both by
+testing the actual property rather than a synthetic case chosen to avoid
+the bug:**
+
+1. **Strict ordering is fundamentally incompatible with chunk-level loss
+   tolerance, and the first implementation attempt didn't notice until a
+   test caught it.** The first version routed each chunk through
+   `RatchetedSession::seal_payload`/`open_on` — the same strict,
+   gapless, per-record sequence `ratchet.rs`'s own module docs already
+   require or reordering/loss is intolerable. Delivering chunks
+   out of order, or dropping any of them, immediately produced
+   `Error::Replay` or left the chain permanently desynced — not a subtle
+   bug, but one the initial design didn't surface until
+   `chunk_arrival_order_does_not_matter` and
+   `tolerates_losing_up_to_parity_shards_chunks_in_either_direction`
+   were written and failed. The fix was architectural, not a patch: each
+   incremental-ratchet chunk now carries its own AEAD authentication,
+   keyed by HKDF over the session's current `root_key` (a value both
+   peers already agree on) mixed with a fresh random per-attempt nonce,
+   entirely independent of `seal`/`open`'s sequence numbers. This is the
+   same class of finding as §3.3/§6.3's Merkle off-by-one and §6.12's
+   ORAM write-back bug: a black-box symptom (`Replay`/desync) that only
+   pointed at *something* being wrong, root-caused by building the
+   thing that actually needed building (an independent chunk-auth
+   mechanism) rather than patching the symptom (e.g., loosening the
+   replay window, which would have reintroduced exactly the kind of
+   silent-wrongness risk this document's whole premise warns against).
+2. **A stale-root-key bug on chunks arriving after reconstruction already
+   completed.** Once the redesigned chunk-auth mechanism was in place,
+   `full_round_trip_with_no_losses` — delivering *every* chunk, including
+   the `parity_shards` worth beyond the `data_shards` actually needed —
+   still failed with `Error::Decrypt`, while a test that dropped exactly
+   two chunks passed. The two facts together localized it: reconstruction
+   completes and the epoch advances (changing `root_key`) as soon as
+   `data_shards` chunks arrive, but the remaining, already-in-flight
+   chunks from that same attempt can still show up afterward; deriving
+   *their* chunk key from the now-changed `root_key` produced the wrong
+   key, not a forged-ciphertext failure. Fixed by recording the most
+   recently *completed* attempt's nonce per direction
+   (`last_completed_step1_attempt`/`last_completed_step2_attempt`) and
+   short-circuiting a straggler matching it before attempting to derive
+   any key at all, rather than letting it fall through to a decrypt
+   attempt that was always going to fail. Regression test:
+   `straggler_chunks_after_completion_are_ignored_not_treated_as_decrypt_failures`,
+   which specifically delivers the full, undiminished 7-chunk set rather
+   than a loss pattern that would avoid the bug by construction — the
+   same "assert the full property, not a convenient case of it" standard
+   §6.4 already states.
+
+Final state after this section: 126 tests (up from 86), full
+`scripts/check.sh` green.
+
+---
+
+### 6.18 Closing `crate::multidevice`'s named gap: a signed, version-authenticated device list
+
+`docs/SYSTEMIZATION.md` §4.4 and `docs/LIBSIGNAL_COMPARISON.md`'s
+production-readiness list both named the same real gap when
+`crate::multidevice` first landed: `RemoteAccount` was assembled by the
+caller and trusted as given, with nothing stopping a MITM controlling
+wherever bundles are fetched from injecting a device the account owner
+never added. Closed the same way this document's own doctrine says to
+close a named gap — properly, not with a hand-wave — by adding exactly
+the authority the earlier design was missing:
+
+- **`SignedDeviceList`**: the *account's* long-term signing `Identity`
+  (never any one device's — mirrors the real distinction between "this
+  person" and "this person's phone") signs a versioned list of `(device
+  id, identity, DH identity)` triples. `RemoteAccount::from_signed_device_list`
+  verifies that signature, then checks every supplied `PreKeyBundle`'s
+  identity and DH identity actually match what the list authorizes for
+  its device id — `a_bundle_not_matching_the_signed_list_is_rejected`
+  and `a_bundle_for_a_device_id_absent_from_the_list_is_rejected` both
+  simulate exactly the injection this gap allowed, checked against the
+  actual rejection, not just against the signature check existing in
+  isolation.
+- **Rollback protection**: a signature alone doesn't stop a MITM from
+  replaying an *older*, genuinely-signed list to hide a revocation or
+  resurrect a removed device — the classic version-rollback attack every
+  signed-list scheme needs to account for.
+  `MultiDeviceSession::sync_from_signed_device_list` tracks the highest
+  `version` it has accepted per account and rejects anything not
+  strictly greater, checked directly by `stale_device_list_version_is_rejected`
+  against both a replay of the same version and an older one — not
+  merely asserted as "versions must increase" in a doc comment (§4's
+  "the test that tries to break it" standard, applied here).
+- **Automatic revocation on a newer list**: a device dropped from a
+  newer, validly-signed list has its session removed the moment that
+  list is processed, rather than requiring a separate explicit
+  `revoke_device` call the caller might forget —
+  `a_device_removed_from_a_newer_list_has_its_session_revoked` checks
+  this directly by fanning out after the revoking sync and confirming
+  the dropped device's id is genuinely gone from both `has_device` and
+  the fan-out set, not just that the call didn't error.
+
+What this does *not* do, stated per §5's standard rather than left
+implicit: this crate still has no directory service, so *fetching* a
+`SignedDeviceList` and deciding which account key to trust as its signer
+in the first place remain entirely the caller's problem — the same scope
+boundary `crate::handshake` already draws for peer-identity provisioning.
+`RemoteAccount::new`/`add_device` also remain available fully
+unauthenticated; a caller that uses them instead of the signed path is
+opting out of this protection, not exposed to a defect in it.
+
+Final state after this section: 132 tests (up from 126), full
+`scripts/check.sh` green.
