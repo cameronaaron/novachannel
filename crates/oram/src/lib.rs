@@ -709,6 +709,12 @@ mod tests {
     }
 
     #[test]
+    fn capacity_reports_the_number_of_leaves() {
+        let oram: PathOram<u64> = PathOram::new(64, 4);
+        assert_eq!(oram.capacity(), 64);
+    }
+
+    #[test]
     fn overwrite_returns_previous_value() {
         let mut oram: PathOram<u64> = PathOram::new(64, 4);
         let mut rng = ChaCha20Rng::seed_from_u64(3);
@@ -753,6 +759,20 @@ mod tests {
         let mut client = Client::with_server(depth, server);
         client.init_empty_root();
         client
+    }
+
+    #[test]
+    fn integrity_error_has_a_human_readable_display() {
+        let msg = IntegrityError.to_string();
+        assert!(msg.contains("integrity"));
+    }
+
+    #[test]
+    fn root_getter_returns_the_current_trusted_root() {
+        let client = verified_client(64, 4);
+        // Not zero (the pre-`init_empty_root` placeholder) — a real root
+        // was computed and stored by `verified_client`'s setup.
+        assert_ne!(client.root(), [0u8; 32]);
     }
 
     #[test]

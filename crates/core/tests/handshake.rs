@@ -91,6 +91,78 @@ fn wrong_pinned_server_identity_is_rejected() {
 }
 
 #[test]
+fn wrong_pinned_initiator_identity_is_rejected() {
+    let server_identity = Identity::generate();
+    let real_client = Identity::generate();
+    let decoy_client_public = Identity::generate().public();
+
+    let (init_state, msg1) = initiator_start(None);
+    let (resp_state, msg2) =
+        responder_respond(&server_identity, Some(decoy_client_public), &msg1).unwrap();
+    let (msg3, _client_session) = init_state.complete(&real_client, &msg2).unwrap();
+
+    let result = resp_state.complete(&msg3);
+    assert!(matches!(result, Err(Error::IdentityMismatch)));
+}
+
+#[test]
+fn trailing_bytes_in_msg1_are_rejected() {
+    let server_identity = Identity::generate();
+    let (_init_state, mut msg1) = initiator_start(None);
+    msg1.push(0xFF);
+    assert!(matches!(
+        responder_respond(&server_identity, None, &msg1),
+        Err(Error::Malformed(_))
+    ));
+}
+
+#[test]
+fn trailing_bytes_in_msg2_are_rejected() {
+    let server_identity = Identity::generate();
+    let client_identity = Identity::generate();
+
+    let (init_state, msg1) = initiator_start(None);
+    let (_resp_state, mut msg2) = responder_respond(&server_identity, None, &msg1).unwrap();
+    msg2.push(0xFF);
+
+    let result = init_state.complete(&client_identity, &msg2);
+    assert!(matches!(result, Err(Error::Malformed(_))));
+}
+
+#[test]
+fn trailing_bytes_in_msg3_are_rejected() {
+    let server_identity = Identity::generate();
+    let client_identity = Identity::generate();
+
+    let (init_state, msg1) = initiator_start(None);
+    let (resp_state, msg2) = responder_respond(&server_identity, None, &msg1).unwrap();
+    let (mut msg3, _client_session) = init_state.complete(&client_identity, &msg2).unwrap();
+    msg3.push(0xFF);
+
+    let result = resp_state.complete(&msg3);
+    assert!(matches!(result, Err(Error::Malformed(_))));
+}
+
+#[test]
+fn public_identity_and_signature_debug_output_do_not_leak_raw_key_material() {
+    // Also the only exercise of `Debug` for `PublicIdentity`/`HybridSignature`
+    // — worth checking directly rather than incidentally, since the whole
+    // point of the hand-written impls (over `#[derive(Debug)]`) is
+    // summarizing the PQ component's length instead of dumping its bytes.
+    let identity = Identity::generate();
+    let public = identity.public();
+    let sig = identity.sign(b"message");
+
+    let public_debug = format!("{:?}", public);
+    assert!(public_debug.contains("PublicIdentity"));
+    assert!(public_debug.contains("bytes"));
+
+    let sig_debug = format!("{:?}", sig);
+    assert!(sig_debug.contains("HybridSignature"));
+    assert!(sig_debug.contains("bytes"));
+}
+
+#[test]
 fn forged_signature_is_rejected() {
     let server_identity = Identity::generate();
     let client_identity = Identity::generate();

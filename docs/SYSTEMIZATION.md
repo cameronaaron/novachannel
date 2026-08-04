@@ -354,13 +354,17 @@ peer-identity pinning already uses.
 
 ## 8. What was actually verified, and how
 
-49 tests across the workspace, all adversarial where the claim is
+86 tests across the workspace, all adversarial where the claim is
 adversarial (not merely "does the happy path run"): tamper, replay,
 wrong-key, wrong-message, below-threshold-quorum, server-tampers-a-bucket,
 server-replays-a-stale-bucket, cross-epoch/same-epoch rate-limit tests, and
 `novachannel::ratchet`'s epoch-transition/stale-epoch/concurrent-initiation
 tests (§4.1) each try to break a specific stated property rather than
-exercise code paths incidentally. `scripts/check.sh` runs
+exercise code paths incidentally. A subsequent line-coverage pass
+(`ENGINEERING-STANDARDS.md` §6.16) closed the remaining genuinely-reachable
+gaps rather than chasing a literal 100% — which also found and removed one
+real piece of dead code (`permutation::hash2`, an unused duplicate of
+`compress2`). `scripts/check.sh` runs
 `cargo fmt --check`, `cargo clippy --workspace --all-targets --release -D
 warnings`, and the full test suite as the standing bar for "done";
 `.github/workflows/ci.yml` runs the identical script, not a

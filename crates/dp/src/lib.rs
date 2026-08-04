@@ -214,6 +214,12 @@ mod tests {
     }
 
     #[test]
+    fn epsilon_getter_returns_the_constructed_value() {
+        let s = DummyScheduler::new(2.5);
+        assert_eq!(s.epsilon(), 2.5);
+    }
+
+    #[test]
     fn empirical_likelihood_ratio_matches_bound() {
         let epsilon = 0.5f64;
         let s = DummyScheduler::new(epsilon);

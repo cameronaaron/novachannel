@@ -474,3 +474,119 @@ fn derive_next_epoch(
         (new_root, r2i, i2r)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handshake::{initiator_start, responder_respond};
+    use crate::identity::Identity;
+
+    fn pair() -> (RatchetedSession, RatchetedSession) {
+        let server_identity = Identity::generate();
+        let client_identity = Identity::generate();
+
+        let (init_state, msg1) = initiator_start(None);
+        let (resp_state, msg2) = responder_respond(&server_identity, None, &msg1).unwrap();
+        let (msg3, client_session) = init_state.complete(&client_identity, &msg2).unwrap();
+        let server_session = resp_state.complete(&msg3).unwrap();
+
+        (
+            RatchetedSession::new(&client_session, true),
+            RatchetedSession::new(&server_session, false),
+        )
+    }
+
+    // The four tests below reach internal error branches (a too-short
+    // ratchet record, an empty decrypted payload, an unrecognized message
+    // type, trailing bytes inside a ratchet-control payload) that the
+    // public API in `crates/core/tests/ratchet.rs` never produces on its
+    // own — every real caller of `seal`/`initiate_ratchet` always writes a
+    // well-formed payload. Reaching them needs the same private
+    // `seal_payload` the public methods use internally, which is only
+    // available from inside this module.
+
+    #[test]
+    fn a_record_shorter_than_the_header_is_rejected() {
+        let (_client, mut server) = pair();
+        assert!(matches!(server.open(&[0u8; 4]), Err(Error::Malformed(_))));
+    }
+
+    #[test]
+    fn an_empty_decrypted_payload_is_rejected() {
+        let (mut client, mut server) = pair();
+        let record = client.seal_payload(&[]).unwrap();
+        assert!(matches!(server.open(&record), Err(Error::Malformed(_))));
+    }
+
+    #[test]
+    fn an_unrecognized_message_type_is_rejected() {
+        let (mut client, mut server) = pair();
+        let record = client.seal_payload(&[99u8]).unwrap();
+        assert!(matches!(server.open(&record), Err(Error::Malformed(_))));
+    }
+
+    #[test]
+    fn trailing_bytes_in_a_ratchet_step1_payload_are_rejected() {
+        let (mut client, mut server) = pair();
+
+        let kex = InitiatorKex::generate();
+        let mut w = Writer::new();
+        w.put_fixed(kex.x25519_public().as_bytes());
+        w.put_var(&kex.ml_kem_public().to_bytes());
+        let mut payload = Vec::new();
+        payload.push(MSG_RATCHET_STEP1);
+        payload.extend_from_slice(&w.0);
+        payload.push(0xFF); // trailing garbage
+
+        let record = client.seal_payload(&payload).unwrap();
+        assert!(matches!(server.open(&record), Err(Error::Malformed(_))));
+    }
+
+    #[test]
+    fn trailing_bytes_in_a_ratchet_step2_payload_are_rejected() {
+        let (mut client, mut server) = pair();
+        // Client has a real pending ratchet at epoch 0, matching the forged
+        // reply's epoch tag below.
+        client.initiate_ratchet().unwrap();
+
+        let decoy_initiator = InitiatorKex::generate();
+        let responder_kex_out = kex::responder_exchange(
+            decoy_initiator.x25519_public(),
+            decoy_initiator.ml_kem_public(),
+        )
+        .unwrap();
+        let mut w = Writer::new();
+        w.put_fixed(responder_kex_out.x25519_public.as_bytes());
+        w.put_var(&responder_kex_out.ml_kem_ciphertext);
+        let mut payload = Vec::new();
+        payload.push(MSG_RATCHET_STEP2);
+        payload.extend_from_slice(&w.0);
+        payload.push(0xFF); // trailing garbage
+
+        // Sealed under the server's still-current epoch-0 send chain, which
+        // the client's epoch-0 recv chain can decrypt.
+        let record = server.seal_payload(&payload).unwrap();
+        assert!(matches!(client.open(&record), Err(Error::Malformed(_))));
+    }
+
+    #[test]
+    fn a_step2_reply_at_an_epoch_other_than_the_pending_one_is_rejected_and_pending_survives() {
+        let (mut client, _server) = pair();
+        client.initiate_ratchet().unwrap();
+        assert_eq!(client.pending_epoch, 0);
+
+        let result = client.handle_step2(1, &[0u8; 32]);
+        assert!(matches!(result, Err(Error::WrongState)));
+        // The mismatched reply must not have consumed the real pending
+        // ratchet — a later, correctly-tagged reply should still work.
+        assert!(client.pending.is_some());
+    }
+
+    #[test]
+    fn a_step2_reply_with_no_pending_ratchet_is_rejected() {
+        let (_client, mut server) = pair();
+        assert!(server.pending.is_none());
+        let result = server.handle_step2(0, &[0u8; 32]);
+        assert!(matches!(result, Err(Error::WrongState)));
+    }
+}

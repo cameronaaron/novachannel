@@ -35,3 +35,66 @@ pub fn recover_secret(a: &Share, b: &Share) -> Option<BaseElement> {
     let a1 = (a.y - b.y) / (a.x - b.x);
     Some(a.y - a1 * a.x)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovers_sk_from_two_points_on_the_same_line() {
+        let sk = BaseElement::new(1234);
+        let a1 = BaseElement::new(777);
+        let nullifier = BaseElement::new(1); // shares must agree on this
+        let x1 = BaseElement::new(10);
+        let x2 = BaseElement::new(20);
+
+        let share_a = Share {
+            nullifier,
+            x: x1,
+            y: sk + a1 * x1,
+        };
+        let share_b = Share {
+            nullifier,
+            x: x2,
+            y: sk + a1 * x2,
+        };
+
+        assert_eq!(recover_secret(&share_a, &share_b), Some(sk));
+    }
+
+    #[test]
+    fn different_nullifiers_do_not_recover_anything() {
+        let share_a = Share {
+            nullifier: BaseElement::new(1),
+            x: BaseElement::new(10),
+            y: BaseElement::new(20),
+        };
+        let share_b = Share {
+            nullifier: BaseElement::new(2),
+            x: BaseElement::new(30),
+            y: BaseElement::new(40),
+        };
+        assert_eq!(recover_secret(&share_a, &share_b), None);
+    }
+
+    #[test]
+    fn identical_x_is_the_degenerate_case_and_recovers_nothing() {
+        // Same x on the same line would divide by zero deriving the slope;
+        // it's also not a real two-point observation (both shares came
+        // from the same message-binding value), so refusing to "recover"
+        // anything from it is correct, not just safe.
+        let nullifier = BaseElement::new(1);
+        let x = BaseElement::new(10);
+        let share_a = Share {
+            nullifier,
+            x,
+            y: BaseElement::new(20),
+        };
+        let share_b = Share {
+            nullifier,
+            x,
+            y: BaseElement::new(999),
+        };
+        assert_eq!(recover_secret(&share_a, &share_b), None);
+    }
+}

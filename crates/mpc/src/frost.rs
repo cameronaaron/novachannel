@@ -614,4 +614,38 @@ mod tests {
             &honest.group_public_key,
         ));
     }
+
+    #[test]
+    fn a_share_from_a_participant_absent_from_the_commitment_list_is_rejected() {
+        let (threshold, n) = (3, 5);
+        let (shares, dealer_commitments) = run_dkg(threshold, n);
+        let message = b"attest to this";
+        let quorum: Vec<&KeyShare> = shares[0..3].iter().collect();
+        let signer_ids: Vec<ParticipantId> = quorum.iter().map(|s| s.participant_id).collect();
+
+        let mut nonces = Vec::new();
+        let mut commitments = Vec::new();
+        for s in &quorum {
+            let (n, c) = round1_commit(s.participant_id);
+            nonces.push(n);
+            commitments.push(c);
+        }
+
+        let (nonce, _) = round1_commit(quorum[0].participant_id);
+        let z = round2_sign(quorum[0], nonce, message, &signer_ids, &commitments);
+
+        // `4` never contributed a round-1 commitment, so it can't be found
+        // in `commitments` — the lookup itself must fail closed rather than
+        // panic or fall through to a default.
+        let vshare = public_verification_share(4, &dealer_commitments, &[]);
+        assert!(!verify_signature_share(
+            4,
+            &vshare,
+            &z,
+            message,
+            &signer_ids,
+            &commitments,
+            &quorum[0].group_public_key,
+        ));
+    }
 }

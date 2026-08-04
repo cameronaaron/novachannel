@@ -66,3 +66,16 @@ impl<'a> Reader<'a> {
         self.pos == self.buf.len()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_fixed_past_the_end_of_the_buffer_is_rejected() {
+        let mut r = Reader::new(&[1, 2, 3]);
+        assert!(r.get_fixed(4).is_err());
+        // A failed read must not have consumed anything.
+        assert_eq!(r.get_fixed(3).unwrap(), &[1, 2, 3]);
+    }
+}

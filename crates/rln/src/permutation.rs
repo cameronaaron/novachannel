@@ -159,8 +159,46 @@ pub fn compress2(params: &Params, left: BaseElement, right: BaseElement) -> Base
         .expect("each state is a non-empty [BaseElement; WIDTH] array")
 }
 
-/// `Hash(sk, epoch) -> a1`, using the same permutation with a distinct
-/// input shape (no third/fourth input needed; capacity lanes zeroed).
-pub fn hash2(params: &Params, a: BaseElement, b: BaseElement) -> BaseElement {
-    compress2(params, a, b)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_matches_new() {
+        // `Default` exists for callers that expect the standard trait
+        // rather than a bespoke constructor; it must derive the exact same
+        // parameters `new()` does, not an independent (and therefore
+        // possibly divergent) set.
+        let a = Params::default();
+        let b = Params::new();
+        assert_eq!(a.round_constants, b.round_constants);
+        assert_eq!(a.mds, b.mds);
+    }
+
+    #[test]
+    fn trace_permutation_returns_rounds_plus_one_states_starting_with_the_input() {
+        let params = Params::new();
+        let input = [
+            BaseElement::new(1),
+            BaseElement::new(2),
+            BaseElement::new(3),
+            BaseElement::new(4),
+        ];
+        let states = trace_permutation(&params, input);
+        assert_eq!(states.len(), ROUNDS + 1);
+        assert_eq!(states[0], input);
+    }
+
+    #[test]
+    fn compress2_is_deterministic_and_input_sensitive() {
+        let params = Params::new();
+        let a = BaseElement::new(1);
+        let b = BaseElement::new(2);
+
+        assert_eq!(compress2(&params, a, b), compress2(&params, a, b));
+        // The construction isn't symmetric — swapping inputs changes the
+        // output, which is exactly what makes it usable as a Merkle
+        // combiner (a tree can't tell left from right otherwise).
+        assert_ne!(compress2(&params, a, b), compress2(&params, b, a));
+    }
 }

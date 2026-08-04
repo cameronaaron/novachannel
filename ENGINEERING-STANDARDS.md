@@ -52,6 +52,7 @@ was neither elliptic-curve arithmetic nor quantum-resistant). Concretely:
 | §6.13 FROST-signed RLN membership roots (no new inter-crate dependency) | `MerkleTree::root_bytes()` + `frost::sign`/`verify`; `crates/mpc/tests/frost_signs_rln_root.rs` (attests, binds to the specific root, refuses below threshold) |
 | §6.14 `unsafe`/`unwrap` discipline promoted from audit to lint, per libsignal | `#![deny(unsafe_code)]` + `#![warn(clippy::unwrap_used)]` in every crate root; `docs/LIBSIGNAL_COMPARISON.md` |
 | §6.15 `novachannel::ratchet`: forward secrecy + post-compromise security, honestly scoped against SPQR | `crates/core/src/ratchet.rs` module docs (reads SPQR's real `src/v1/unchunked/send_ek.rs`, not just its README); `crates/core/tests/ratchet.rs` (10 tests: per-message key independence, tamper does not desync, in-order enforcement, epoch transition, in-flight-during-ratchet delivery, stale-epoch rejection, concurrent-initiation rejection) |
+| §6.16 Real line-coverage gaps closed (not chased to a literal 100%) | 86 tests total (up from 49); `permutation::hash2` (dead code) deleted; `MerkleTree::verify_path`, `share::recover_secret`'s degenerate branch, malformed/trailing-bytes parser paths in `handshake.rs`/`ratchet.rs`, in-order transport delivery now directly tested |
 | §6.2 A fix and its regression test are one change | the RLN Merkle off-by-one fix (§6.3) and `valid_membership_proof_verifies` |
 | §6.8 Dependency hygiene | every crate's declared dependencies are used; checked by grep audit (§6.8), no dead dependency left unresolved |
 | §9 Fair claims about proof/build status | `cargo test -p novachannel-rln --release` documented as the required invocation, with the debug-mode caveat explained rather than hidden |
@@ -716,3 +717,74 @@ is a real protocol decision this change does not make on the caller's
 behalf. `concurrent_initiation_from_both_sides_is_rejected_not_silently_corrupted`
 is the test that keeps this an explicit error instead of silent epoch
 divergence.
+
+### 6.16 Chasing line coverage found real gaps and one real dead function
+
+Measured with `cargo tarpaulin` rather than assumed: before this pass, the
+non-`novachannel-rln` crates sat around 77–98% line coverage and
+`novachannel-rln` itself (measured separately, `--release`, per the
+winterfell debug-mode quirk in §6.5) was as low as 10% on `merkle.rs`.
+**Literal 100% was explicitly not the target** — a real share of the
+uncovered lines were `.expect("reason")` branches on invariants meant to
+be unreachable (the entire point of the `unwrap_used` audit in §6.14 is
+that they *stay* unreachable), and driving those to green would mean
+either deleting the safety net or writing a test that deliberately breaks
+an invariant just to paint a line — worse than leaving it uncovered and
+documented. The target was closing every *genuinely reachable* gap.
+
+That turned up one real defect in the codebase itself, not just in test
+coverage: `permutation::hash2` was a byte-for-byte duplicate of
+`compress2` with zero call sites anywhere in the crate — dead code that
+existed only because nothing had ever needed a differently-named alias
+it was written for. Per §6.8's dependency-hygiene standard, it was
+deleted rather than given a hollow test just to close the line-coverage
+gap it caused.
+
+It also turned up a few real untested branches, closed with direct tests
+rather than only end-to-end ones: `MerkleTree::verify_path` (a reference
+Merkle-path verifier that was written, documented as "used in tests," and
+then never actually called by any test); `share::recover_secret`'s
+degenerate same-`x` branch (the division-by-zero guard, distinct from the
+already-tested different-nullifier branch); several malformed/trailing-
+bytes parser branches in `handshake.rs` and `ratchet.rs` that no
+successful protocol run ever exercises, reached with hand-crafted
+malformed messages; and `transport.rs`'s ordinary in-order-message path,
+which — surprisingly — no existing test had exercised directly, since
+every prior transport test sent exactly one message per direction or
+deliberately reordered two.
+
+Four of `ratchet.rs`'s branches (an empty decrypted payload, an
+unrecognized message type, trailing bytes inside a ratchet-control
+payload, a step-2 reply tagged with the wrong pending epoch) are not
+reachable through the public protocol at all — every real caller of
+`seal`/`initiate_ratchet` only ever produces well-formed messages, so
+these are true defense-in-depth branches, not just hard to trigger.
+Reaching them for a test needs the same private `seal_payload` the public
+methods use internally, or in the epoch-mismatch case, calling the
+private `handle_step2` directly with a fabricated epoch — both done from
+a `#[cfg(test)] mod tests` nested inside `ratchet.rs` itself (Rust's
+privacy rules give a descendant module access to its parent's private
+items), rather than weakening those methods' visibility just to make them
+testable from the public integration-test crate.
+
+One measurement caveat worth recording rather than hiding: `tarpaulin`'s
+line attribution for `novachannel-rln`'s `lib.rs` and `air.rs` remains
+low (33% and 80%) even after this pass, despite `tests/rln.rs`'s five
+tests calling every public function in `lib.rs` and, transitively, every
+trait method in `air.rs`'s `Air`/`Prover` implementations, on every run.
+Manual review of both files found no remaining conditional branch that
+isn't already forced by an existing test — `verify_message`'s one
+`if` (wrong root) is covered by `wrong_root_is_rejected`, and its only
+other failure path (a STARK proof that fails to verify) is covered by
+`tampered_proof_bytes_are_rejected`. The likely cause is release-mode
+inlining: this crate can only be tested with `cargo test --release`
+(§6.5), and LLVM's coverage instrumentation is well known to under-attribute
+hits back to source lines for short functions aggressively inlined at
+their call sites — visible directly in this workspace by comparing two
+different tarpaulin runs of the same `lib.rs` that report different,
+only-partially-overlapping "covered" line sets depending on what else was
+compiled alongside it. Recorded here rather than either quietly accepted
+as a real gap or hidden by writing tests to satisfy a number that may not
+reflect real coverage.
+
+Final state: 86 tests (up from 49), full `scripts/check.sh` green.

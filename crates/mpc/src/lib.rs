@@ -392,6 +392,12 @@ mod tests {
     }
 
     #[test]
+    fn dealer_threshold_getter_returns_the_constructed_value() {
+        let dealer = Dealer::new(3, 5);
+        assert_eq!(dealer.threshold(), 3);
+    }
+
+    #[test]
     fn threshold_quorum_recovers_the_shared_secret() {
         let (threshold, n) = (3, 5);
         let shares = run_dkg(threshold, n);
