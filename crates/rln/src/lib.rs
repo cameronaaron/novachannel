@@ -60,7 +60,7 @@ pub mod merkle;
 pub mod permutation;
 pub mod share;
 
-use rand::RngCore;
+use rand::Rng;
 use winterfell::math::{fields::f128::BaseElement, FieldElement};
 
 use merkle::{MerkleTree, PathStep};
@@ -75,7 +75,7 @@ pub struct Identity {
 impl Identity {
     pub fn generate() -> Self {
         let mut bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         Identity {
             sk: bytes_to_field(&bytes),
         }

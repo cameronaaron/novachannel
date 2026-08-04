@@ -12,8 +12,8 @@ workspace = true
 # Classical AEAD for the data-plane transport.
 chacha20poly1305 = "0.11"
 # Key derivation for the handshake -> transport key schedule.
-hkdf = "0.12"
-sha2 = "0.10"
+hkdf = "0.13"
+sha2 = "0.11"
 # Classical authentication + key exchange.
 ed25519-dalek = { version = "3", features = ["rand_core"] }
 x25519-dalek = { version = "3", features = ["static_secrets", "reusable_secrets", "zeroize"] }
@@ -28,11 +28,11 @@ kem = "0.3"
 # HMAC-based hash ratchet for the per-message chain key in `ratchet` —
 # already a transitive dependency of `hkdf`, declared directly here because
 # `ratchet.rs` calls it itself rather than going through HKDF-expand.
-hmac = "0.12"
+hmac = "0.13"
 rand_core = "0.10"
 getrandom = { version = "0.4", features = ["sys_rng"] }
 zeroize = { version = "1", features = ["derive"] }
-thiserror = "1"
+thiserror = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }

@@ -969,3 +969,58 @@ opting out of this protection, not exposed to a defect in it.
 
 Final state after this section: 132 tests (up from 126), full
 `scripts/check.sh` green.
+
+---
+
+### 6.19 Dependency currency: zero vulnerabilities, every direct dependency bumped to its latest major where feasible
+
+Checked against both sources, not just one: `cargo audit` against the
+full RustSec advisory database (1189 advisories) found zero
+vulnerabilities, zero unmaintained crates, zero unsound crates, and zero
+yanked versions across all resolved dependencies — and GitHub's
+Dependabot API (`gh api repos/.../dependabot/alerts`) confirmed zero
+*open* alerts directly, independent of what's checked out locally.
+
+Beyond vulnerabilities, every direct dependency pinned to an older major
+than what's published was bumped where the resulting breakage was small
+enough to fix and verify in this pass: `thiserror` 1→2 (no source changes
+needed), `rand`/`rand_chacha` 0.8/0.3→0.10 (source changes: `Rng` split
+into a base trait plus the `RngExt` extension trait that now hosts
+`random_bool`/`random_range` — renamed from `gen_bool`/`gen_range` —
+`thread_rng()` renamed to `rng()`, and the old `RngCore` trait's methods
+moved onto the renamed base `Rng` trait), and `sha2`/`hkdf`/`hmac`
+0.10/0.12/0.12→0.11/0.13/0.13 (source change: `Hmac::new_from_slice`
+needs `hmac::KeyInit` explicitly in scope in the new major, where it
+previously resolved without it).
+
+**One test's assumption broke, and it was the test's assumption that was
+stale, not the code — checked, not just asserted, per §0's doctrine.**
+`a_server_that_replays_a_stale_bucket_is_caught` (`crates/oram/src/lib.rs`,
+§6.12) hardcoded `ChaCha20Rng::seed_from_u64(13)` to force a specific
+scenario: the root bucket (node 1, on *every* access's path) must
+actually change contents between two writes, so restoring a snapshot of
+it afterward is a genuine tamper, not a no-op. `rand_chacha` 0.10 changed
+`seed_from_u64`'s internal seed-expansion algorithm from 0.3's — a
+documented, intentional upstream change, not a bug in either version —
+so seed 13 no longer produces that scenario: the two writes end up
+leaving the root bucket in the *same* state, making the "replay" a no-op
+and the test fail (`Ok(Some(...))`, not the expected `Err(IntegrityError)`).
+The fix was not to loosen the assertion — it was to find a seed that
+still produces the real scenario, the same "validate the instrument"
+habit §0.5 already prescribes: a throwaway probe (`crates/oram` test,
+deleted after use) swept seeds 0..200 checking which ones actually change
+the root bucket's block-id set between the two writes, found seed 127,
+and the test now uses it with a comment explaining *why* the seed value
+is load-bearing — so a future dependency bump that breaks it again gets
+found by re-running the same probe, not by guessing.
+
+`cargo update --dry-run --verbose` after this pass: every dependency
+this workspace can control is at its latest compatible version; the one
+remaining entry (`generic-array` 0.14.7, available 0.14.9) is a transitive
+dependency of crates this workspace doesn't declare a direct requirement
+on, so there is no `Cargo.toml` line here to bump — it updates
+automatically once whatever pulls it in raises its own requirement.
+
+Final state after this section: 104 resolved crate dependencies (down
+from 107 — the version bumps consolidated some previously-duplicated
+versions in the tree), full `scripts/check.sh` green, `cargo audit` clean.

@@ -9,7 +9,7 @@ description = "Differential-privacy-calibrated dummy traffic scheduling for meta
 workspace = true
 
 [dependencies]
-rand = "0.8"
+rand = "0.10"
 
 [dev-dependencies]
-rand_chacha = "0.3"
+rand_chacha = "0.10"

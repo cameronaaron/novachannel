@@ -66,7 +66,7 @@
 
 use std::collections::HashMap;
 
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 pub type BlockId = u64;
 
@@ -207,7 +207,7 @@ impl<V: Clone, S: ServerStorage<V>> Client<V, S> {
     }
 
     fn random_leaf(&self, rng: &mut impl Rng) -> u64 {
-        rng.gen_range(0..self.num_leaves)
+        rng.random_range(0..self.num_leaves)
     }
 
     /// Reads (and clears) every bucket on `path_nodes(leaf)` into the stash.
@@ -730,8 +730,8 @@ mod tests {
         let mut rng = ChaCha20Rng::seed_from_u64(4);
 
         for step in 0..5000u64 {
-            let id = rng.gen_range(0..200u64);
-            if rng.gen_bool(0.5) {
+            let id = rng.random_range(0..200u64);
+            if rng.random_bool(0.5) {
                 let value = step;
                 let got = oram.write(id, value, &mut rng);
                 assert_eq!(got, reference.insert(id, value));
@@ -801,8 +801,8 @@ mod tests {
         let mut rng = ChaCha20Rng::seed_from_u64(12);
 
         for step in 0..2000u64 {
-            let id = rng.gen_range(0..200u64);
-            if rng.gen_bool(0.5) {
+            let id = rng.random_range(0..200u64);
+            if rng.random_bool(0.5) {
                 let value = vec![step as u8; (step % 5 + 1) as usize];
                 let got = client.verified_write(id, value.clone(), &mut rng).unwrap();
                 assert_eq!(got, reference.insert(id, value));
@@ -835,7 +835,13 @@ mod tests {
     #[test]
     fn a_server_that_replays_a_stale_bucket_is_caught() {
         let mut client = verified_client(64, 4);
-        let mut rng = ChaCha20Rng::seed_from_u64(13);
+        // This seed is load-bearing: it's chosen (by a throwaway probe, per
+        // ENGINEERING-STANDARDS.md §0.5's "validate the instrument" habit)
+        // specifically because it makes the root bucket's contents actually
+        // differ between the two writes below -- a seed where they happen
+        // to end up identical would make the "replay" a no-op and this test
+        // would pass without ever exercising the property it claims to.
+        let mut rng = ChaCha20Rng::seed_from_u64(127);
 
         client.verified_write(2, vec![9, 9], &mut rng).unwrap();
         // Snapshot the (honest, current) root bucket, then perform another

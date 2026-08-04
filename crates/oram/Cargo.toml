@@ -9,8 +9,8 @@ description = "Path ORAM: an O(log n)-per-access oblivious storage layer for ser
 workspace = true
 
 [dependencies]
-rand = "0.8"
-sha2 = "0.10"
+rand = "0.10"
+sha2 = "0.11"
 
 [dev-dependencies]
-rand_chacha = "0.3"
+rand_chacha = "0.10"

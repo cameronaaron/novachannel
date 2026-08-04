@@ -99,7 +99,7 @@
 //! mechanism instead of a faithful reimplementation of SPQR.
 
 use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use kem::KeyExport;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;

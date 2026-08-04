@@ -63,7 +63,7 @@
 #![warn(clippy::unwrap_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 /// Per-slot dummy-traffic scheduler calibrated to a target epsilon.
 #[derive(Clone, Copy, Debug)]
@@ -107,7 +107,7 @@ impl DummyScheduler {
     /// if a passive observer can tell real and dummy packets apart by any
     /// other signal (size, timing jitter, ...).
     pub fn decide(&self, has_real_message: bool, rng: &mut impl Rng) -> bool {
-        has_real_message || rng.gen_bool(self.dummy_probability)
+        has_real_message || rng.random_bool(self.dummy_probability)
     }
 }
 
