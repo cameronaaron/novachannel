@@ -80,17 +80,75 @@ fn tampered_record_fails_to_decrypt_and_does_not_desync_the_chain() {
 }
 
 #[test]
-fn out_of_order_delivery_within_an_epoch_is_rejected() {
-    // Unlike the base transport, this module requires in-order delivery —
-    // see the module docs for why. Confirm that's actually enforced
-    // rather than silently accepted with wrong results.
+fn a_later_record_is_opened_immediately_and_the_earlier_one_still_opens_afterward() {
+    // Receiving `seq=1` before `seq=0` derives and caches the skipped
+    // key for `seq=0` rather than rejecting `seq=1` outright — the same
+    // bounded skipped-key mechanism real Double Ratchet implementations
+    // use (module docs).
     let (mut client, mut server) = run_handshake();
 
     let r1 = client.seal(b"first").unwrap();
     let r2 = client.seal(b"second").unwrap();
 
-    assert!(server.open(&r2).is_err());
+    assert_eq!(expect_application(server.open(&r2).unwrap()), b"second");
     assert_eq!(expect_application(server.open(&r1).unwrap()), b"first");
+}
+
+#[test]
+fn a_skipped_key_can_only_be_used_once() {
+    let (mut client, mut server) = run_handshake();
+
+    let r1 = client.seal(b"first").unwrap();
+    let r2 = client.seal(b"second").unwrap();
+
+    expect_application(server.open(&r2).unwrap());
+    expect_application(server.open(&r1).unwrap());
+
+    // A genuine replay of the already-consumed skipped record must still
+    // fail — the skipped key was deleted the moment it was used, not
+    // kept around for a second decrypt attempt.
+    assert!(matches!(server.open(&r1), Err(Error::Replay)));
+}
+
+#[test]
+fn several_records_can_arrive_out_of_order_and_all_still_open() {
+    let (mut client, mut server) = run_handshake();
+
+    let records: Vec<Vec<u8>> = (0..5)
+        .map(|i| client.seal(format!("message {i}").as_bytes()).unwrap())
+        .collect();
+
+    // Deliver in a scrambled order: 2, 4, 0, 3, 1.
+    for &i in &[2usize, 4, 0, 3, 1] {
+        let plaintext = expect_application(server.open(&records[i]).unwrap());
+        assert_eq!(plaintext, format!("message {i}").as_bytes());
+    }
+}
+
+#[test]
+fn skipping_past_the_bound_is_rejected_without_desyncing_expected_seq() {
+    let (mut client, mut server) = run_handshake();
+
+    let in_order_first = client.seal(b"real first message").unwrap();
+
+    // Fast-forward a second, independent chain position far ahead by
+    // sealing many records without delivering them, then attempt one
+    // whose gap exceeds the bound.
+    for _ in 0..novachannel::ratchet::MAX_SKIPPED_KEYS {
+        client.seal(b"filler").unwrap();
+    }
+    let far_future = client.seal(b"too far").unwrap();
+    assert!(matches!(
+        server.open(&far_future),
+        Err(Error::TooManySkippedKeys)
+    ));
+
+    // The server's `expected_seq` must still be 0 — the rejected attempt
+    // didn't touch it, so the real first message still opens normally.
+    assert_eq!(
+        expect_application(server.open(&in_order_first).unwrap()),
+        b"real first message"
+    );
 }
 
 #[test]

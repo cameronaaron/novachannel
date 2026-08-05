@@ -76,12 +76,26 @@
 //!
 //! Both variants share every other constraint below:
 //!
-//! - **In-order delivery is required.** The base [`crate::transport`]
-//!   module tolerates reordering via its replay window; this module does
-//!   not attempt that on top of chain-key ratcheting (out-of-order
-//!   handling is most of why SPQR's design and Signal's classical ratchet
-//!   are as involved as they are) — build it on a reliable, ordered
-//!   stream (e.g. TCP), not raw UDP/QUIC.
+//! - **Out-of-order and lost application records are tolerated, bounded.**
+//!   Each [`RecvChain`] keeps a cache of message keys skipped while
+//!   catching up to a later sequence number — the same mechanism real
+//!   Double Ratchet implementations use: receiving `seq` ahead of
+//!   `expected_seq` derives and stashes the keys for everything in
+//!   between (never rewinding, since the chain is one-way) rather than
+//!   rejecting the message outright, and a subsequent, legitimately
+//!   late arrival for one of those skipped sequence numbers decrypts
+//!   from the cached key instead of `Error::Replay`. Bounded by
+//!   [`MAX_SKIPPED_KEYS`] per chain so a peer (or an attacker who can
+//!   inject sequence numbers) can't force unbounded memory growth by
+//!   claiming an absurdly far-future `seq`; exceeding it is
+//!   [`Error::TooManySkippedKeys`], not a silent truncation. A skipped
+//!   key is deleted the moment it's looked up, successful decrypt or
+//!   not — the same "used once, ever" rule every other message key in
+//!   this module follows — so a second delivery of the same sequence
+//!   number (a true replay, not a legitimate late arrival) correctly
+//!   fails. This applies to ordinary [`Self::seal`]/[`Self::open`]
+//!   records; [`Self::initiate_incremental_ratchet`]'s chunks already had
+//!   their own, separate reordering tolerance (module docs above).
 //! - **Ratchet initiation must not race.** Both sides calling
 //!   [`RatchetedSession::initiate_ratchet`] concurrently, before either
 //!   has seen the other's step, is rejected with
@@ -89,14 +103,23 @@
 //!   divergent epoch state — callers that want concurrent-initiation
 //!   safety need to add their own coordination (e.g. only the original
 //!   handshake initiator ever calls it) or a retry-on-error policy.
-//! - **No formal verification.** SPQR is hax/F*-checked and has ProVerif
-//!   models. This module has the same test discipline as the rest of
-//!   this workspace (adversarial unit tests, `ENGINEERING-STANDARDS.md`)
-//!   and nothing more.
+//! - **No formal verification of this module specifically.** SPQR is
+//!   hax/F*-checked and has ProVerif models. `crates/core/formal/proverif`
+//!   has real, executed ProVerif models of `crate::handshake` and
+//!   `crate::x3dh` (session establishment) — but not of this module's own
+//!   ratchet-step protocol logic, and none of this crate has hax/F*
+//!   source-level verification at all; see that directory's README for
+//!   exactly what is and isn't covered, and why hax/F* stays a named,
+//!   out-of-reach gap rather than an attempted one. This module has the
+//!   same test discipline as the rest of this workspace otherwise
+//!   (adversarial unit tests, `ENGINEERING-STANDARDS.md`) and nothing more.
 //!
 //! It gives real forward secrecy and real, hybrid PQ-safe
 //! post-compromise security — just via a much smaller, fully-understood
 //! mechanism instead of a faithful reimplementation of SPQR.
+
+use std::cmp::Ordering;
+use std::collections::HashMap;
 
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
@@ -115,6 +138,12 @@ type HmacSha256 = Hmac<Sha256>;
 /// incremental ratchet reconstruction, or `None` if nothing's in
 /// progress. See [`RatchetedSession::incremental_ratchet_progress`].
 pub type ChunkProgress = Option<(usize, usize)>;
+
+/// The most message keys one [`RecvChain`] will cache for out-of-order
+/// delivery at once — module docs on why this bound exists. 1000 matches
+/// the order of magnitude Signal's own `libsignal-protocol` uses for the
+/// same purpose (`MAX_FORWARD_JUMPS`/skipped-key-store caps).
+pub const MAX_SKIPPED_KEYS: u64 = 1000;
 
 const MSG_APPLICATION: u8 = 0;
 const MSG_RATCHET_STEP1: u8 = 1;
@@ -192,12 +221,23 @@ fn open_with_message_key(message_key: &[u8; 32], aad: &[u8], record: &[u8]) -> R
         .map_err(|_| Error::Decrypt)
 }
 
-/// One receive-side chain, tagged with the epoch it belongs to and the
-/// sequence number it expects next (strict in-order, per epoch).
+/// One receive-side chain, tagged with the epoch it belongs to, the
+/// sequence number it expects next, and any message keys already derived
+/// and cached for sequence numbers below that (module docs on
+/// out-of-order tolerance).
 struct RecvChain {
     epoch: u32,
     chain: ChainKey,
     expected_seq: u64,
+    skipped: HashMap<u64, [u8; 32]>,
+}
+
+impl Drop for RecvChain {
+    fn drop(&mut self) {
+        for key in self.skipped.values_mut() {
+            key.zeroize();
+        }
+    }
 }
 
 /// A [`crate::handshake::EstablishedSession`] upgraded with per-message
@@ -488,6 +528,7 @@ impl RatchetedSession {
                 epoch: 0,
                 chain: recv_chain,
                 expected_seq: 0,
+                skipped: HashMap::new(),
             },
             recv_previous: None,
             pending: None,
@@ -664,6 +705,22 @@ impl RatchetedSession {
         }
     }
 
+    fn recv_mut(&mut self, slot: RecvSlot) -> &mut RecvChain {
+        match slot {
+            RecvSlot::Current => &mut self.recv_current,
+            RecvSlot::Previous => self
+                .recv_previous
+                .as_mut()
+                .expect("caller only reaches Previous when recv_previous is Some"),
+        }
+    }
+
+    /// Opens one record against `slot`'s chain. Three cases, module docs
+    /// on why: `seq == expected_seq` is the ordinary forward step;
+    /// `seq < expected_seq` looks up (and consumes) a previously cached
+    /// skipped key; `seq > expected_seq` derives and caches every key in
+    /// between before deriving `seq`'s own, catching the chain up without
+    /// ever rewinding it.
     fn open_on(
         &mut self,
         slot: RecvSlot,
@@ -671,32 +728,56 @@ impl RatchetedSession {
         aad: &[u8],
         ciphertext: &[u8],
     ) -> Result<Vec<u8>> {
-        let recv = match slot {
-            RecvSlot::Current => &self.recv_current,
-            RecvSlot::Previous => self
-                .recv_previous
-                .as_ref()
-                .expect("caller only reaches Previous when recv_previous is Some"),
-        };
-        if seq != recv.expected_seq {
-            return Err(Error::Replay);
-        }
-        let (next_chain, message_key) = recv.chain.advance();
-        let plaintext = open_with_message_key(&message_key, aad, ciphertext)?;
+        let recv = self.recv_mut(slot);
+        match seq.cmp(&recv.expected_seq) {
+            Ordering::Less => {
+                // A skipped key is removed the instant it's looked up,
+                // decrypt outcome notwithstanding — same "used once,
+                // ever" rule every other message key in this module
+                // follows, and what makes a genuine replay of this same
+                // `seq` correctly fail afterward.
+                let key = recv.skipped.remove(&seq).ok_or(Error::Replay)?;
+                open_with_message_key(&key, aad, ciphertext)
+            }
+            Ordering::Equal => {
+                let (next_chain, message_key) = recv.chain.advance();
+                let plaintext = open_with_message_key(&message_key, aad, ciphertext)?;
+                // Only commit the chain advance once decryption actually
+                // succeeded — a forged or corrupted record must not be
+                // able to desync the real receive chain.
+                recv.chain = next_chain;
+                recv.expected_seq += 1;
+                Ok(plaintext)
+            }
+            Ordering::Greater => {
+                let skip_count = seq - recv.expected_seq;
+                if skip_count > MAX_SKIPPED_KEYS
+                    || recv.skipped.len() as u64 + skip_count > MAX_SKIPPED_KEYS
+                {
+                    return Err(Error::TooManySkippedKeys);
+                }
+                let mut chain = recv.chain.clone();
+                let mut newly_skipped = Vec::with_capacity(skip_count as usize);
+                for s in recv.expected_seq..seq {
+                    let (next, key) = chain.advance();
+                    newly_skipped.push((s, key));
+                    chain = next;
+                }
+                let (next_chain, message_key) = chain.advance();
+                let plaintext = open_with_message_key(&message_key, aad, ciphertext)?;
 
-        // Only commit the chain advance once decryption actually
-        // succeeded — a forged or corrupted record must not be able to
-        // desync the real receive chain.
-        let recv = match slot {
-            RecvSlot::Current => &mut self.recv_current,
-            RecvSlot::Previous => self
-                .recv_previous
-                .as_mut()
-                .expect("caller only reaches Previous when recv_previous is Some"),
-        };
-        recv.chain = next_chain;
-        recv.expected_seq += 1;
-        Ok(plaintext)
+                // Only commit the derived-but-unused skipped keys and the
+                // chain advance once decryption of `seq` itself actually
+                // succeeded — an attacker sending a bogus far-future
+                // `seq` must not be able to force real state mutation
+                // (and the memory that comes with it) off a forged
+                // record alone.
+                recv.skipped.extend(newly_skipped);
+                recv.chain = next_chain;
+                recv.expected_seq = seq + 1;
+                Ok(plaintext)
+            }
+        }
     }
 
     fn handle_step1(&mut self, epoch: u32, payload: &[u8]) -> Result<Vec<u8>> {
@@ -928,6 +1009,7 @@ impl RatchetedSession {
                 epoch: new_epoch,
                 chain: ChainKey(new_recv),
                 expected_seq: 0,
+                skipped: HashMap::new(),
             },
         );
         self.recv_previous = Some(old_current);

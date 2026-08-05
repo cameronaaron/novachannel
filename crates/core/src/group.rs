@@ -619,6 +619,23 @@ impl Commit {
             signature,
         })
     }
+
+    /// [`Self::write`]/[`Self::read`] take this crate's own private
+    /// [`Writer`]/[`Reader`], so nothing outside the crate could
+    /// previously call them — a `Commit` had a documented purpose
+    /// (broadcast to every other group member) and no public way to
+    /// fulfil it, the same gap [`crate::prekey::PreKeyBundle`] once had.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.write(&mut w);
+        w.into_bytes()
+    }
+
+    /// Inverse of [`Self::to_bytes`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes);
+        Self::read(&mut r)
+    }
 }
 
 /// Delivered to a prospective member alongside the [`Commit`] that adds
@@ -628,6 +645,28 @@ impl Commit {
 /// machinery.
 pub struct Welcome {
     sealed: SealedToNode,
+}
+
+impl Welcome {
+    /// Same gap, same fix as [`Commit::to_bytes`]/[`Commit::from_bytes`]:
+    /// a `Welcome` must reach the joining member over some transport
+    /// (typically alongside the accompanying [`Commit`]), which needs
+    /// public bytes, not this crate's private [`Writer`]/[`Reader`].
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.sealed.write(&mut w);
+        w.into_bytes()
+    }
+
+    /// Inverse of [`Self::to_bytes`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes);
+        let sealed = SealedToNode::read(&mut r)?;
+        if !r.finished() {
+            return Err(Error::Malformed("trailing bytes in welcome"));
+        }
+        Ok(Welcome { sealed })
+    }
 }
 
 struct WelcomeSnapshot {
@@ -1344,6 +1383,36 @@ mod tests {
             .unwrap();
         let bob = Group::join(bob_key_package, &welcome, &commit).unwrap();
         (alice, bob, alice_id, bob_id)
+    }
+
+    #[test]
+    fn commit_and_welcome_round_trip_through_bytes() {
+        let alice_id = Identity::generate();
+        let mut alice = Group::create(&alice_id, 4).unwrap();
+        let bob_key_package = MyLeafKeyPackage::generate(Identity::generate().public());
+
+        let (commit, welcome) = alice
+            .propose_add(&alice_id, bob_key_package.public())
+            .unwrap();
+
+        let commit_bytes = commit.to_bytes();
+        let welcome_bytes = welcome.to_bytes();
+        let commit_from_bytes = Commit::from_bytes(&commit_bytes).unwrap();
+        let welcome_from_bytes = Welcome::from_bytes(&welcome_bytes).unwrap();
+
+        // The round-tripped pair works exactly like the originals: a
+        // fresh member can join from them alone.
+        let bob = Group::join(bob_key_package, &welcome_from_bytes, &commit_from_bytes).unwrap();
+        assert_eq!(bob.epoch(), 1);
+        assert_eq!(bob.my_leaf_index(), 1);
+    }
+
+    #[test]
+    fn garbage_bytes_are_rejected_not_panicked_on() {
+        assert!(Commit::from_bytes(b"not a real commit").is_err());
+        assert!(Welcome::from_bytes(b"not a real welcome").is_err());
+        assert!(Commit::from_bytes(&[]).is_err());
+        assert!(Welcome::from_bytes(&[]).is_err());
     }
 
     #[test]

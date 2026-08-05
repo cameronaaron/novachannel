@@ -40,6 +40,8 @@ pub enum Error {
     NotAGroupMember,
     #[error("could not locate a decryptable path secret in this commit's update path")]
     CommitNotDecryptable,
+    #[error("catching up to this record's sequence number would skip more keys than this session allows")]
+    TooManySkippedKeys,
     #[error(
         "a received commit's public path key did not match the key its decrypted secret derives"
     )]

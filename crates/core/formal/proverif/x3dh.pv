@@ -1,0 +1,256 @@
+(*
+ * ProVerif model of crate::x3dh's asynchronous, deniable session
+ * establishment (X3DH extended with a hybrid ML-KEM-1024 leg on both the
+ * signed prekey and, when present, the one-time prekey -- see
+ * crates/core/src/x3dh.rs's own module docs for the exact term-by-term
+ * combination this mirrors: DH1..DH4 + SS_pq + SS_pq').
+ *
+ * STATUS: executed with ProVerif 2.05 (`proverif crates/core/formal/proverif/x3dh.pv`).
+ * The secrecy/forward-secrecy query below returned exactly the result
+ * predicted next to it (`not attacker_p1(secretApplicationData)` --
+ * true, i.e. secret even accounting for the phase-1 long-term-key leak)
+ * at the time this note was last updated. If you change this model,
+ * re-run it -- a comment saying "expected: false" is not a substitute
+ * for the tool actually saying so after your edit.
+ *
+ * TYPING NOTE: same scheme as handshake.pv -- only values that must never
+ * be directly observable as cleartext (DH exponents, KEM decapsulation
+ * keys/shared secrets, the signing key) get their own ProVerif type;
+ * everything actually sent on the wire is plain `bitstring`.
+ *
+ * WHAT THIS MODELS
+ * The full-term configuration (a one-time prekey was available and used)
+ * is what's modeled -- the strongest case, and the one the headline
+ * forward-secrecy query below actually exercises. All four DH terms and
+ * both KEM encapsulations (against the signed prekey and the one-time
+ * prekey) are explicit, not collapsed.
+ *
+ * The one-time prekey's secret is modeled as a fresh, never-leaked `new`
+ * name specific to a single (Initiator, Responder) session pair, matching
+ * `OneTimePreKeyStore::take` actually removing it from the store and its
+ * `OneTimePreKey` being dropped (zeroized) the moment it's consumed. The
+ * long-term identity and signed-prekey secrets, by contrast, ARE leaked
+ * to the attacker -- but only in `phase 1`, i.e. *after* the modeled
+ * session has already run to completion in phase 0. That sequencing is
+ * the actual point of the model: it directly states
+ * crates/core/src/x3dh.rs's own documented claim --
+ *
+ *   "No forward secrecy against a compromise of SPK_b's secret before
+ *    the one-time prekey is exhausted or if none was available [...]
+ *    DH4 [is] the one DH term whose secret is deleted after one use, so
+ *    it survives even a later, full compromise of IK_b and SPK_b's
+ *    secrets"
+ *
+ * -- as a checkable secrecy query instead of just an English claim.
+ *
+ * WHAT THIS DOES NOT MODEL
+ * - Deniability, x3dh.rs's other headline property. This is the harder
+ *   omission to wave away, so it's worth being precise about *why*:
+ *   ProVerif's query language proves *reachability* facts (a state is/
+ *   isn't reachable, a correspondence does/doesn't hold) under a fixed
+ *   protocol description. Deniability is a *simulation* claim -- "a
+ *   transcript indistinguishable from a real one could have been
+ *   produced by the responder alone, without the initiator's
+ *   participation" -- which needs either (a) an explicit simulator
+ *   process and an observational-equivalence query (ProVerif supports
+ *   `diff`-equivalence between two processes, but authoring a faithful
+ *   simulator process and getting the equivalence query right is a
+ *   nontrivial modeling exercise in its own right, not a small addition
+ *   to this file), or (b) a dedicated deniability logic this tool
+ *   doesn't speak. Skipped here rather than faked with a query that
+ *   doesn't actually test the claimed property -- the same "don't
+ *   overclaim" standard `ENGINEERING-STANDARDS.md` applies to the Rust
+ *   code applies to this model.
+ * - Explicit authentication/agreement queries. X3DH's implicit
+ *   authentication (DH1 requires *someone* holding IK_a's secret --
+ *   genuinely the initiator, or the responder simulating them, which is
+ *   exactly the deniability property above) means a standard injective
+ *   correspondence query would either be meaningless or would fail *by
+ *   design* -- there is deliberately no unique "the initiator alone
+ *   could have produced this" event to correspond against, unlike
+ *   handshake.pv's live, transcript-signing protocol. Not modeling one
+ *   here is a consequence of the design being checked, not a gap in the
+ *   checking.
+ * - Everything handshake.pv's own "what this does not model" section
+ *   already lists (wire encoding, concrete algorithm security).
+ *)
+
+(* ---------- network ---------- *)
+free net: channel.
+
+(* ---------- classical Diffie-Hellman (same scheme as handshake.pv:
+   public values are `bitstring`, only the exponent is dedicated) ---------- *)
+type exponent.
+const g: bitstring [data].
+fun exp(bitstring, exponent): bitstring.
+equation forall x: exponent, y: exponent; exp(exp(g, x), y) = exp(exp(g, y), x).
+
+(* ---------- ML-KEM, abstracted as randomized public-key encryption of a
+   fresh symmetric value (same idiom as handshake.pv) ---------- *)
+type kem_sk.
+type kem_ss.
+fun kem_pk_of(kem_sk): bitstring.
+fun kem_encap(bitstring, kem_ss, bitstring): bitstring.
+reduc forall sk: kem_sk, ss: kem_ss, r: bitstring;
+  kem_decap(kem_encap(kem_pk_of(sk), ss, r), sk) = ss.
+
+(* ---------- hybrid Ed25519 + ML-DSA-87 signatures (same collapse as
+   handshake.pv) -- used here only for the signed prekey's own signature,
+   the one signature this protocol has anywhere (module docs: that's what
+   keeps it deniable -- nothing session-specific is ever signed). ---------- *)
+type sig_sk.
+fun sig_pk_of(sig_sk): bitstring.
+fun sign(bitstring, sig_sk): bitstring.
+reduc forall m: bitstring, sk: sig_sk; checksign(sign(m, sk), sig_pk_of(sk)) = m.
+
+(* ---------- KDF (random-oracle abstraction) ---------- *)
+fun kdf(bitstring): bitstring.
+
+(* ---------- AEAD, used only to observe how SK protects the payload.
+   The real protocol derives a *separate* init-payload key from the same
+   combined IKM via a distinct HKDF label rather than using the session
+   key `sk` itself directly -- collapsed here to one key for a smaller
+   model. That simplification doesn't change the secrecy argument being
+   tested: both keys are functions of the identical combined DH/KEM
+   material, so an attacker who can't derive one can't derive the other
+   either. ---------- *)
+fun senc(bitstring, bitstring): bitstring.
+reduc forall m: bitstring, k: bitstring; sdec(senc(m, k), k) = m.
+
+(* ---------- the secret this model checks stays secret, even across the
+   phase-1 long-term-key leak below ---------- *)
+free secretApplicationData: bitstring [private].
+
+(* ================= Initiator role =================
+ * All arguments are values the initiator already has (their own
+ * long-term DH secret) or received from the responder's published,
+ * already-`out(net, ...)`'d bundle -- passed directly here rather than
+ * re-read off `net` purely to keep the process signature readable; every
+ * one of them is attacker-visible regardless, via the `out` statements in
+ * the top-level process below. *)
+let InitiatorX3DH(ik_a: exponent, IK_b: bitstring,
+                   spk_dh_pub: bitstring, spk_kem_pub: bitstring,
+                   opk_dh_pub: bitstring, opk_kem_pub: bitstring) =
+    new ek_a: exponent;
+    let EK_a = exp(g, ek_a) in
+
+    let dh1 = exp(spk_dh_pub, ik_a) in
+    let dh2 = exp(IK_b, ek_a) in
+    let dh3 = exp(spk_dh_pub, ek_a) in
+    let dh4 = exp(opk_dh_pub, ek_a) in
+
+    new ss_pq: kem_ss;
+    new r1: bitstring;
+    let ct_pq = kem_encap(spk_kem_pub, ss_pq, r1) in
+
+    new ss_pq2: kem_ss;
+    new r2: bitstring;
+    let ct_pq2 = kem_encap(opk_kem_pub, ss_pq2, r2) in
+
+    let sk = kdf((dh1, dh2, dh3, dh4, ss_pq, ss_pq2)) in
+    out(net, (exp(g, ik_a), EK_a, ct_pq, ct_pq2, senc(secretApplicationData, sk))).
+
+(* ================= Responder role =================
+ * Runs with this particular session's own one-time prekey secrets
+ * (`opk_dh`, `opk_kem_sk`) -- generated fresh once per top-level
+ * replica, module docs' "consumed by at most one session" property
+ * modeled structurally by simply never reusing these two names across
+ * more than one `ResponderX3DH` invocation (see the top-level process). *)
+let ResponderX3DH(ik_b: exponent, spk_dh: exponent, spk_kem_sk: kem_sk,
+                   opk_dh: exponent, opk_kem_sk: kem_sk) =
+    in(net, (IK_a: bitstring, EK_a: bitstring, ct_pq: bitstring, ct_pq2: bitstring, sealed: bitstring));
+
+    let dh1 = exp(IK_a, spk_dh) in
+    let dh2 = exp(EK_a, ik_b) in
+    let dh3 = exp(EK_a, spk_dh) in
+    let dh4 = exp(EK_a, opk_dh) in
+    let ss_pq = kem_decap(ct_pq, spk_kem_sk) in
+    let ss_pq2 = kem_decap(ct_pq2, opk_kem_sk) in
+
+    let sk = kdf((dh1, dh2, dh3, dh4, ss_pq, ss_pq2)) in
+    let received = sdec(sealed, sk) in
+    (* Deliberately no `out(net, received)` here -- same correction as
+       handshake.pv's `Responder`: echoing the decrypted plaintext back
+       onto the public channel would leak `secretApplicationData` to the
+       attacker *by construction*, testing nothing about the protocol.
+       Successfully reaching `sdec` at all is already everything this
+       model needs from the responder side. *)
+    0.
+
+(* ================= queries =================
+ * ProVerif requires all `query` declarations before the top-level
+ * `process` -- see the `process` block below for the actual protocol
+ * setup (including the phase-1 long-term-key leak) this query runs
+ * against.
+ *
+ * Secrecy, including forward secrecy against the phase-1 leak: the
+ * attacker never learns `secretApplicationData` from any session, even
+ * one whose long-term keys (`ik_a`, `ik_b`, `spk_dh`, `spk_kem_sk`) are
+ * later fully compromised -- because deriving that session's `sk` still
+ * needs `dh4`/`ss_pq2`, which need the one-time prekey's secrets
+ * (`opk_dh`, `opk_kem_sk`), which this model never leaks at all (they
+ * are consumed and, in the real code, zeroized).
+ *
+ * Expected result (a prediction, per the STATUS note at the top of this
+ * file, not a confirmed fact): `attacker(secretApplicationData)` --
+ * expected false, i.e. secrecy (here, specifically forward secrecy)
+ * holds.
+ *
+ * Contrast, not itself encoded as a second query here: a configuration
+ * *without* an OPK reduces to DH1..DH3 + SS_pq alone, none of which
+ * involve a secret this model would keep off the phase-1 leak list --
+ * so the equivalent query on that configuration is expected to succeed
+ * for the attacker instead, matching x3dh.rs's own documented caveat
+ * that forward secrecy specifically depends on an OPK having been
+ * available and consumed.
+ *)
+query attacker(secretApplicationData).
+
+(* ================= top level =================
+ * B's long-term DH identity and signed prekey are generated once and
+ * reused across every session (real X3DH's asynchronous property: many
+ * sessions share one published bundle). Each replica of the inner
+ * process generates a *fresh* one-time prekey and spawns exactly one
+ * initiator/responder pair against it -- modeling "at most one session
+ * ever consumes this particular OPK" structurally, not just by
+ * assertion. *)
+process
+    new ik_a: exponent;
+    new ik_b: exponent;
+    let IK_a_pub = exp(g, ik_a) in
+    let IK_b_pub = exp(g, ik_b) in
+
+    new spk_dh: exponent;
+    let spk_dh_pub = exp(g, spk_dh) in
+    new spk_kem_sk: kem_sk;
+    let spk_kem_pub = kem_pk_of(spk_kem_sk) in
+
+    new sig_sk_b: sig_sk;
+    let sig_pk_b = sig_pk_of(sig_sk_b) in
+    let sig_spk = sign((spk_dh_pub, spk_kem_pub), sig_sk_b) in
+
+    out(net, (sig_pk_b, IK_a_pub, IK_b_pub, spk_dh_pub, spk_kem_pub, sig_spk));
+
+    (
+        (
+            !(
+                new opk_dh: exponent;
+                let opk_dh_pub = exp(g, opk_dh) in
+                new opk_kem_sk: kem_sk;
+                let opk_kem_pub = kem_pk_of(opk_kem_sk) in
+                out(net, (opk_dh_pub, opk_kem_pub));
+                (
+                    InitiatorX3DH(ik_a, IK_b_pub, spk_dh_pub, spk_kem_pub,
+                                  opk_dh_pub, opk_kem_pub)
+                  | ResponderX3DH(ik_b, spk_dh, spk_kem_sk, opk_dh, opk_kem_sk)
+                )
+            )
+        )
+      | (
+            (* The forward-secrecy compromise: everything long-term-lived
+               leaks, but only after phase 0's sessions (each with its own
+               never-leaked, single-use OPK) have already run. *)
+            phase 1;
+            out(net, (ik_a, ik_b, spk_dh, spk_kem_sk))
+        )
+    )

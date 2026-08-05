@@ -1,0 +1,62 @@
+[package]
+name = "novachannel-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Standalone workspace root: keeps this nightly-only, ASan-instrumented
+# crate (and its own separate Cargo.lock) out of the main workspace's
+# stable-toolchain build/test/clippy runs entirely, rather than needing
+# every one of those commands to remember to `--exclude` it.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.novachannel]
+path = ".."
+
+[[bin]]
+name = "prekey_bundle"
+path = "fuzz_targets/prekey_bundle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "x3dh_respond"
+path = "fuzz_targets/x3dh_respond.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sealed_sender_open"
+path = "fuzz_targets/sealed_sender_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake_messages"
+path = "fuzz_targets/handshake_messages.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ratchet_open"
+path = "fuzz_targets/ratchet_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "group_commit"
+path = "fuzz_targets/group_commit.rs"
+test = false
+doc = false
+bench = false

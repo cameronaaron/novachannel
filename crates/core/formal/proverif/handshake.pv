@@ -1,0 +1,251 @@
+(*
+ * ProVerif model of crate::handshake's live, 3-message mutually
+ * authenticated handshake (see crates/core/src/handshake.rs's own module
+ * docs for the wire diagram this mirrors).
+ *
+ * STATUS: executed with ProVerif 2.05 (`proverif crates/core/formal/proverif/handshake.pv`).
+ * All 5 queries below returned exactly the result predicted next to each
+ * one at the time this note was last updated. If you change this model,
+ * re-run it -- a comment saying "expected: true" is not a substitute for
+ * the tool actually saying so after your edit.
+ *
+ * TYPING NOTE: only values that must never be directly observable as
+ * cleartext (DH exponents, KEM decapsulation keys/shared secrets, signing
+ * keys) get their own ProVerif type. Everything that's actually sent on
+ * the wire (DH public values, KEM public keys/ciphertexts, verification
+ * keys, signatures) is plain `bitstring`, the same idiom ProVerif's own
+ * bundled examples (e.g. `NSL.pv`) use -- it's what lets a signature or
+ * ciphertext be built directly over a tuple of mixed-origin fields
+ * without a wall of explicit type-converter casts.
+ *
+ * WHAT THIS MODELS
+ * Both hybrid legs (X25519 Diffie-Hellman, ML-KEM-1024 encapsulation) are
+ * modeled explicitly, not collapsed into one abstract secret, since the
+ * whole point of the hybrid design is that either leg alone must suffice
+ * for secrecy. HKDF/SHA-256 are modeled as uninterpreted functions (`kdf`,
+ * `hash`) -- the standard random-oracle abstraction for symbolic protocol
+ * analysis; this model says nothing about HKDF's own properties, only
+ * about how the protocol uses whatever it outputs.
+ *
+ * WHAT THIS DOES NOT MODEL
+ * - Deniability. ProVerif's native query language checks reachability and
+ *   correspondence properties, not the simulation-based definitions
+ *   deniability needs. This handshake makes no deniability claim anyway
+ *   (crate::handshake's own docs: it is deliberately non-repudiable,
+ *   unlike crate::x3dh) -- see x3dh.pv for the module that *does* claim
+ *   deniability, and that file's note on why this tool still can't check
+ *   that particular property either.
+ * - The wire encoding itself (crate::wire's length-prefixing, malformed-
+ *   input rejection). This is a protocol-logic model, not a parser
+ *   fuzzer -- crates/core/fuzz covers that ground with real code.
+ * - Concrete algorithm security (X25519's discrete-log hardness,
+ *   ML-KEM-1024's module-LWE hardness, ChaCha20-Poly1305's IND-CCA2
+ *   security, HKDF/SHA-256 as a real random oracle). A symbolic
+ *   Dolev-Yao attacker can't break these directly; only combine, replay,
+ *   or misuse whatever the protocol exposes.
+ *)
+
+(* ---------- network ---------- *)
+free net: channel.
+
+(* ---------- classical Diffie-Hellman. Public values (`g`, every
+   `exp(...)` result) are plain `bitstring` -- see the TYPING NOTE above;
+   only the exponent itself is a dedicated, never-sent type. ---------- *)
+type exponent.
+const g: bitstring [data].
+fun exp(bitstring, exponent): bitstring.
+equation forall x: exponent, y: exponent; exp(exp(g, x), y) = exp(exp(g, y), x).
+
+(* ---------- ML-KEM, abstracted as randomized public-key encryption of a
+   fresh symmetric value -- the standard symbolic-model idiom for a KEM:
+   the encapsulator picks the shared secret itself and "encrypts" it under
+   the recipient's public key, with an explicit randomness argument so two
+   encapsulations to the same key are unlinkable to the attacker. The
+   decapsulation key and the shared secret it recovers are the only
+   dedicated types here; the public key and ciphertext are `bitstring`. ---------- *)
+type kem_sk.
+type kem_ss.
+fun kem_pk_of(kem_sk): bitstring.
+fun kem_encap(bitstring, kem_ss, bitstring): bitstring.
+reduc forall sk: kem_sk, ss: kem_ss, r: bitstring;
+  kem_decap(kem_encap(kem_pk_of(sk), ss, r), sk) = ss.
+
+(* ---------- hybrid Ed25519 + ML-DSA-87 signatures, collapsed to one
+   abstract signature scheme -- ProVerif has no notion of "two schemes,
+   both must verify"; modeling the hybrid pair's actual security property
+   (forging requires breaking both) as one unforgeable signature is the
+   correct upper bound on what a symbolic attacker gets either way. ---------- *)
+type sig_sk.
+fun sig_pk_of(sig_sk): bitstring.
+fun sign(bitstring, sig_sk): bitstring.
+reduc forall m: bitstring, sk: sig_sk; checksign(sign(m, sk), sig_pk_of(sk)) = m.
+
+(* ---------- KDF / transcript hash (random-oracle abstraction) ---------- *)
+fun kdf(bitstring): bitstring.
+fun hash(bitstring): bitstring.
+
+(* ---------- AEAD transport, used only to observe how SK protects data ---------- *)
+fun senc(bitstring, bitstring): bitstring.
+reduc forall m: bitstring, k: bitstring; sdec(senc(m, k), k) = m.
+
+(* ---------- events for the authentication correspondence ----------
+ * Split into a "signed" event fired the instant each signature is
+ * produced and an "accepted" event fired once the *other* party has
+ * verified it, so the correspondence directly says what the signature
+ * is supposed to guarantee: whoever accepted a signature over a given
+ * transcript can only have done so because the claimed signer really
+ * produced it over that exact transcript, and (via inj-event) at most
+ * once per real signing. *)
+event ResponderSigned(bitstring).                (* transcript1 *)
+event InitiatorAccepted(bitstring, bitstring, bitstring). (* self, peer, transcript1 *)
+
+event InitiatorSigned(bitstring, bitstring).      (* self, transcript2 *)
+event ResponderAccepted(bitstring, bitstring, bitstring). (* self, peer, transcript2 *)
+
+(* ---------- the secret this model checks stays secret ---------- *)
+free secretApplicationData: bitstring [private].
+
+(* ---------- the two honest, mutually-pinned parties. Declared as
+   top-level `free ... [private]` names (rather than `new`-restricted
+   inside `process`) specifically so the queries below can reference
+   `sig_pk_of(sk_a)`/`sig_pk_of(sk_b)` directly and ask about *this*
+   concrete honest pair -- an unrestricted `query a: bitstring, ...`
+   would also match an attacker who registers their own key and simply
+   never runs the honest `Initiator`/`Responder` roles at all, which
+   is not an authentication failure, just a query that forgot to say
+   which identities are supposed to be honest. `[private]`, same as any
+   other `new`, still keeps the raw secret key off the wire -- only the
+   derived public key is ever `out`. ---------- *)
+free sk_a: sig_sk [private].
+free sk_b: sig_sk [private].
+
+(* ================= Initiator role =================
+ * my_sk: my long-term signing key. peer_pk: the identity I've pinned and
+ * expect to be talking to (crate::handshake's explicit-pinning model --
+ * module docs: "there is no CA hierarchy here"). *)
+let Initiator(my_sk: sig_sk, peer_pk: bitstring) =
+    new x: exponent;
+    new kem_sk_i: kem_sk;
+    let eph_i = exp(g, x) in
+    let kem_pk_i = kem_pk_of(kem_sk_i) in
+    out(net, (eph_i, kem_pk_i));
+
+    in(net, (eph_r: bitstring, kem_ct: bitstring, resp_id: bitstring, sig1: bitstring));
+    let transcript1 = (eph_i, kem_pk_i, eph_r, kem_ct, resp_id) in
+    if resp_id = peer_pk then
+    let (=transcript1) = checksign(sig1, peer_pk) in
+    event InitiatorAccepted(sig_pk_of(my_sk), peer_pk, transcript1);
+
+    let dh_shared = exp(eph_r, x) in
+    let kem_shared = kem_decap(kem_ct, kem_sk_i) in
+
+    let my_pk = sig_pk_of(my_sk) in
+    let transcript2 = (transcript1, sig1, my_pk) in
+    let sig2 = sign(transcript2, my_sk) in
+    event InitiatorSigned(my_pk, transcript2);
+    out(net, (my_pk, sig2));
+
+    let final_transcript = (transcript2, sig2) in
+    let sk = kdf((dh_shared, kem_shared, hash(final_transcript))) in
+    out(net, senc(secretApplicationData, sk)).
+
+(* ================= Responder role ================= *)
+let Responder(my_sk: sig_sk) =
+    let my_pk = sig_pk_of(my_sk) in
+    in(net, (eph_i: bitstring, kem_pk_i: bitstring));
+
+    new y: exponent;
+    new ss: kem_ss;
+    new r: bitstring;
+    let eph_r = exp(g, y) in
+    let kem_ct = kem_encap(kem_pk_i, ss, r) in
+
+    let transcript1 = (eph_i, kem_pk_i, eph_r, kem_ct, my_pk) in
+    let sig1 = sign(transcript1, my_sk) in
+    event ResponderSigned(transcript1);
+    out(net, (eph_r, kem_ct, my_pk, sig1));
+
+    in(net, (peer_pk: bitstring, sig2: bitstring));
+    let transcript2 = (transcript1, sig1, peer_pk) in
+    let (=transcript2) = checksign(sig2, peer_pk) in
+    event ResponderAccepted(my_pk, peer_pk, transcript2);
+
+    let dh_shared = exp(eph_i, y) in
+    let final_transcript = (transcript2, sig2) in
+    let sk = kdf((dh_shared, ss, hash(final_transcript))) in
+    in(net, encrypted: bitstring);
+    let received = sdec(encrypted, sk) in
+    (* Deliberately no `out(net, received)` here: echoing the decrypted
+       plaintext back onto the public channel would leak
+       `secretApplicationData` to the attacker *by construction* (the
+       model would be testing whether the attacker can read something it
+       was just handed in cleartext, not a property of the protocol).
+       Successfully reaching `sdec` at all is already everything this
+       model needs from the responder side. *)
+    0.
+
+(* ================= queries =================
+ * ProVerif requires all `query` declarations before the top-level
+ * `process` -- see the `process` block below for the two honest parties
+ * and replicated roles these queries run against.
+ *
+ * 1. Secrecy: the attacker never learns application data sent over a
+ *    completed session between the two honest, correctly-pinned parties.
+ *
+ * 2/3. Authentication, both directions, injective (each acceptance
+ *    corresponds to a distinct real signing -- rules out both "nobody
+ *    ever really signed this" and "one real signature was replayed to
+ *    justify two acceptances"):
+ *    - Whenever an initiator accepts responder `b`'s signature over
+ *      transcript1, responder `b` really produced that exact signing
+ *      event, once.
+ *    - Whenever a responder accepts initiator `a`'s signature over
+ *      transcript2, initiator `a` really produced that exact signing
+ *      event, once.
+ *
+ * Expected results (predictions, per the STATUS note above, not
+ * confirmed facts):
+ * - `query attacker(secretApplicationData).` -- expected: false (not
+ *   derivable), i.e. secrecy holds, since deriving `sk` needs either the
+ *   real `dh_shared` (needs `x` or `y`, never sent on the wire) or the
+ *   real `kem_shared` (needs `kem_sk_i`, likewise never sent) -- the
+ *   hybrid combiner means the attacker would need both ephemeral legs,
+ *   and this model gives them neither.
+ * - Both injective correspondence queries, restricted to the concrete
+ *   honest pair `sk_a`/`sk_b` (see that declaration's own comment for
+ *   why) -- expected: true, since `transcript1`/`transcript2` each
+ *   include the full preceding exchange, so no two distinct sessions can
+ *   ever produce the same transcript value for the attacker to replay a
+ *   stale signature against.
+ *)
+query attacker(secretApplicationData).
+
+query tr: bitstring;
+  inj-event(InitiatorAccepted(sig_pk_of(sk_a), sig_pk_of(sk_b), tr)) ==> inj-event(ResponderSigned(tr)).
+query tr: bitstring;
+  inj-event(InitiatorAccepted(sig_pk_of(sk_b), sig_pk_of(sk_a), tr)) ==> inj-event(ResponderSigned(tr)).
+
+query tr: bitstring;
+  inj-event(ResponderAccepted(sig_pk_of(sk_a), sig_pk_of(sk_b), tr)) ==> inj-event(InitiatorSigned(sig_pk_of(sk_b), tr)).
+query tr: bitstring;
+  inj-event(ResponderAccepted(sig_pk_of(sk_b), sig_pk_of(sk_a), tr)) ==> inj-event(InitiatorSigned(sig_pk_of(sk_a), tr)).
+
+(* ================= top level =================
+ * Two honest, mutually-pinned parties, each willing to run either role
+ * an unbounded number of times. The attacker can additionally register
+ * and run their own identities against either honest party (implicit:
+ * anything the attacker can construct from public/leaked values, per
+ * ProVerif's standard active-attacker model) -- which is exactly why the
+ * authentication queries above are restricted to the concrete honest
+ * pair rather than quantified over all identities. *)
+process
+    let pk_a = sig_pk_of(sk_a) in
+    let pk_b = sig_pk_of(sk_b) in
+    out(net, pk_a);
+    out(net, pk_b);
+    (
+        (!Initiator(sk_a, pk_b))
+      | (!Initiator(sk_b, pk_a))
+      | (!Responder(sk_a))
+      | (!Responder(sk_b))
+    )
