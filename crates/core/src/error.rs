@@ -34,6 +34,16 @@ pub enum Error {
     UnauthorizedDevice,
     #[error("signed device list version is not newer than the last one accepted")]
     StaleDeviceList,
+    #[error("group has reached its fixed leaf capacity; this module does not support resizing")]
+    GroupFull,
+    #[error("referenced leaf index is not a current group member")]
+    NotAGroupMember,
+    #[error("could not locate a decryptable path secret in this commit's update path")]
+    CommitNotDecryptable,
+    #[error(
+        "a received commit's public path key did not match the key its decrypted secret derives"
+    )]
+    PathKeyMismatch,
 }
 
 pub type Result<T> = core::result::Result<T, Error>;

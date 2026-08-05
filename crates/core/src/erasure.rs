@@ -40,7 +40,7 @@ use crate::error::{Error, Result};
 /// `x^8 + x^4 + x^3 + x^2 + 1` (`0x11D`) and generator `2` — the same
 /// field and generator used by, e.g., QR codes' Reed–Solomon coding.
 /// Rebuilt fresh per call rather than cached: 256 iterations is a
-/// negligible cost next to the ML-KEM-768 handshake material this module
+/// negligible cost next to the ML-KEM-1024 handshake material this module
 /// exists to chunk, and it avoids reaching for `std::sync::OnceLock` for
 /// a workspace-wide singleton to save microseconds nothing here is
 /// sensitive to.

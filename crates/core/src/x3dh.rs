@@ -1,5 +1,5 @@
 //! Asynchronous, deniable session establishment — X3DH (Signal's original
-//! design), extended with a hybrid ML-KEM-768 leg the way Signal's own
+//! design), extended with a hybrid ML-KEM-1024 leg the way Signal's own
 //! PQXDH extends it.
 //!
 //! # Why this exists alongside [`crate::handshake`]
@@ -44,8 +44,12 @@
 //!                             one DH term whose secret is deleted after
 //!                             one use, so it survives even a later,
 //!                             full compromise of IK_b and SPK_b's secrets
-//! SS_pq = ML-KEM-768 encapsulated against SPK_b's KEM public key
-//! SK = HKDF(DH1 || DH2 || DH3 || [DH4] || SS_pq)
+//! SS_pq  = ML-KEM-1024 encapsulated against SPK_b's KEM public key
+//! SS_pq' = ML-KEM-1024 encapsulated against OPK_b's KEM public key --
+//!                             present only alongside DH4; deleted after one
+//!                             use the same way, so it survives a later
+//!                             compromise of SPK_b's ML-KEM secret too
+//! SK = HKDF(DH1 || DH2 || DH3 || [DH4] || SS_pq || [SS_pq'])
 //! ```
 //!
 //! Two DH terms alone (just DH2/DH3, "ephemeral-only") would give forward
@@ -228,11 +232,19 @@ pub fn initiate(
     let dh4 = peer_bundle
         .one_time_prekey
         .as_ref()
-        .map(|(_, opk_pub)| ephemeral_secret.diffie_hellman(opk_pub));
+        .map(|(_, opk_pub, _)| ephemeral_secret.diffie_hellman(opk_pub));
 
     let (ml_kem_ct, ml_kem_ss) = peer_bundle.spk_kem_public().encapsulate_with_rng(&mut rng);
+    // Encapsulated only if the bundle carried an OPK: like DH4, this term's
+    // secret is deleted the moment the responder consumes it, so it gives
+    // the ML-KEM leg the same single-use forward secrecy DH4 gives the
+    // classical leg (see `OneTimePreKey`'s docs).
+    let ml_kem_opk = peer_bundle
+        .one_time_prekey
+        .as_ref()
+        .map(|(_, _, opk_kem_pub)| opk_kem_pub.encapsulate_with_rng(&mut rng));
 
-    let mut combined_bytes = Vec::with_capacity(32 * 4 + 32);
+    let mut combined_bytes = Vec::with_capacity(32 * 4 + 32 * 2);
     combined_bytes.extend_from_slice(dh1.as_bytes());
     combined_bytes.extend_from_slice(dh2.as_bytes());
     combined_bytes.extend_from_slice(dh3.as_bytes());
@@ -240,6 +252,9 @@ pub fn initiate(
         combined_bytes.extend_from_slice(dh4.as_bytes());
     }
     combined_bytes.extend_from_slice(&ml_kem_ss);
+    if let Some((_, opk_ss)) = &ml_kem_opk {
+        combined_bytes.extend_from_slice(opk_ss);
+    }
     let combined = CombinedSecret(combined_bytes);
     let keys = derive(&combined)?;
 
@@ -248,9 +263,11 @@ pub fn initiate(
     w.put_fixed(ephemeral_public.as_bytes());
     w.put_var(&ml_kem_ct);
     match &peer_bundle.one_time_prekey {
-        Some((id, _)) => {
+        Some((id, _, _)) => {
             w.put_fixed(&[1]);
             w.put_fixed(&id.to_be_bytes());
+            let (opk_ct, _) = ml_kem_opk.as_ref().expect("set together with dh4 above");
+            w.put_var(opk_ct);
         }
         None => w.put_fixed(&[0]),
     }
@@ -310,13 +327,17 @@ pub fn respond(
     let initiator_ephemeral = kex::x25519_public_from_bytes(r.get_fixed(32)?)?;
     let ml_kem_ct = kex::ml_kem_ciphertext_from_bytes(r.get_var()?)?;
     let has_opk = r.get_fixed(1)?[0];
-    let opk_id = match has_opk {
+    let opk_id_and_ct = match has_opk {
         0 => None,
-        1 => Some(u32::from_be_bytes(
-            r.get_fixed(4)?
-                .try_into()
-                .expect("get_fixed(4) already guarantees the length"),
-        )),
+        1 => {
+            let id = u32::from_be_bytes(
+                r.get_fixed(4)?
+                    .try_into()
+                    .expect("get_fixed(4) already guarantees the length"),
+            );
+            let opk_ct = kex::ml_kem_ciphertext_from_bytes(r.get_var()?)?;
+            Some((id, opk_ct))
+        }
         _ => return Err(Error::Malformed("invalid one-time-prekey presence flag")),
     };
     let header_len = r.consumed();
@@ -326,7 +347,10 @@ pub fn respond(
         return Err(Error::Malformed("trailing bytes in x3dh init message"));
     }
 
-    let one_time_secret = opk_id.map(|id| opks.take(id)).transpose()?;
+    let one_time_secret = opk_id_and_ct
+        .as_ref()
+        .map(|(id, _)| opks.take(*id))
+        .transpose()?;
 
     let dh1 = my_spk.diffie_hellman(&initiator_dh_identity);
     let dh2 = my_dh_identity.diffie_hellman(&initiator_ephemeral);
@@ -335,8 +359,12 @@ pub fn respond(
         .as_ref()
         .map(|opk| opk.diffie_hellman(&initiator_ephemeral));
     let ml_kem_ss = my_spk.decapsulate(&ml_kem_ct);
+    let ml_kem_opk_ss = one_time_secret
+        .as_ref()
+        .zip(opk_id_and_ct.as_ref())
+        .map(|(opk, (_, opk_ct))| opk.decapsulate(opk_ct));
 
-    let mut combined_bytes = Vec::with_capacity(32 * 4 + 32);
+    let mut combined_bytes = Vec::with_capacity(32 * 4 + 32 * 2);
     combined_bytes.extend_from_slice(dh1.as_bytes());
     combined_bytes.extend_from_slice(dh2.as_bytes());
     combined_bytes.extend_from_slice(dh3.as_bytes());
@@ -344,6 +372,9 @@ pub fn respond(
         combined_bytes.extend_from_slice(dh4.as_bytes());
     }
     combined_bytes.extend_from_slice(&ml_kem_ss);
+    if let Some(opk_ss) = &ml_kem_opk_ss {
+        combined_bytes.extend_from_slice(opk_ss);
+    }
     let combined = CombinedSecret(combined_bytes);
     let keys = derive(&combined)?;
 

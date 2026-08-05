@@ -10,7 +10,7 @@
 //!   covers every record in the session.
 //! - **Post-compromise security.** Either party can call
 //!   [`RatchetedSession::initiate_ratchet`] to mix a fresh hybrid
-//!   X25519 + ML-KEM-768 exchange (reusing [`crate::kex`]) into an
+//!   X25519 + ML-KEM-1024 exchange (reusing [`crate::kex`]) into an
 //!   HKDF-derived root key, advancing to a new "epoch" with fresh chains.
 //!   A session compromised at some point recovers confidentiality once a
 //!   ratchet step completes and both sides adopt the new epoch.
@@ -33,7 +33,7 @@
 //!
 //! By default this module does a **synchronous, one-shot** hybrid re-key
 //! ([`RatchetedSession::initiate_ratchet`]): one full X25519 public key +
-//! one full ML-KEM-768 encapsulation key in the initiating message, one
+//! one full ML-KEM-1024 encapsulation key in the initiating message, one
 //! full ciphertext in the reply — the same shapes [`crate::kex`] already
 //! uses for the initial handshake, just re-run mid-session. It also offers
 //! an **incremental, erasure-coded** alternative

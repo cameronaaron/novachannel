@@ -678,7 +678,7 @@ mechanism sized to what could actually be checked here:
   discarded immediately after use. `each_message_is_sealed_under_a_different_key`
   proves the chain is actually advancing, not silently reusing one key.
 - **Post-compromise security**: `initiate_ratchet` re-runs the *existing*,
-  already-tested hybrid X25519 + ML-KEM-768 exchange from `kex.rs`
+  already-tested hybrid X25519 + ML-KEM-1024 exchange from `kex.rs`
   mid-session — one full KEM payload each way, not SPQR's incrementally
   chunked one — and mixes the fresh shared secret into a new root key via
   HKDF, exactly mirroring `handshake::finalize_keys`'s own derivation

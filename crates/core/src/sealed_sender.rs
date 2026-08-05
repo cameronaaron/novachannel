@@ -16,7 +16,7 @@
 //!
 //! # Mechanism
 //! An envelope carries exactly one thing an outside observer can see: a
-//! fresh, single-use ephemeral hybrid public key (X25519 + ML-KEM-768),
+//! fresh, single-use ephemeral hybrid public key (X25519 + ML-KEM-1024),
 //! generated new for this one message and never reused. That key is
 //! Diffie-Hellman'd / encapsulated against the *recipient's* long-term
 //! [`crate::prekey::SealingPublicKey`] to derive a one-time AEAD key, which

@@ -189,7 +189,7 @@ so the same class of off-by-one couldn't resurface in a sibling constant.
 
 ## 4. `novachannel` (core): hybrid post-quantum channel
 
-Hybrid key exchange (X25519 + ML-KEM-768) and hybrid signatures (Ed25519 +
+Hybrid key exchange (X25519 + ML-KEM-1024) and hybrid signatures (Ed25519 +
 ML-DSA-65) — the exact algorithms NIST ratified as FIPS 203 and FIPS 204 in
 2024, via RustCrypto's pure-Rust `ml-kem`/`ml-dsa` crates (this project
 originally used `pqcrypto-kyber`/`pqcrypto-dilithium`, C bindings to the
@@ -221,7 +221,7 @@ two properties the base session doesn't have: a fresh, single-use AEAD key
 per record derived from a one-way HMAC-SHA256 hash chain (forward secrecy —
 recovering the chain's current state cannot recover a past message key),
 and an explicit, coordinated re-key step (`initiate_ratchet`) that reruns
-the same hybrid X25519 + ML-KEM-768 exchange from `kex.rs` mid-session and
+the same hybrid X25519 + ML-KEM-1024 exchange from `kex.rs` mid-session and
 mixes the result into a fresh root key (post-compromise security — a
 session compromised at some point recovers confidentiality once a ratchet
 step completes).
@@ -290,7 +290,7 @@ in this workspace was: by testing the full, undiminished chunk set, not
 just a synthetic loss pattern chosen to avoid the bug by construction.
 
 What this does *not* claim relative to SPQR: it serializes the same
-ordinary ML-KEM-768 bytes `kex.rs` already produces and splits *those*
+ordinary ML-KEM-1024 bytes `kex.rs` already produces and splits *those*
 into shards, rather than re-encoding the KEM algorithm's own internal
 structure the way SPQR's `incremental_mlkem768` does — simpler, but it
 doesn't shrink any single chunk's *meaning*, only its size on the wire.
@@ -309,7 +309,7 @@ proves who authenticated that specific exchange. `crate::x3dh` is a
 second, additive session-establishment path (producing the same
 `EstablishedSession` type, so it plugs into `ratchet`/`transport`
 unmodified) built on the classic X3DH design Signal's own protocol
-originates from, extended with a hybrid ML-KEM-768 leg the way Signal's
+originates from, extended with a hybrid ML-KEM-1024 leg the way Signal's
 PQXDH extends it: `crate::prekey::PreKeyBundle` publishes a long-term DH
 identity key, a medium-term signed prekey (DH + ML-KEM, signed once by
 the owner's `Identity` and reused across many sessions), and an optional
@@ -331,7 +331,7 @@ encrypts the sender's identity so only the *recipient* can read it, but a
 relay never needs to open that payload to do its job. `crate::sealed_sender`
 is a distinct, one-shot envelope built for exactly the relay's-eye view,
 modeled on Signal's own sealed sender: a fresh, single-use ephemeral
-hybrid key (X25519 + ML-KEM-768), generated new per message and never
+hybrid key (X25519 + ML-KEM-1024), generated new per message and never
 reused, is the only value an outside observer sees. It's combined with
 the *recipient's* long-term key to derive a one-time AEAD key that seals
 a `SenderCertificate` (the sender's identity, signed by whatever the

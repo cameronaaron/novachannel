@@ -26,7 +26,7 @@
 //! used (see `crate::x3dh` module docs for why that matters).
 
 use kem::{Kem, KeyExport};
-use ml_kem::MlKem768;
+use ml_kem::MlKem1024;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
 use crate::error::{Error, Result};
@@ -66,10 +66,22 @@ impl DhIdentity {
 /// One unsigned, single-use prekey. `id` is transport-level bookkeeping
 /// only (which key a peer's init message referenced) — it carries no
 /// cryptographic weight itself.
+///
+/// Carries its own ML-KEM-1024 leg alongside the DH one, distinct from the
+/// [`SignedPreKey`]'s: the SPK's KEM keypair is reused across every session
+/// established against it, so a later compromise of its secret plus a
+/// recorded transcript recovers the PQ contribution to `SK` for any session
+/// that didn't also consume an OPK. This one is deleted the moment it's
+/// used (same as the OPK's DH half always was), so it gives the *quantum*
+/// leg of the handshake the same single-use forward secrecy the DH leg
+/// already had — a quantum adversary who later breaks the SPK's ML-KEM
+/// keypair still can't recover `SK` for a session that consumed an OPK.
 pub struct OneTimePreKey {
     pub id: u32,
     secret: StaticSecret,
     public: X25519Public,
+    kem_secret: MlKemDecapsulationKey,
+    kem_public: MlKemEncapsulationKey,
 }
 
 impl OneTimePreKey {
@@ -77,15 +89,30 @@ impl OneTimePreKey {
         let mut rng = csprng();
         let secret = StaticSecret::random_from_rng(&mut rng);
         let public = X25519Public::from(&secret);
-        OneTimePreKey { id, secret, public }
+        let (kem_secret, kem_public) = MlKem1024::generate_keypair_from_rng(&mut rng);
+        OneTimePreKey {
+            id,
+            secret,
+            public,
+            kem_secret,
+            kem_public,
+        }
     }
 
-    pub fn public(&self) -> (u32, X25519Public) {
-        (self.id, self.public)
+    pub fn public(&self) -> (u32, X25519Public, MlKemEncapsulationKey) {
+        (self.id, self.public, self.kem_public.clone())
     }
 
     pub(crate) fn diffie_hellman(&self, their: &X25519Public) -> x25519_dalek::SharedSecret {
         self.secret.diffie_hellman(their)
+    }
+
+    pub(crate) fn decapsulate(
+        &self,
+        ciphertext: &kex::MlKemCiphertext,
+    ) -> kem::SharedKey<MlKem1024> {
+        use kem::Decapsulate;
+        self.kem_secret.decapsulate(ciphertext)
     }
 }
 
@@ -107,7 +134,7 @@ impl OneTimePreKeyStore {
     }
 
     /// The public halves to publish in a [`PreKeyBundle`].
-    pub fn public_keys(&self) -> Vec<(u32, X25519Public)> {
+    pub fn public_keys(&self) -> Vec<(u32, X25519Public, MlKemEncapsulationKey)> {
         self.keys.iter().map(OneTimePreKey::public).collect()
     }
 
@@ -146,7 +173,7 @@ impl SignedPreKey {
         let mut rng = csprng();
         let dh_secret = StaticSecret::random_from_rng(&mut rng);
         let dh_public = X25519Public::from(&dh_secret);
-        let (kem_secret, kem_public) = MlKem768::generate_keypair_from_rng(&mut rng);
+        let (kem_secret, kem_public) = MlKem1024::generate_keypair_from_rng(&mut rng);
         let signature = signing_identity.sign(&spk_signed_bytes(&dh_public, &kem_public));
         SignedPreKey {
             dh_secret,
@@ -164,7 +191,7 @@ impl SignedPreKey {
     pub(crate) fn decapsulate(
         &self,
         ciphertext: &kex::MlKemCiphertext,
-    ) -> kem::SharedKey<MlKem768> {
+    ) -> kem::SharedKey<MlKem1024> {
         use kem::Decapsulate;
         self.kem_secret.decapsulate(ciphertext)
     }
@@ -245,7 +272,7 @@ pub struct PreKeyBundle {
     pub identity: PublicIdentity,
     pub dh_identity: X25519Public,
     spk: PublicSignedPreKey,
-    pub one_time_prekey: Option<(u32, X25519Public)>,
+    pub one_time_prekey: Option<(u32, X25519Public, MlKemEncapsulationKey)>,
 }
 
 impl PreKeyBundle {
@@ -253,7 +280,7 @@ impl PreKeyBundle {
         identity: PublicIdentity,
         dh_identity: &DhIdentity,
         spk: &SignedPreKey,
-        one_time_prekey: Option<(u32, X25519Public)>,
+        one_time_prekey: Option<(u32, X25519Public, MlKemEncapsulationKey)>,
     ) -> Self {
         PreKeyBundle {
             identity,
@@ -285,10 +312,11 @@ impl PreKeyBundle {
         w.put_fixed(self.dh_identity.as_bytes());
         self.spk.write(w);
         match &self.one_time_prekey {
-            Some((id, public)) => {
+            Some((id, public, kem_public)) => {
                 w.put_fixed(&[1]);
                 w.put_fixed(&id.to_be_bytes());
                 w.put_fixed(public.as_bytes());
+                w.put_var(&kem_public.to_bytes());
             }
             None => w.put_fixed(&[0]),
         }
@@ -308,7 +336,8 @@ impl PreKeyBundle {
                         .expect("get_fixed(4) already guarantees the length"),
                 );
                 let public = kex::x25519_public_from_bytes(r.get_fixed(32)?)?;
-                Some((id, public))
+                let kem_public = kex::ml_kem_public_from_bytes(r.get_var()?)?;
+                Some((id, public, kem_public))
             }
             _ => return Err(Error::Malformed("invalid one-time-prekey presence flag")),
         };

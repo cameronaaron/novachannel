@@ -73,11 +73,11 @@ this document exists to avoid.
 `novachannel::ratchet` (added subsequently, see
 `ENGINEERING-STANDARDS.md` §6.15) closes the gap a different way: the same
 two named properties — forward secrecy per message via an HMAC-SHA256 hash
-chain, post-compromise security via a periodic hybrid X25519+ML-KEM-768
+chain, post-compromise security via a periodic hybrid X25519+ML-KEM-1024
 re-key — through a synchronous, one-shot re-key (reusing the *existing*,
 already-tested `kex.rs` exchange, not a new incremental encoding) instead
 of SPQR's chunked/erasure-coded one. The tradeoff is explicit: a ratchet
-step costs one full ~1.2KB KEM payload each way instead of being spread
+step costs one full ~1.5KB KEM payload each way instead of being spread
 thin across many messages, it requires in-order delivery (no reordering
 tolerance the way the base transport has), and it has ordinary adversarial
 unit tests, not hax/F*/ProVerif-level formal verification. A real,
@@ -88,7 +88,7 @@ A subsequent addition (`ENGINEERING-STANDARDS.md` §6.17,
 closing the *verification* one: `initiate_incremental_ratchet` splits the
 same re-key material into erasure-coded chunks tolerant of losing some of
 them, closer to SPQR's chunked design than the one-shot path is. It still
-serializes ordinary ML-KEM-768 bytes and splits those, rather than
+serializes ordinary ML-KEM-1024 bytes and splits those, rather than
 re-encoding the KEM algorithm's internal structure the way SPQR's
 `incremental_mlkem768` does, and its erasure code has the same
 "reference implementation, not independently cryptanalyzed" status as

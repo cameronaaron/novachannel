@@ -30,7 +30,7 @@ fn make_responder(with_opk: bool) -> Responder {
 }
 
 fn bundle(r: &Responder) -> PreKeyBundle {
-    let opk_public = r.opks.public_keys().first().copied();
+    let opk_public = r.opks.public_keys().into_iter().next();
     PreKeyBundle::build(
         r.signing_identity.public(),
         &r.dh_identity,
@@ -305,7 +305,8 @@ fn unknown_one_time_prekey_id_is_rejected() {
     // wire internals from the integration-test crate.
     let mut responder = make_responder(false);
     let mut peer_bundle = bundle(&responder);
-    peer_bundle.one_time_prekey = Some((999, DhIdentity::generate().public()));
+    let (_, bogus_dh, bogus_kem) = OneTimePreKey::generate(999).public();
+    peer_bundle.one_time_prekey = Some((999, bogus_dh, bogus_kem));
 
     let initiator_identity = Identity::generate();
     let initiator_dh = DhIdentity::generate();

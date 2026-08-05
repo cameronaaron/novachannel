@@ -1,6 +1,10 @@
 //! Ephemeral hybrid key exchange: X25519 (classical Diffie-Hellman) combined
-//! with ML-KEM-768 (FIPS 203, the NIST-ratified post-quantum KEM formerly
-//! known during standardization as "Kyber768").
+//! with ML-KEM-1024 (FIPS 203, the NIST-ratified post-quantum KEM formerly
+//! known during standardization as "Kyber1024") — NIST security category 5,
+//! the highest of the three standardized parameter sets, chosen over the
+//! smaller ML-KEM-768 (category 3) for the largest available classical- and
+//! quantum-security margin at the cost of larger public keys and
+//! ciphertexts (~1568/1568 bytes vs. 768's ~1184/1088).
 //!
 //! The two shared secrets are concatenated, never mixed by anything cleverer
 //! than that, and fed into HKDF by the caller. This is the standard hybrid
@@ -11,16 +15,16 @@
 //! what gives the channel forward secrecy.
 
 use kem::{Decapsulate, Encapsulate, Kem};
-use ml_kem::MlKem768;
+use ml_kem::MlKem1024;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519Public};
 use zeroize::Zeroize;
 
 use crate::error::{Error, Result};
 use crate::rng::csprng;
 
-pub type MlKemEncapsulationKey = kem::EncapsulationKey<MlKem768>;
-pub type MlKemDecapsulationKey = kem::DecapsulationKey<MlKem768>;
-pub type MlKemCiphertext = kem::Ciphertext<MlKem768>;
+pub type MlKemEncapsulationKey = kem::EncapsulationKey<MlKem1024>;
+pub type MlKemDecapsulationKey = kem::DecapsulationKey<MlKem1024>;
+pub type MlKemCiphertext = kem::Ciphertext<MlKem1024>;
 
 /// The combined, HKDF-ready shared secret from one hybrid exchange.
 pub struct SharedSecret(pub Vec<u8>);
@@ -44,7 +48,7 @@ impl InitiatorKex {
         let mut rng = csprng();
         let x25519_secret = EphemeralSecret::random_from_rng(&mut rng);
         let x25519_public = X25519Public::from(&x25519_secret);
-        let (ml_kem_secret, ml_kem_public) = MlKem768::generate_keypair_from_rng(&mut rng);
+        let (ml_kem_secret, ml_kem_public) = MlKem1024::generate_keypair_from_rng(&mut rng);
         InitiatorKex {
             x25519_secret,
             x25519_public,
