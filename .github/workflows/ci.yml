@@ -14,6 +14,13 @@ jobs:
       - name: Install Rust
         run: rustup component add rustfmt clippy
 
+      # scripts/check.sh's audit step needs this on PATH. Installed here
+      # (not just relied on in scheduled-security.yml's daily cron) so a PR
+      # that introduces a newly-vulnerable dependency is blocked before
+      # merge, not caught up to a day later on main.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:

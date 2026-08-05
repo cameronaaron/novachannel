@@ -38,7 +38,7 @@
 //! See `examples/echo.rs` for a full client/server handshake and
 //! encrypted exchange over TCP.
 
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 // Every `.unwrap()` this catches either gets replaced with a
 // `.expect("reason")` documenting why it can't actually fail, or is a
 // bug — the same discipline libsignal's own crates enforce

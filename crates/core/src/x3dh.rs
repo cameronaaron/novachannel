@@ -116,11 +116,41 @@ impl Drop for CombinedSecret {
 /// transport keys, the ratchet seed, and a single-use key for the init
 /// message's own payload (sealed before either directional `Sender` exists
 /// to send anything, so it can't reuse either of their sequence spaces).
+/// `i2r`/`r2i` are `Option` solely so `Drop` (below) can coexist with
+/// moving them out via [`SessionKeys::take_directional_keys`] — a struct
+/// with a `Drop` impl can't partially move a non-`Copy` field out by value.
+/// They're `Some` from construction until that single call site takes them.
 struct SessionKeys {
-    i2r: DirectionalKey,
-    r2i: DirectionalKey,
+    i2r: Option<DirectionalKey>,
+    r2i: Option<DirectionalKey>,
     ratchet_root: [u8; 32],
     init_payload_key: [u8; 32],
+}
+
+impl SessionKeys {
+    /// Takes both directional keys, leaving `self` to zeroize the two raw
+    /// arrays it still owns when it drops at the end of the caller's scope.
+    fn take_directional_keys(&mut self) -> (DirectionalKey, DirectionalKey) {
+        (
+            self.i2r
+                .take()
+                .expect("taken exactly once, right after derive()"),
+            self.r2i
+                .take()
+                .expect("taken exactly once, right after derive()"),
+        )
+    }
+}
+
+impl Drop for SessionKeys {
+    fn drop(&mut self) {
+        // `i2r`/`r2i` zeroize their own AEAD state on drop (chacha20poly1305's
+        // `zeroize` feature) whether still held here or already taken; the
+        // two raw arrays we hold directly need the same treatment
+        // `CombinedSecret` gives its input keying material.
+        self.ratchet_root.zeroize();
+        self.init_payload_key.zeroize();
+    }
 }
 
 fn derive(combined: &CombinedSecret) -> Result<SessionKeys> {
@@ -140,18 +170,21 @@ fn derive(combined: &CombinedSecret) -> Result<SessionKeys> {
     hk.expand(LABEL_INIT_PAYLOAD, &mut init_payload_key)
         .map_err(|_| Error::Malformed("HKDF expand failed"))?;
 
-    Ok(SessionKeys {
-        i2r: DirectionalKey::new(
+    let keys = SessionKeys {
+        i2r: Some(DirectionalKey::new(
             okm_i2r[..32].try_into().expect("okm_i2r is 44 bytes"),
             okm_i2r[32..].try_into().expect("okm_i2r is 44 bytes"),
-        ),
-        r2i: DirectionalKey::new(
+        )),
+        r2i: Some(DirectionalKey::new(
             okm_r2i[..32].try_into().expect("okm_r2i is 44 bytes"),
             okm_r2i[32..].try_into().expect("okm_r2i is 44 bytes"),
-        ),
+        )),
         ratchet_root,
         init_payload_key,
-    })
+    };
+    okm_i2r.zeroize();
+    okm_r2i.zeroize();
+    Ok(keys)
 }
 
 /// Seals under a single-use key with an all-zero nonce — safe here for the
@@ -256,7 +289,7 @@ pub fn initiate(
         combined_bytes.extend_from_slice(opk_ss);
     }
     let combined = CombinedSecret(combined_bytes);
-    let keys = derive(&combined)?;
+    let mut keys = derive(&combined)?;
 
     let mut w = Writer::new();
     w.put_fixed(my_dh_identity.public().as_bytes());
@@ -284,6 +317,7 @@ pub fn initiate(
     let sealed_payload = seal_init_payload(&keys.init_payload_key, &aad, &payload_plaintext)?;
     w.put_var(&sealed_payload);
 
+    let (i2r, r2i) = keys.take_directional_keys();
     Ok(InitiatedSession {
         message: InitMessage {
             bytes: w.into_bytes(),
@@ -292,8 +326,8 @@ pub fn initiate(
             peer: PeerInfo {
                 identity: peer_bundle.identity.clone(),
             },
-            sender: Sender::new(keys.i2r),
-            receiver: Receiver::new(keys.r2i),
+            sender: Sender::new(i2r),
+            receiver: Receiver::new(r2i),
             ratchet_root: keys.ratchet_root,
         },
     })
@@ -376,7 +410,7 @@ pub fn respond(
         combined_bytes.extend_from_slice(opk_ss);
     }
     let combined = CombinedSecret(combined_bytes);
-    let keys = derive(&combined)?;
+    let mut keys = derive(&combined)?;
 
     let mut aad = Vec::with_capacity(PAYLOAD_AAD_CONTEXT.len() + header_bytes.len());
     aad.extend_from_slice(PAYLOAD_AAD_CONTEXT);
@@ -390,12 +424,13 @@ pub fn respond(
         return Err(Error::Malformed("trailing bytes in x3dh init payload"));
     }
 
+    let (i2r, r2i) = keys.take_directional_keys();
     let session = EstablishedSession {
         peer: PeerInfo {
             identity: initiator_identity.clone(),
         },
-        sender: Sender::new(keys.r2i),
-        receiver: Receiver::new(keys.i2r),
+        sender: Sender::new(r2i),
+        receiver: Receiver::new(i2r),
         ratchet_root: keys.ratchet_root,
     };
 

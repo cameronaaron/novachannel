@@ -55,7 +55,7 @@
 //! to transport (broadcast commitments, point-to-point shares) however
 //! their deployment does so (over `novachannel` sessions, most naturally).
 
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 // Every `.unwrap()` this catches either gets replaced with a
 // `.expect("reason")` documenting why it can't actually fail, or is a
 // bug — the same discipline libsignal's own crates enforce

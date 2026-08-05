@@ -53,7 +53,7 @@
 //! greedily re-evicts as much of the stash as possible back into the path,
 //! deepest-eligible bucket first.
 
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 // Every `.unwrap()` this catches either gets replaced with a
 // `.expect("reason")` documenting why it can't actually fail, or is a
 // bug — the same discipline libsignal's own crates enforce
@@ -157,6 +157,23 @@ pub struct Client<V: Clone, S: ServerStorage<V>> {
     /// `position_map`/`stash`, it can be handed to a third party to audit,
     /// which is exactly the property that makes it useful.
     root: [u8; 32],
+}
+
+impl<V: Clone, S: ServerStorage<V>> Drop for Client<V, S> {
+    fn drop(&mut self) {
+        // `position_map`'s leaf assignments are cleared on drop, same
+        // standard as this workspace's other secret state. `stash`'s block
+        // values (`V`) are not zeroized here: `V` is caller-supplied and
+        // unbounded by `Zeroize`, so this only clears the position map, not
+        // the stash's payload bytes — a real, documented gap rather than a
+        // false completeness claim. Callers storing sensitive `V` should
+        // zeroize it themselves before a `Client` carrying it drops.
+        for leaf in self.position_map.values_mut() {
+            *leaf = 0;
+        }
+        self.position_map.clear();
+        self.stash.clear();
+    }
 }
 
 impl<V: Clone, S: ServerStorage<V>> Client<V, S> {

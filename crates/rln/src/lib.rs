@@ -44,7 +44,7 @@
 //! actually depends on. Tightening the declared degrees to match the
 //! measured value in every case is possible future work.
 
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 // Every `.unwrap()` this catches either gets replaced with a
 // `.expect("reason")` documenting why it can't actually fail, or is a
 // bug — the same discipline libsignal's own crates enforce
@@ -67,7 +67,16 @@ use merkle::{MerkleTree, PathStep};
 use permutation::{compress2, Params};
 
 /// A member's long-term secret. Never leaves the holder's process.
-#[derive(Clone, Copy, Debug)]
+///
+/// No `Debug` impl: unlike [`share::Share`] (individually hiding by
+/// construction — see that module's doc comment), a bare `sk` is the raw
+/// secret itself, so printing it is a straight key leak. Not `Copy` either
+/// (a `Drop` impl and `Copy` are mutually exclusive in Rust, and `Copy`
+/// would let the secret proliferate through implicit copies anyway) — the
+/// `Drop` impl below best-effort-clears the field this struct owns
+/// directly, the same standard `novachannel::identity::Identity` (the
+/// `core` crate) holds itself to.
+#[derive(Clone)]
 pub struct Identity {
     pub sk: BaseElement,
 }
@@ -84,6 +93,12 @@ impl Identity {
     /// The public commitment placed in the membership tree: `Hash(sk, 0)`.
     pub fn commitment(&self, params: &Params) -> BaseElement {
         compress2(params, self.sk, BaseElement::ZERO)
+    }
+}
+
+impl Drop for Identity {
+    fn drop(&mut self) {
+        self.sk = BaseElement::ZERO;
     }
 }
 

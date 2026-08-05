@@ -702,6 +702,12 @@ struct WelcomeSnapshot {
     target_leaf: u32,
 }
 
+impl Drop for WelcomeSnapshot {
+    fn drop(&mut self) {
+        self.epoch_secret.zeroize();
+    }
+}
+
 impl WelcomeSnapshot {
     fn write(&self, w: &mut Writer) {
         w.put_fixed(&self.group_id);
@@ -843,6 +849,16 @@ pub struct Group {
     send_seq: u64,
     send_chain: ChainKey,
     recv_chains: HashMap<u32, (ChainKey, u64)>,
+}
+
+impl Drop for Group {
+    fn drop(&mut self) {
+        self.epoch_secret.zeroize();
+        self.application_secret.zeroize();
+        for secret in self.known_secrets.values_mut() {
+            secret.zeroize();
+        }
+    }
 }
 
 fn initial_epoch_secret(group_id: &[u8; 16]) -> [u8; 32] {
@@ -1357,7 +1373,7 @@ impl Group {
             &welcome.sealed,
         )?;
         let mut r = Reader::new(&plaintext);
-        let snapshot = WelcomeSnapshot::read(&mut r)?;
+        let mut snapshot = WelcomeSnapshot::read(&mut r)?;
         if !r.finished() {
             return Err(Error::Malformed("trailing bytes in welcome snapshot"));
         }
@@ -1366,7 +1382,11 @@ impl Group {
         let mut group = Group {
             group_id: snapshot.group_id,
             capacity: snapshot.capacity as usize,
-            nodes: snapshot.nodes,
+            // `snapshot` has a `Drop` impl (zeroizes `epoch_secret`), which
+            // forbids moving a non-`Copy` field like `nodes` out by value —
+            // `mem::take` swaps in an empty `Vec` instead, which is fine
+            // since `snapshot` is dropped right after this block anyway.
+            nodes: std::mem::take(&mut snapshot.nodes),
             epoch: snapshot.epoch,
             epoch_secret: snapshot.epoch_secret,
             application_secret,

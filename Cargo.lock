@@ -100,6 +100,7 @@ dependencies = [
  "cipher",
  "cpufeatures 0.3.0",
  "rand_core",
+ "zeroize",
 ]
 
 [[package]]
@@ -112,6 +113,7 @@ dependencies = [
  "chacha20",
  "cipher",
  "poly1305",
+ "zeroize",
 ]
 
 [[package]]
@@ -335,6 +337,7 @@ checksum = "707114b52a152fa7bdb290cd7cd5912d9467273b6d74e21b8d81aca1f8533f6b"
 dependencies = [
  "ctutils",
  "typenum",
+ "zeroize",
 ]
 
 [[package]]
@@ -412,6 +415,7 @@ dependencies = [
  "pkcs8",
  "shake",
  "signature",
+ "zeroize",
 ]
 
 [[package]]
@@ -426,6 +430,7 @@ dependencies = [
  "pkcs8",
  "rand_core",
  "sha3 0.11.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -437,6 +442,7 @@ dependencies = [
  "ctutils",
  "hybrid-array",
  "num-traits",
+ "zeroize",
 ]
 
 [[package]]

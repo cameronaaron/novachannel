@@ -9,8 +9,12 @@ license = "MIT OR Apache-2.0"
 workspace = true
 
 [dependencies]
-# Classical AEAD for the data-plane transport.
-chacha20poly1305 = "0.11"
+# Classical AEAD for the data-plane transport. `zeroize` clears the
+# expanded key schedule on drop — without it, ChaCha20Poly1305's internal
+# state (derived directly from every AEAD key in this crate) outlives the
+# raw key bytes it was built from, even where the wrapping struct zeroizes
+# those.
+chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 # Key derivation for the handshake -> transport key schedule.
 hkdf = "0.13"
 sha2 = "0.11"
@@ -22,8 +26,11 @@ x25519-dalek = { version = "3", features = ["static_secrets", "reusable_secrets"
 # not the pre-standardization "Dilithium"/"Kyber" round-3 submissions this
 # crate used before. Pure Rust (RustCrypto), no C FFI, composed with the
 # classical primitives above so breaking either alone is insufficient.
-ml-dsa = "0.1"
-ml-kem = "0.3"
+# `zeroize` on both: without it, neither crate's SigningKey/DecapsulationKey
+# actually clears its secret state on drop (their `Drop` impls are entirely
+# feature-gated) despite `identity.rs`/`kex.rs` assuming they do.
+ml-dsa = { version = "0.1", features = ["zeroize"] }
+ml-kem = { version = "0.3", features = ["zeroize"] }
 kem = "0.3"
 # HMAC-based hash ratchet for the per-message chain key in `ratchet` —
 # already a transitive dependency of `hkdf`, declared directly here because

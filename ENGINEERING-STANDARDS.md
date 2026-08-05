@@ -55,6 +55,7 @@ was neither elliptic-curve arithmetic nor quantum-resistant). Concretely:
 | §6.16 Real line-coverage gaps closed (not chased to a literal 100%) | 86 tests total (up from 49); `permutation::hash2` (dead code) deleted; `MerkleTree::verify_path`, `share::recover_secret`'s degenerate branch, malformed/trailing-bytes parser paths in `handshake.rs`/`ratchet.rs`, in-order transport delivery now directly tested |
 | §6.17 X3DH, sealed sender, Sesame-style multi-device, and an incremental erasure-coded ratchet — each additive, none replacing already-tested code | `crates/core/src/{x3dh,prekey,sealed_sender,multidevice,erasure}.rs` + their module docs; `crates/core/tests/{x3dh,sealed_sender,multidevice,incremental_ratchet}.rs` (126 tests total, up from 86); two real defects found and fixed in the same change as their regression tests (below) |
 | §6.18 Signed, version-authenticated device lists close `crate::multidevice`'s trust-provisioning gap | `SignedDeviceList`/`RemoteAccount::from_signed_device_list`/`MultiDeviceSession::sync_from_signed_device_list`; `crates/core/tests/multidevice.rs` (6 new tests: mismatched-bundle rejection, unlisted-device rejection, wrong-signer rejection, version-rollback rejection, automatic revocation on a newer list) |
+| §6.19 Zeroization gaps closed workspace-wide; `unsafe_code` promoted `deny`→`forbid`; supply chain gated per-PR | `ml-dsa`/`ml-kem`/`chacha20poly1305`'s optional `zeroize` cargo features enabled (their `Drop` impls were feature-gated and silently absent without it); `novachannel_rln::Identity` lost its `Debug` derive and gained a `Drop` impl (was leaking `sk` via `{:?}`, the one secret type in the workspace §2.1 missed); `Group`/`WelcomeSnapshot`/`x3dh::SessionKeys`/`oram::Client` gained `Drop` impls for `epoch_secret`/`application_secret`/`known_secrets`/`ratchet_root`/`init_payload_key`/`position_map`; all five crate roots use `#![forbid(unsafe_code)]` (a local `#[allow(unsafe_code)]` could previously override `deny`); `scripts/check.sh` runs `--locked` (catches an unreviewed `Cargo.lock` drift) and `cargo audit` on every invocation, and CI now installs `cargo-audit` and runs the same gate per-PR instead of only via `scheduled-security.yml`'s daily cron; `SECURITY.md` added |
 | §6.2 A fix and its regression test are one change | the RLN Merkle off-by-one fix (§6.3) and `valid_membership_proof_verifies` |
 | §6.8 Dependency hygiene | every crate's declared dependencies are used; checked by grep audit (§6.8), no dead dependency left unresolved |
 | §9 Fair claims about proof/build status | `cargo test -p novachannel-rln --release` documented as the required invocation, with the debug-mode caveat explained rather than hidden |
@@ -173,11 +174,26 @@ reach a `Debug` implementation, a log line, or a wire message by accident.
 ### 2.1 Every long-lived secret has a `Drop` impl
 
 `novachannel::identity::Identity`, `novachannel_mpc::Dealer`,
-`novachannel_mpc::KeyShare`, and `novachannel::kex::SharedSecret` all zero
-their secret fields on drop. `PublicIdentity` and `HybridSignature`
-deliberately implement `Debug` (they're public data); their secret-holding
-counterparts deliberately don't derive it at all, so a stray `{:?}` in a log
-statement fails to compile instead of leaking a scalar.
+`novachannel_mpc::KeyShare`, `novachannel::kex::SharedSecret`,
+`novachannel::group::{Group, WelcomeSnapshot}`, `novachannel::x3dh::SessionKeys`,
+`novachannel_rln::Identity`, and `novachannel_oram::Client` all zero their
+secret fields on drop. `PublicIdentity` and `HybridSignature` deliberately
+implement `Debug` (they're public data); their secret-holding counterparts
+deliberately don't derive it at all, so a stray `{:?}` in a log statement
+fails to compile instead of leaking a scalar.
+
+This extends past this workspace's own code: `ml-dsa`, `ml-kem`, and
+`chacha20poly1305` are each built with their `zeroize` cargo feature
+enabled. Without it, each crate's own `Drop` impl for its signing/
+decapsulation keys and cipher state is entirely `#[cfg(feature =
+"zeroize")]`-gated and doesn't exist — so a `Drop` impl on this workspace's
+own wrapper struct that assumes the dependency clears its internal state
+(as `identity.rs`'s comment on `impl Drop for Identity` says outright) is
+only true once the feature is actually turned on in `Cargo.toml`. A rule
+enforced by a test only covers this workspace's own code; verifying a
+*dependency's* Cargo features actually match what a doc comment assumes
+about it is not something `cargo test` can check on its own, which is why
+this note exists here instead of only in the dependency's own docs.
 
 ### 2.2 Comparisons over secret-derived values use the field's own equality, not a byte-by-byte shortcut that could branch on timing
 
