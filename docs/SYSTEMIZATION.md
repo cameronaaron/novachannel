@@ -134,27 +134,32 @@ recommends deploying.
 
 There is a second, more concrete cost: proof size. Unlike Groth16 (2 G1 +
 1 G2 elements — 128 bytes compressed on BN254, independent of circuit
-size or chosen security level), a STARK's proof size scales with both the
-circuit and the query count chosen for soundness. `crates/rln/examples/proof_size.rs`
-measures this crate's actual proofs — same tiny RLN circuit (§3.4),
-`ProofOptions`' query count varied with blowup factor held at 8 (this
-AIR's minimum, derived from its own constraint degrees):
+size or chosen security level), a STARK's proof size scales with the
+circuit, the query count, and the blowup factor chosen for soundness.
+`crates/rln/examples/proof_size.rs` measures this crate's actual proofs —
+same tiny RLN circuit (§3.4):
 
-| queries | blowup | conjectured bits | measured proof size |
-| --- | --- | --- | --- |
-| 16 | 8 | ~48 | ~10.6 KB |
-| 32 | 8 (this crate's default) | ~96 | ~18.3–18.6 KB |
-| 64 | 8 | ~192 | ~29.5–29.8 KB |
+| queries | blowup | grinding | conjectured bits | measured proof size |
+| --- | --- | --- | --- | --- |
+| 16 | 8 | 0 | ~48 | ~15.0 KB |
+| 32 | 8 | 0 (pre-hardening default) | ~96 | ~25.8 KB |
+| 32 | 16 | 20 (**this crate's default**) | ~148 | ~36.7 KB |
+| 64 | 8 | 0 | ~192 | ~43.0 KB |
 
-(sizes vary a few percent run to run — the circuit's own randomized
-witness data — hence the ranges; run the example to reproduce.) That's
-roughly **85–230x** Groth16's constant 128 bytes, for a genuinely tiny
-circuit — the gap would only widen for a production-sized membership set.
-If per-message bandwidth matters more than avoiding a trusted setup and
-PQ-hardening the proof system for a given deployment, that's a real reason
-to prefer Groth16 instead; this project's choice optimizes for the
-opposite priority, and the number above is what that choice actually
-costs, not an abstract tradeoff.
+(run the example to reproduce; exact bytes can vary a little run to run
+from the circuit's own randomized witness data.) The default configuration
+was raised from ~96 to ~148 conjectured bits — the query/blowup/grinding
+combination `crates/rln/src/air.rs::default_proof_options` uses, with the
+formula and reasoning documented on that function — since ~96 bits fell
+short of the ≥128-bit bar this workspace's other primitives (ML-KEM-1024,
+ML-DSA-87) are held to. At the new default, proof size is roughly
+**280x** Groth16's constant 128 bytes, for a genuinely tiny circuit — the
+gap would only widen for a production-sized membership set. If per-message
+bandwidth matters more than avoiding a trusted setup and PQ-hardening the
+proof system for a given deployment, that's a real reason to prefer
+Groth16 instead; this project's choice optimizes for the opposite
+priority, and the numbers above are what that choice actually costs, not
+an abstract tradeoff.
 
 ### 3.3 A defect found by validating against ground truth
 
@@ -183,9 +188,13 @@ so the same class of off-by-one couldn't resurface in a sibling constant.
   shares, and non-reconstruction across different epochs — checked
   directly against the field arithmetic, not merely asserted.
 - Concrete parameters: Merkle depth 5 (32-member group), permutation
-  width 4, 7 rounds per hash call, trace length 64 rows (a power of two,
-  as the STARK domain requires) — small values chosen for a runnable
-  reference implementation, not claimed as production-scale.
+  width 4, 31 rounds per hash call (raised from an initial 7 — see
+  `crates/rln/src/permutation.rs`'s `ROUNDS` doc comment for the
+  security-margin reasoning and why the round-count formulas for
+  *original* interleaved-S-box Rescue don't directly transfer to this
+  uniform-S-box variant), trace length 256 rows (a power of two, as the
+  STARK domain requires) — small values chosen for a runnable reference
+  implementation, not claimed as production-scale.
 
 ## 4. `novachannel` (core): hybrid post-quantum channel
 

@@ -6,12 +6,14 @@
 //!     cargo run -p novachannel-rln --release --example proof_size
 //!
 //! # Reading the numbers
-//! FRI's conjectured soundness for this query/blowup combination is
-//! roughly `num_queries * log2(blowup_factor)` bits (the standard
-//! back-of-envelope bound cited alongside winterfell's own examples) —
-//! this example prints that alongside the actual measured proof size for
-//! each configuration, so the size/soundness tradeoff `ProofOptions`
-//! controls is visible directly rather than asserted.
+//! FRI's conjectured soundness for this query/blowup/grinding combination
+//! is roughly `num_queries * log2(blowup_factor) + grinding_factor` bits
+//! (winterfell's own `ProofOptions` docs give this exact formula) — this
+//! example prints that alongside the actual measured proof size for each
+//! configuration, so the size/soundness tradeoff `ProofOptions` controls
+//! is visible directly rather than asserted. It doesn't fold in
+//! `FieldExtension`'s separate effect on soundness (see `air.rs`'s
+//! `default_proof_options` doc comment for that caveat).
 //!
 //! For comparison: a Groth16 proof is 2 G1 + 1 G2 elements — on BN254,
 //! that's 128 bytes compressed, independent of circuit size or the
@@ -31,6 +33,7 @@ struct Config {
     num_queries: usize,
     blowup_factor: usize,
     grinding_factor: u32,
+    field_extension: FieldExtension,
 }
 
 fn main() {
@@ -45,18 +48,28 @@ fn main() {
             num_queries: 16,
             blowup_factor: 8,
             grinding_factor: 0,
+            field_extension: FieldExtension::None,
         },
         Config {
-            label: "this crate's default (~96-bit conjectured)",
+            label: "old default before the 128-bit hardening pass (~96-bit)",
             num_queries: 32,
             blowup_factor: 8,
             grinding_factor: 0,
+            field_extension: FieldExtension::None,
+        },
+        Config {
+            label: "this crate's default (~148-bit conjectured, see air.rs)",
+            num_queries: 32,
+            blowup_factor: 16,
+            grinding_factor: 20,
+            field_extension: FieldExtension::Quadratic,
         },
         Config {
             label: "more queries, stronger (~192-bit conjectured)",
             num_queries: 64,
             blowup_factor: 8,
             grinding_factor: 0,
+            field_extension: FieldExtension::None,
         },
     ];
 
@@ -84,7 +97,7 @@ fn main() {
             c.num_queries,
             c.blowup_factor,
             c.grinding_factor,
-            FieldExtension::None,
+            c.field_extension,
             8,
             31,
             BatchingMethod::Linear,
@@ -105,7 +118,8 @@ fn main() {
         let proof = prover.prove(trace).expect("proof generation failed");
         let bytes = proof.to_bytes();
 
-        let conjectured_bits = (c.num_queries as f64) * (c.blowup_factor as f64).log2();
+        let conjectured_bits =
+            (c.num_queries as f64) * (c.blowup_factor as f64).log2() + c.grinding_factor as f64;
         println!(
             "{:<45} {:>10} {:>10} {:>18.0} {:>10} bytes",
             c.label,

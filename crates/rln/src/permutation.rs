@@ -27,9 +27,37 @@ use winterfell::math::{fields::f128::BaseElement, FieldElement};
 
 /// Permutation state width, in field elements.
 pub const WIDTH: usize = 4;
-/// Number of rounds. Chosen conservatively relative to the S-box degree,
-/// but see the module-level caveat: this has not been cryptanalyzed.
-pub const ROUNDS: usize = 7;
+/// Number of rounds.
+///
+/// This construction applies the forward `x^5` S-box every round with no
+/// alternating inverse-S-box rounds — closer to a Poseidon-style uniform
+/// power-map permutation than to *original* Rescue (which interleaves
+/// `x^5`/`x^{1/5}` rounds specifically so a statistical attack on one
+/// direction doesn't get an easier ride on the other). That matters for
+/// which published round-count guidance actually applies: Rescue-Prime's
+/// own numbers assume the interleaved construction and don't directly
+/// transfer here.
+///
+/// For a uniform degree-5 S-box, width-4 state, and a ~128-bit prime
+/// field, both attack families the literature on this S-box class
+/// considers (Gröbner-basis/algebraic attacks, whose complexity is bounded
+/// by the degree of the ideal the round function generates, and
+/// interpolation/statistical attacks, whose complexity grows with the
+/// permutation's total algebraic degree `5^rounds`) clear a 128-bit
+/// security target well before round 20 for these parameters — published
+/// Poseidon/Rescue-Prime parameter tables for this S-box degree and state
+/// width land full round counts in the low teens even *with* their own
+/// added safety margin. 31 rounds (the next value keeping `ROUNDS + 1` —
+/// this file's per-block row count — a power of two, which `air.rs`'s
+/// trace-length assertion requires) is chosen to sit comfortably above
+/// that with room to spare, not because the minimum is anywhere near 31.
+///
+/// This is a deliberately large margin over the estimated minimum, not a
+/// substitute for it: see the module-level caveat above — nobody has
+/// independently cryptanalyzed this specific, from-scratch construction,
+/// so "the standard formulas suggest this is safe" is the best available
+/// evidence, not a proof.
+pub const ROUNDS: usize = 31;
 /// S-box exponent (`x^5`); computed by repeated squaring, not `FieldElement::exp`,
 /// so the degree is easy to read directly off the code.
 #[inline]

@@ -471,14 +471,30 @@ impl Prover for RlnProver {
     }
 }
 
-/// Standard proof options for this AIR: ~96-bit conjectured security,
-/// matching the parameters used in winterfell's own reference example.
+/// Proof options targeting 128+ bits of conjectured security.
+///
+/// Winterfell's own `ProofOptions` docs give the formula this is built
+/// from: conjectured soundness is bounded by `num_queries *
+/// log2(blowup_factor) + grinding_factor`, i.e. `32 * log2(16) + 20 =
+/// 32*4 + 20 = 148` bits here — comfortably past 128 with margin, not
+/// pinned exactly to the line. `FieldExtension::Quadratic` (bumped from
+/// `None`) addresses the separate caveat those same docs raise: even a
+/// ~128-bit base field can fall short of ~100+ bits of *field-related*
+/// soundness (as opposed to query-based soundness) without an extension,
+/// since that margin depends on the field size relative to the evaluation
+/// domain, not on `num_queries`/`blowup_factor` at all.
+///
+/// The previous parameters (32 queries, blowup 8, no grinding, no
+/// extension) landed at `32 * log2(8) + 0 = 96` bits — explicitly
+/// documented as such and matching winterfell's own reference example,
+/// but short of the 128-bit target this crate's other primitives (ML-KEM-
+/// 1024, ML-DSA-87) are held to.
 pub fn default_proof_options() -> ProofOptions {
     ProofOptions::new(
         32,
-        8,
-        0,
-        FieldExtension::None,
+        16,
+        20,
+        FieldExtension::Quadratic,
         8,
         31,
         BatchingMethod::Linear,
