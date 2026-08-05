@@ -1,10 +1,15 @@
 //! Long-term identity keys.
 //!
 //! Every identity is a *hybrid* of a classical and a post-quantum signature
-//! scheme: Ed25519 plus ML-DSA-65 (FIPS 204 — the NIST-ratified successor to
-//! the "Dilithium3" round-3 submission this crate used before the 2024
-//! finalization; see the crate-level upgrade note). A signature is only
-//! valid if both components verify. Breaking either scheme alone (a
+//! scheme: Ed25519 plus ML-DSA-87 (FIPS 204 — the NIST-ratified successor to
+//! the "Dilithium5" round-3 submission this crate used before the 2024
+//! finalization; see the crate-level upgrade note). ML-DSA-87 is NIST
+//! security category 5, the highest of the three standardized parameter
+//! sets — chosen, like `crate::kex`'s ML-KEM-1024, over the smaller
+//! ML-DSA-65 (category 3) so identity signatures don't cap this crate's
+//! hybrid PQ security below what its key exchange already provides, at the
+//! cost of larger signatures (~4.6KB vs. ML-DSA-65's ~3.3KB). A signature is
+//! only valid if both components verify. Breaking either scheme alone (a
 //! classical break of Ed25519's discrete log, or a future break of the
 //! lattice assumption underlying ML-DSA) is therefore insufficient to forge
 //! an identity proof — the attacker needs both, which is the standard
@@ -12,7 +17,7 @@
 //! post-quantum cryptography.
 
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
-use ml_dsa::{Generate, Keypair, MlDsa65};
+use ml_dsa::{Generate, Keypair, MlDsa87};
 use zeroize::Zeroize;
 
 use crate::error::{Error, Result};
@@ -23,7 +28,7 @@ use crate::wire::{Reader, Writer};
 #[derive(Clone)]
 pub struct PublicIdentity {
     pub(crate) ed25519: VerifyingKey,
-    pub(crate) ml_dsa: ml_dsa::VerifyingKey<MlDsa65>,
+    pub(crate) ml_dsa: ml_dsa::VerifyingKey<MlDsa87>,
 }
 
 // ml-dsa's key types don't implement PartialEq themselves; compare by their
@@ -76,7 +81,7 @@ impl PublicIdentity {
         )
         .map_err(|_| Error::Malformed("invalid ed25519 public key"))?;
         let ml_dsa =
-            <ml_dsa::VerifyingKey<MlDsa65> as ml_dsa::KeyInit>::new_from_slice(r.get_var()?)
+            <ml_dsa::VerifyingKey<MlDsa87> as ml_dsa::KeyInit>::new_from_slice(r.get_var()?)
                 .map_err(|_| Error::Malformed("invalid ML-DSA public key"))?;
         Ok(PublicIdentity { ed25519, ml_dsa })
     }
@@ -86,7 +91,7 @@ impl PublicIdentity {
 #[derive(Clone)]
 pub struct HybridSignature {
     pub(crate) ed25519: ed25519_dalek::Signature,
-    pub(crate) ml_dsa: ml_dsa::Signature<MlDsa65>,
+    pub(crate) ml_dsa: ml_dsa::Signature<MlDsa87>,
 }
 
 impl std::fmt::Debug for HybridSignature {
@@ -112,7 +117,7 @@ impl HybridSignature {
         let ed_bytes = r.get_fixed(64)?;
         let ed25519 = ed25519_dalek::Signature::from_slice(ed_bytes)
             .map_err(|_| Error::Malformed("invalid ed25519 signature"))?;
-        let ml_dsa = ml_dsa::Signature::<MlDsa65>::try_from(r.get_var()?)
+        let ml_dsa = ml_dsa::Signature::<MlDsa87>::try_from(r.get_var()?)
             .map_err(|_| Error::Malformed("invalid ML-DSA signature"))?;
         Ok(HybridSignature { ed25519, ml_dsa })
     }
@@ -124,14 +129,14 @@ impl HybridSignature {
 /// [`PublicIdentity`] and [`HybridSignature`] cross the network.
 pub struct Identity {
     ed25519: SigningKey,
-    ml_dsa: ml_dsa::SigningKey<MlDsa65>,
+    ml_dsa: ml_dsa::SigningKey<MlDsa87>,
 }
 
 impl Identity {
     pub fn generate() -> Self {
         let mut rng = csprng();
         let ed25519 = SigningKey::generate(&mut rng);
-        let ml_dsa = ml_dsa::SigningKey::<MlDsa65>::generate_from_rng(&mut rng);
+        let ml_dsa = ml_dsa::SigningKey::<MlDsa87>::generate_from_rng(&mut rng);
         Identity { ed25519, ml_dsa }
     }
 

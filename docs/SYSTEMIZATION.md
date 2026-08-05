@@ -190,7 +190,7 @@ so the same class of off-by-one couldn't resurface in a sibling constant.
 ## 4. `novachannel` (core): hybrid post-quantum channel
 
 Hybrid key exchange (X25519 + ML-KEM-1024) and hybrid signatures (Ed25519 +
-ML-DSA-65) — the exact algorithms NIST ratified as FIPS 203 and FIPS 204 in
+ML-DSA-87) — the exact algorithms NIST ratified as FIPS 203 and FIPS 204 in
 2024, via RustCrypto's pure-Rust `ml-kem`/`ml-dsa` crates (this project
 originally used `pqcrypto-kyber`/`pqcrypto-dilithium`, C bindings to the
 pre-standardization round-3 submissions; migrating was a real breaking

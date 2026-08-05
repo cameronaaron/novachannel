@@ -8,7 +8,7 @@
 //! the root, encrypting each step to the resolution of its sibling subtree
 //! so only current members can decrypt it — and reuses this crate's own
 //! primitives (X25519 + ML-KEM-1024 hybrid encryption, HKDF, the hybrid
-//! Ed25519 + ML-DSA-65 [`crate::identity::Identity`] for signing commits).
+//! Ed25519 + ML-DSA-87 [`crate::identity::Identity`] for signing commits).
 //! It is **not** RFC 9420: there is no TLS presentation-language wire
 //! encoding, no HPKE per RFC 9180 specifically (this crate's own hybrid
 //! combiner is used instead, same as everywhere else in this workspace),

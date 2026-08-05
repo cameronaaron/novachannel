@@ -2,7 +2,7 @@
 //!
 //! This crate is a small, from-first-principles building block — not a
 //! drop-in TLS replacement. It composes vetted primitives (X25519,
-//! Ed25519, ML-KEM-1024, ML-DSA-65, ChaCha20-Poly1305, HKDF-SHA256) rather
+//! Ed25519, ML-KEM-1024, ML-DSA-87, ChaCha20-Poly1305, HKDF-SHA256) rather
 //! than implementing any cryptographic primitive itself, and it
 //! deliberately leaves out things a general-purpose transport protocol
 //! needs and this does not attempt: certificate authorities / PKI (peer
@@ -10,7 +10,7 @@
 //! (there is exactly one suite), and record compression or padding.
 //!
 //! # What it gives you
-//! - **Mutual authentication** via a hybrid (Ed25519 + ML-DSA-65)
+//! - **Mutual authentication** via a hybrid (Ed25519 + ML-DSA-87)
 //!   signature over the full handshake transcript.
 //! - **Forward secrecy** via ephemeral X25519 + ML-KEM-1024, discarded after
 //!   one handshake.
