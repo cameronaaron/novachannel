@@ -1,0 +1,105 @@
+name: Scheduled security checks
+
+# Two checks that are only meaningful run *repeatedly over time*, not once
+# at commit time like scripts/check.sh's gate:
+#
+# - cargo audit: a dependency can go from "clean" to "has a disclosed CVE"
+#   on a day nobody touches this repo. ENGINEERING-STANDARDS.md's
+#   convention of running `cargo audit` before a commit only catches
+#   advisories that already existed *at commit time* — it says nothing
+#   about the weeks or months after, while the same Cargo.lock keeps
+#   sitting on main. This job re-checks it daily regardless of whether
+#   anything changed.
+# - cargo fuzz: crates/core/fuzz's six targets (see that directory's own
+#   README) have only ever been smoke-tested for seconds at a time by a
+#   human. Real fuzzing value comes from sustained, unattended runs with
+#   a corpus that keeps growing between runs — exactly what a human
+#   re-running a short local smoke test every so often doesn't provide.
+
+on:
+  schedule:
+    # 07:17 UTC daily -- arbitrary off-the-hour time, avoids the
+    # top-of-hour thundering herd of jobs scheduled at :00.
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds_per_target:
+        description: "Seconds to fuzz each target"
+        required: false
+        default: "180"
+
+concurrency:
+  group: scheduled-security-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: cargo audit (workspace + fuzz crate)
+        run: |
+          cargo audit
+          cargo audit --file crates/core/fuzz/Cargo.lock
+
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - prekey_bundle
+          - x3dh_respond
+          - sealed_sender_open
+          - handshake_messages
+          - ratchet_open
+          - group_commit
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly Rust
+        run: rustup toolchain install nightly
+
+      - name: Cache cargo-fuzz install + registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-fuzz
+          key: fuzz-tooling-${{ runner.os }}-${{ hashFiles('crates/core/fuzz/Cargo.lock') }}
+          restore-keys: |
+            fuzz-tooling-${{ runner.os }}-
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # Restored (not required to exist) so each run builds on whatever
+      # the previous run's fuzzer discovered, instead of starting cold
+      # every single day -- this is the entire point of scheduling it
+      # rather than relying on one-off local smoke runs.
+      - name: Restore corpus
+        uses: actions/cache@v4
+        with:
+          path: crates/core/fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      - name: Fuzz ${{ matrix.target }}
+        working-directory: crates/core
+        run: |
+          cargo +nightly fuzz run ${{ matrix.target }} -- \
+            -max_total_time=${{ github.event.inputs.fuzz_seconds_per_target || 180 }}
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: crates/core/fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
