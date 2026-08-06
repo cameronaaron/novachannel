@@ -16,10 +16,10 @@ This is a cryptography workspace. The failure modes that matter are not "the
 server falls over under load" — there is no server — they are **silent
 wrongness**: a proof that verifies when it shouldn't, a channel that looks
 encrypted but isn't bound to the right identity, a "post-quantum" claim that
-turns out to be classical discrete-log with extra steps (the exact defect
-this workspace replaced — see `zkp.py` in git history: Curve25519 constants
-fed into plain modular exponentiation, labeled "NIST PQC compliant," which
-was neither elliptic-curve arithmetic nor quantum-resistant). Concretely:
+turns out to be classical discrete-log with extra steps (the exact defect this workspace replaced: an earlier Python prototype fed
+Curve25519 constants into plain modular exponentiation, labeled "NIST PQC
+compliant," which was neither elliptic-curve arithmetic nor
+quantum-resistant (see §0.2). Concretely:
 
 - **A cryptographic claim in a doc comment is a claim under test.** "This is
   ε-differential-private," "this binds `sk` across membership and share,"

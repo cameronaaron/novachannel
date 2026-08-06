@@ -15,7 +15,7 @@ or pull request — a public report on unfixed, exploitable cryptographic
 code puts every current user at risk between disclosure and a fix.
 
 Use GitHub's private vulnerability reporting for this repository:
-[github.com/cameronaaron/internet/security/advisories/new](https://github.com/cameronaaron/internet/security/advisories/new).
+[github.com/cameronaaron/novachannel/security/advisories/new](https://github.com/cameronaaron/novachannel/security/advisories/new).
 This opens a private advisory visible only to the maintainer and you,
 with its own discussion thread, until a fix is ready to publish.
 
