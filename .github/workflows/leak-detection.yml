@@ -1,0 +1,27 @@
+name: Leak detection
+
+# Scans every push and PR for committed secrets and credentials — the
+# automated version of the manual git-history audit this workspace went
+# through once already (see ENGINEERING-STANDARDS.md's history). Runs as
+# its own workflow rather than a job appended to ci.yml, matching the same
+# separation-of-concerns reasoning scheduled-security.yml already uses:
+# this checks a different property (nothing secret got committed) than
+# ci.yml's gate (fmt/clippy/tests/audit), and shouldn't be coupled to it.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
