@@ -41,4 +41,16 @@ else
     echo "==> cargo audit (skipped: cargo-audit not installed locally; CI always runs it)"
 fi
 
+# Runs on every commit here too, mirroring the cargo-audit pattern above:
+# leak-detection.yml's gitleaks scan is the CI-enforced version, this is
+# the same check available before a change ever leaves the machine. Needs
+# `brew install gitleaks` (or see https://github.com/gitleaks/gitleaks)
+# locally; CI always runs it via the gitleaks-action.
+if command -v gitleaks >/dev/null 2>&1; then
+    echo "==> gitleaks detect"
+    gitleaks detect --source . --redact
+else
+    echo "==> gitleaks detect (skipped: gitleaks not installed locally; CI always runs it)"
+fi
+
 echo "==> all checks passed"
