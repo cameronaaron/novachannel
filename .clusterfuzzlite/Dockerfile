@@ -5,5 +5,5 @@
 FROM gcr.io/oss-fuzz-base/base-builder-rust
 
 RUN git clone --depth 1 https://github.com/cameronaaron/novachannel $SRC/novachannel
-COPY build.sh $SRC/
+COPY .clusterfuzzlite/build.sh $SRC/
 WORKDIR $SRC/novachannel
