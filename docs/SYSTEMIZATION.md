@@ -114,52 +114,60 @@ primitives elsewhere in the stack (§4).
 
 The cost: verifying membership inside a STARK circuit needs an
 algebraic hash whose round function is a low-degree polynomial (so it
-compiles to inexpensive AIR transition constraints). No published Rust
-implementation of a STARK-friendly hash matched the specific field
-(`winterfell`'s `f128`) and framework version used here, so this project
-defines one (`NovaRescue`, `crates/rln/src/permutation.rs`): a
-Rescue-Prime-shaped permutation (additive round constants, `x^5` S-box, a
-Cauchy-construction MDS matrix — the MDS property follows from the Cauchy
-construction algebraically, not from manual verification of a hardcoded
-matrix) with round constants generated deterministically from a fixed seed
-rather than hand-copied from a paper.
+compiles to inexpensive AIR transition constraints). This crate originally
+defined one from scratch (`NovaRescue`: a Rescue-Prime-shaped permutation
+with round constants generated deterministically from a fixed seed, over
+`winterfell`'s `f128` field, at width 4) because no published Rust
+implementation matched that exact field/framework combination at the
+time. **That from-scratch construction has since been replaced**
+(`ENGINEERING-STANDARDS.md` §6.21) by a verbatim port of
+Poseidon2-over-Goldilocks from `p3-goldilocks`/`p3-poseidon2` 0.6.3 —
+Plonky3's own instantiation, the hash underlying multiple independently
+audited production STARK provers (Succinct's SP1, RISC Zero). Every round
+constant and the internal diffusion matrix are copied directly from that
+crate's source, not reinterpreted, and checked against its own published
+test vector byte-for-byte
+(`permutation::tests::matches_official_poseidon2_goldilocks_width8_test_vector`).
+Matching a published instance meant matching its field (`f64`/Goldilocks,
+not `f128`) and its smallest published width (8, not this crate's
+previous 4 — `p3-goldilocks` only ships constants for widths 8, 12, 16,
+and 20).
 
-**This is the one place this project introduces new cryptographic code,
-and it has not been cryptanalyzed.** Poseidon, Rescue-Prime, Griffin, and
-similar algebraic hashes earned trust through years of public differential/
-algebraic cryptanalysis before their round counts were considered safe.
-`NovaRescue` has had none. It demonstrates the *shape* of a working
-STARK-based RLN circuit; it is not a hash function this document
-recommends deploying.
+**Porting the algorithm is not the same as an independent review of this
+specific port**, and this document does not claim more than the former:
+a transcription error in a constant is a real bug the test-vector check
+happens to catch, not one any port is guaranteed to catch in general —
+see `permutation.rs`'s own module doc and `SECURITY.md` for the precise
+scope of what's been checked. What porting *does* close is the risk
+category §0.3 originally flagged for `NovaRescue`: an invented,
+uncryptanalyzed algebraic construction with no public scrutiny at all.
+That category is closed; "independently reviewed as deployed in this
+crate" is not yet true, and isn't claimed to be.
 
 There is a second, more concrete cost: proof size. Unlike Groth16 (2 G1 +
 1 G2 elements — 128 bytes compressed on BN254, independent of circuit
 size or chosen security level), a STARK's proof size scales with the
 circuit, the query count, and the blowup factor chosen for soundness.
 `crates/rln/examples/proof_size.rs` measures this crate's actual proofs —
-same tiny RLN circuit (§3.4):
+same tiny RLN circuit (§3.4), re-measured after the Poseidon2/Goldilocks
+port:
 
 | queries | blowup | grinding | conjectured bits | measured proof size |
 | --- | --- | --- | --- | --- |
-| 16 | 8 | 0 | ~48 | ~15.0 KB |
-| 32 | 8 | 0 (pre-hardening default) | ~96 | ~25.8 KB |
-| 32 | 16 | 20 (**this crate's default**) | ~148 | ~36.7 KB |
-| 64 | 8 | 0 | ~192 | ~43.0 KB |
+| 16 | 16 | 0 | ~64 | ~13.3 KB |
+| 24 | 16 | 0 (pre-hardening default) | ~96 | ~19.9 KB |
+| 32 | 16 | 20 (**this crate's default**) | ~148 | ~30.0 KB |
+| 48 | 16 | 0 | ~192 | ~32.7 KB |
 
-(run the example to reproduce; exact bytes can vary a little run to run
-from the circuit's own randomized witness data.) The default configuration
-was raised from ~96 to ~148 conjectured bits — the query/blowup/grinding
-combination `crates/rln/src/air.rs::default_proof_options` uses, with the
-formula and reasoning documented on that function — since ~96 bits fell
-short of the ≥128-bit bar this workspace's other primitives (ML-KEM-1024,
-ML-DSA-87) are held to. At the new default, proof size is roughly
-**280x** Groth16's constant 128 bytes, for a genuinely tiny circuit — the
-gap would only widen for a production-sized membership set. If per-message
-bandwidth matters more than avoiding a trusted setup and PQ-hardening the
-proof system for a given deployment, that's a real reason to prefer
-Groth16 instead; this project's choice optimizes for the opposite
-priority, and the numbers above are what that choice actually costs, not
-an abstract tradeoff.
+(run the example to reproduce; exact bytes vary a little run to run from
+the circuit's own randomized witness data.) At the current default, proof
+size is roughly **230x** Groth16's constant 128 bytes, for a genuinely
+tiny circuit — the gap would only widen for a production-sized membership
+set. If per-message bandwidth matters more than avoiding a trusted setup
+and PQ-hardening the proof system for a given deployment, that's a real
+reason to prefer Groth16 instead; this project's choice optimizes for the
+opposite priority, and the numbers above are what that choice actually
+costs, not an abstract tradeoff.
 
 ### 3.3 A defect found by validating against ground truth
 
@@ -188,13 +196,12 @@ so the same class of off-by-one couldn't resurface in a sibling constant.
   shares, and non-reconstruction across different epochs — checked
   directly against the field arithmetic, not merely asserted.
 - Concrete parameters: Merkle depth 5 (32-member group), permutation
-  width 4, 31 rounds per hash call (raised from an initial 7 — see
-  `crates/rln/src/permutation.rs`'s `ROUNDS` doc comment for the
-  security-margin reasoning and why the round-count formulas for
-  *original* interleaved-S-box Rescue don't directly transfer to this
-  uniform-S-box variant), trace length 256 rows (a power of two, as the
-  STARK domain requires) — small values chosen for a runnable reference
-  implementation, not claimed as production-scale.
+  width 8 (Poseidon2-over-Goldilocks's smallest published instance — see
+  §3.2), 31 rounds per hash call (unchanged by the Poseidon2 port; still
+  the value `crates/rln/src/permutation.rs`'s `ROUNDS` doc comment derives
+  security-margin reasoning for), trace length a power of two per block
+  count (as the STARK domain requires) — small values chosen for a
+  runnable reference implementation, not claimed as production-scale.
 
 ## 4. `novachannel` (core): hybrid post-quantum channel
 
@@ -259,13 +266,14 @@ comment (`crates/core/src/ratchet.rs`) and `ENGINEERING-STANDARDS.md`
 `open_ratchet_chunk` offer a second re-key mechanism, closer in *shape* to
 SPQR's chunked, loss-tolerant design without claiming parity with it. The
 same KEX material the one-shot path sends in one message is split into
-`data_shards + parity_shards` independently AEAD-sealed chunks via a new,
-from-scratch systematic Reed–Solomon-style erasure code over GF(2^8)
-(`novachannel::erasure`, Cauchy-matrix construction — the same MDS
-technique already used for `novachannel-rln`'s `NovaRescue` permutation,
-applied here to a linear code instead of a permutation's diffusion layer).
-Any `data_shards` of the resulting chunks, arriving in any order,
-interleaved with anything else, reconstruct the original bytes exactly.
+`data_shards + parity_shards` independently AEAD-sealed chunks via
+`novachannel::erasure`, a thin wrapper around the maintained
+`reed_solomon_simd` crate (Leopard-RS, FFT-based) rather than this
+module's original hand-rolled Cauchy-matrix GF(2^8) implementation
+(`ENGINEERING-STANDARDS.md` §6.21) — the chunk framing and reassembly
+logic built on top remains this workspace's own. Any `data_shards` of the
+resulting chunks, arriving in any order, interleaved with anything else,
+reconstruct the original bytes exactly.
 
 The one real architectural finding from building this: chunks cannot be
 sent through the base ratchet's existing `seal`/`open` — that mechanism
@@ -504,11 +512,44 @@ needs to trust exactly one long-lived value — the mixnode quorum's group
 public key — the same trust-anchor shape `novachannel::handshake`'s
 peer-identity pinning already uses.
 
+**`Dealer`, `frost`, and `combine_partials` are entirely classical
+elliptic-curve constructions** — every one of them collapses the moment a
+cryptographically relevant quantum computer breaks Ristretto255's
+discrete log, unlike the rest of this workspace's hybrid PQ/classical
+design (§4). No production-ready post-quantum threshold *signature*
+scheme exists to replace FROST with (checked directly, not assumed —
+the closest candidate, `lattice-safe/threshold-ml-dsa`, is unaudited
+research code, and NIST's IR 8214C is a call for submissions, not a
+standard), so that gap stays open for callers who need threshold signing
+specifically. But the mixnode-operator threat model this crate actually
+serves — no single operator can decrypt traffic alone — is a threshold
+*decryption* problem, not a signing one, and that narrower problem has a
+real answer buildable from primitives already vetted elsewhere in this
+workspace: `threshold_kem` (`crates/mpc/src/threshold_kem.rs`,
+`ENGINEERING-STANDARDS.md` §6.22) gives each operator an independent
+ML-KEM-1024 keypair — the same FIPS 203 KEM `novachannel::kex` already
+uses, needing no group DKG at all since there's no shared EC point to
+commit to — and Shamir-shares a per-message master secret across them,
+reusing this crate's own Lagrange-interpolation machinery (§4.2) rather
+than a second implementation. Reconstructing anything now costs an
+attacker `t` independent module-LWE problems (one per compromised
+operator's ML-KEM secret key); a full break of Ristretto's discrete log,
+which fully breaks `Dealer`/`frost`, gains nothing against this path.
+`frost`/`Dealer` remain available, unchanged, for callers whose use case
+is signing rather than decryption — `threshold_kem` is additive, not a
+replacement.
+
 ## 8. What was actually verified, and how
 
-132 tests across the workspace (up from 86), all adversarial where the
-claim is adversarial (not merely "does the happy path run"): tamper,
-replay, wrong-key, wrong-message, below-threshold-quorum,
+168 tests across the workspace (up from 132), plus 8 `cargo-fuzz` targets
+(up from 6) covering every crate with an untrusted-input parsing
+boundary — `novachannel-rln`'s STARK proof verifier and
+`novachannel-mpc`'s FROST signature verifier are new additions, and
+`rln_verify` found a real remote-DoS panic in a dependency's proof
+deserializer within seconds of running (`ENGINEERING-STANDARDS.md` §3.3,
+§6.22), now fixed and regression-tested. All adversarial where the claim
+is adversarial (not merely "does the happy path run"): tamper, replay,
+wrong-key, wrong-message, below-threshold-quorum,
 server-tampers-a-bucket, server-replays-a-stale-bucket,
 cross-epoch/same-epoch rate-limit tests,
 `novachannel::ratchet`'s epoch-transition/stale-epoch/concurrent-initiation
@@ -542,11 +583,20 @@ trail.
 
 Stated plainly, per §1:
 
-- `NovaRescue` needs independent cryptanalysis (differential, linear,
-  algebraic) before any deployment claim beyond "reference implementation
-  of a circuit shape" is defensible. This is a research task for someone
-  with that specialization, not an engineering task this project can
-  complete by writing more code.
+- `novachannel-rln`'s in-circuit permutation is now a verified port of
+  Poseidon2-over-Goldilocks (`ENGINEERING-STANDARDS.md` §6.21) rather than
+  the from-scratch `NovaRescue` construction this document originally
+  described — the "invented, uncryptanalyzed construction" risk category
+  is closed. What remains open: independent review of *this specific
+  port* (a transcription error in a constant is a real risk category a
+  test-vector match doesn't fully rule out) has not happened, and this
+  document does not claim it has.
+- `novachannel-mpc`'s `Dealer`/`frost` remain entirely classical
+  elliptic-curve constructions with no post-quantum alternative for the
+  threshold-*signing* use case — none exists yet that's production-ready
+  (§7). The threshold-*decryption* use case this crate actually serves
+  for mixnode operators does now have a post-quantum path
+  (`threshold_kem`, §7, §6.22); signing does not.
 - Whether STARK-based RLN with this combined-relation circuit design is
   actually novel relative to the full literature (including unpublished
   or industry-internal implementations this project's authors have no
@@ -557,13 +607,14 @@ Stated plainly, per §1:
   reduction (not just adversarial unit tests), comparison against related
   work with matched assumptions, and peer review. None of that exists in
   this repository, and this document does not claim it does.
-- The incremental ratchet's erasure code (§4.1.1) has the same "needs
-  independent cryptanalysis before any deployment claim beyond a
-  reference implementation" status as `NovaRescue` — it's a from-scratch
-  construction, checked against its own stated combinatorial property
-  (any `k`-of-`n` shards reconstruct) exhaustively for one parameter set,
-  not proven for all of them and not reviewed by anyone outside this
-  project.
+- The incremental ratchet's erasure coding (§4.1.1) now delegates the
+  actual Reed-Solomon algorithm to the maintained `reed_solomon_simd`
+  crate rather than a from-scratch implementation. What remains this
+  project's own, and unreviewed by anyone outside it: the chunk framing,
+  AEAD-per-chunk authentication, and reassembly logic built on top,
+  checked against its own stated combinatorial property (any `k`-of-`n`
+  shards reconstruct) exhaustively for one parameter set, not proven for
+  all of them.
 - `crate::multidevice::SignedDeviceList` (§4.4) authenticates *which*
   devices an account currently has and rejects a rollback to a stale
   version, but this crate still has no directory service to actually

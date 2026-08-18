@@ -2,9 +2,10 @@
 //! post-quantum, hash-based ZK-STARK membership proof.
 //!
 //! # What this gives you
-//! A group of `2^DEPTH` members, each holding a secret key whose
-//! commitment sits in a public Merkle tree. Any member can produce a
-//! message proof that:
+//! A group of `2^depth` members (any `depth` for which
+//! [`air::is_valid_depth`] holds -- [`air::DEPTH`] is just this crate's
+//! own default), each holding a secret key whose commitment sits in a
+//! public Merkle tree. Any member can produce a message proof that:
 //! - was made by *some* member of the group, without revealing which one
 //!   (a ZK-STARK over a hash-based circuit — no elliptic curves, so no
 //!   discrete-log assumption to break, which is the "post-quantum" part), and
@@ -13,10 +14,16 @@
 //!   both proofs (see [`share`]).
 //!
 //! # What this doesn't give you
-//! - **Independent cryptanalysis.** [`permutation`] defines a new,
-//!   from-scratch STARK-friendly hash. Treat this crate as a demonstration
-//!   of RLN's circuit shape, not as something to deploy without an
-//!   independent security review of that permutation.
+//! - **Independent review of this specific port.** [`permutation`] is a
+//!   hand-port of `p3-goldilocks`/`p3-poseidon2`'s Poseidon2-over-Goldilocks
+//!   construction (the hash underlying multiple independently audited
+//!   production STARK provers), verified against that reference's own test
+//!   vector byte-for-byte — not a from-scratch design. That closes the
+//!   "invented, uncryptanalyzed construction" gap, but a transcription
+//!   error elsewhere in the port is still a real risk category the test
+//!   vector doesn't fully rule out. Treat this crate as a demonstration of
+//!   RLN's circuit shape, not as something to deploy without an
+//!   independent review of the port itself.
 //! - **A real membership registry.** [`merkle::MerkleTree`] is an in-memory
 //!   reference tree; wiring it to a persistent/distributed registry
 //!   (a smart contract, a gossiped log, ...) is out of scope here.
@@ -61,7 +68,7 @@ pub mod permutation;
 pub mod share;
 
 use rand::Rng;
-use winterfell::math::{fields::f128::BaseElement, FieldElement};
+use winterfell::math::{fields::f64::BaseElement, FieldElement};
 
 use merkle::{MerkleTree, PathStep};
 use permutation::{compress2, Params};
@@ -114,7 +121,7 @@ pub fn bytes_to_field(bytes: &[u8]) -> BaseElement {
     for chunk in bytes.chunks(8) {
         let mut buf = [0u8; 8];
         buf[..chunk.len()].copy_from_slice(chunk);
-        let v = BaseElement::new(u64::from_le_bytes(buf) as u128);
+        let v = BaseElement::new(u64::from_le_bytes(buf));
         acc = compress2(&params, acc, v);
     }
     acc
@@ -127,6 +134,35 @@ pub fn epoch_field(epoch: u64) -> BaseElement {
 pub struct Message {
     pub proof: winterfell::Proof,
     pub public: air::PublicInputs,
+}
+
+impl Message {
+    /// Parses `proof_bytes` (as received from an untrusted network peer)
+    /// into a [`Message`] paired with `public`, catching panics rather
+    /// than letting one crash the caller's process.
+    ///
+    /// This crate never calls `winterfell::Proof::from_bytes` itself —
+    /// every real caller does, to turn wire bytes into the `proof` field
+    /// above before ever reaching [`verify_message`] — so the panic this
+    /// guards against isn't hypothetical: this crate's own fuzz target
+    /// (`crates/core/fuzz/fuzz_targets/rln_verify.rs`) found a 4-byte
+    /// input (`[0xdd, 0x00, 0x03, 0xdd]`) that makes winterfell 0.13.1's
+    /// deserializer panic with "attempt to exponentiate with overflow"
+    /// while decoding an attacker-controlled trace-length exponent, before
+    /// this crate's own code — or winterfell's own signature/constraint
+    /// checks — ever run. That's a genuine remote DoS for any caller
+    /// parsing proof bytes directly, and it reproduces under this
+    /// workspace's own `overflow-checks = true` release profile, not just
+    /// a fuzz build's extra checks. The bug is upstream in winterfell, not
+    /// fixable here, but every caller of *this* crate is protected by
+    /// routing parsing through here instead of calling
+    /// `winterfell::Proof::from_bytes` directly.
+    pub fn from_proof_bytes(proof_bytes: &[u8], public: air::PublicInputs) -> Result<Self, String> {
+        let parsed = std::panic::catch_unwind(|| winterfell::Proof::from_bytes(proof_bytes))
+            .map_err(|_| "malformed proof bytes: parser panicked".to_string())?;
+        let proof = parsed.map_err(|e| e.to_string())?;
+        Ok(Message { proof, public })
+    }
 }
 
 /// Proves that `identity` is a member of `tree` and computes its rate-limit

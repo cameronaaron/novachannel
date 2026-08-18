@@ -2,7 +2,7 @@ use novachannel::identity::Identity;
 use novachannel::multidevice::{
     DeviceId, DeviceListEntry, MultiDeviceSession, ReceivingDevice, RemoteAccount, SignedDeviceList,
 };
-use novachannel::prekey::{DhIdentity, PreKeyBundle, SignedPreKey};
+use novachannel::prekey::{DhIdentity, OneTimePreKeyStore, PreKeyBundle, SignedPreKey};
 use novachannel::ratchet::Opened;
 use novachannel::Error;
 
@@ -209,6 +209,40 @@ fn two_peer_accounts_sending_to_the_same_receiving_device_stay_isolated() {
         Opened::Application(bytes) => assert_eq!(bytes, b"from carol"),
         Opened::RatchetAdvanced { .. } => panic!("expected application data"),
     }
+}
+
+#[test]
+fn remote_account_add_remove_and_list_device_ids() {
+    let phone = make_device();
+    let desktop = make_device();
+
+    let mut remote = RemoteAccount::new();
+    remote.add_device(DeviceId(1), bundle(&phone));
+    remote.add_device(DeviceId(2), bundle(&desktop));
+
+    let mut ids = remote.device_ids();
+    ids.sort();
+    assert_eq!(ids, vec![DeviceId(1), DeviceId(2)]);
+
+    remote.remove_device(DeviceId(1));
+    assert_eq!(remote.device_ids(), vec![DeviceId(2)]);
+}
+
+#[test]
+fn opening_from_an_unknown_sender_device_is_rejected() {
+    let bob_phone = make_device();
+    let mut bob_receiver = ReceivingDevice::new(
+        bob_phone.dh_identity,
+        bob_phone.spk,
+        OneTimePreKeyStore::default(),
+    );
+
+    let stranger = Identity::generate();
+    assert!(!bob_receiver.has_session(&stranger.public(), DeviceId(1)));
+    assert!(matches!(
+        bob_receiver.open_from(&stranger.public(), DeviceId(1), b"anything"),
+        Err(Error::UnknownDevice)
+    ));
 }
 
 fn entry(d: &Device, device_id: DeviceId) -> DeviceListEntry {

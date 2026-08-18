@@ -57,6 +57,8 @@ quantum-resistant (see §0.2). Concretely:
 | §6.18 Signed, version-authenticated device lists close `crate::multidevice`'s trust-provisioning gap | `SignedDeviceList`/`RemoteAccount::from_signed_device_list`/`MultiDeviceSession::sync_from_signed_device_list`; `crates/core/tests/multidevice.rs` (6 new tests: mismatched-bundle rejection, unlisted-device rejection, wrong-signer rejection, version-rollback rejection, automatic revocation on a newer list) |
 | §6.19 Zeroization gaps closed workspace-wide; `unsafe_code` promoted `deny`→`forbid`; supply chain gated per-PR | `ml-dsa`/`ml-kem`/`chacha20poly1305`'s optional `zeroize` cargo features enabled (their `Drop` impls were feature-gated and silently absent without it); `novachannel_rln::Identity` lost its `Debug` derive and gained a `Drop` impl (was leaking `sk` via `{:?}`, the one secret type in the workspace §2.1 missed); `Group`/`WelcomeSnapshot`/`x3dh::SessionKeys`/`oram::Client` gained `Drop` impls for `epoch_secret`/`application_secret`/`known_secrets`/`ratchet_root`/`init_payload_key`/`position_map`; all five crate roots use `#![forbid(unsafe_code)]` (a local `#[allow(unsafe_code)]` could previously override `deny`); `scripts/check.sh` runs `--locked` (catches an unreviewed `Cargo.lock` drift) and `cargo audit` on every invocation, and CI now installs `cargo-audit` and runs the same gate per-PR instead of only via `scheduled-security.yml`'s daily cron; `SECURITY.md` added |
 | §6.20 `novachannel-rln`'s STARK proof options raised from ~96 to ~148 conjectured bits; `NovaRescue` round count raised from 7 to 31 | `crates/rln/src/air.rs::default_proof_options` (32 queries / blowup 16 / grinding 20 / `FieldExtension::Quadratic`, formula and field-extension rationale in its own doc comment); `crates/rln/src/permutation.rs::ROUNDS` (31, chosen to keep `BLOCK_LEN = ROUNDS + 1` a power of two per `air.rs`'s `TRACE_LENGTH` assertion, comfortably above the estimated minimum for this S-box/width/field combination per its own doc comment); `crates/rln/examples/proof_size.rs` and `docs/SYSTEMIZATION.md` §3.2/§3.4 updated with measured numbers at the new default rather than left describing the old one; all 17 `novachannel-rln` tests still pass in `--release` |
+| §6.21 `NovaRescue` (from-scratch permutation) replaced with a verified port of `p3-goldilocks`/`p3-poseidon2`'s Poseidon2-over-Goldilocks construction; `crate::erasure` replaced with `reed_solomon_simd` | `crates/rln/src/permutation.rs` module doc (every round constant and the diffusion matrix copied verbatim from `p3-goldilocks` 0.6.3, checked byte-for-byte by `matches_official_poseidon2_goldilocks_width8_test_vector`); field changed `f128`→`f64` (Goldilocks) workspace-wide in `rln`, `MerkleTree::root_bytes` 16→8 bytes accordingly (a breaking wire-format change, stated as such per §6.11's standard); `crates/core/src/erasure.rs` (hand-rolled GF(256) Cauchy-Reed-Solomon replaced by the audited, FFT-based `reed_solomon_simd`, with this module's own `Malformed`-error guard in front of the dependency's `assert!`-panic on odd shard lengths — untrusted-input handling the dependency itself doesn't provide) |
+| §6.22 A fuzz target found a real remote-DoS panic in `winterfell`'s proof deserializer; `rln::air.rs`/`core::multidevice.rs` coverage gaps closed; post-quantum threshold decryption added to `novachannel-mpc` | `crates/rln/src/lib.rs::Message::from_proof_bytes` + hardened `air::verify` (both `catch_unwind`-wrapped; regression tests replay the exact 4-byte crash inputs `rln_verify`/`mpc_frost_verify` fuzz targets found — see `crates/core/fuzz/fuzz_targets/{rln_verify,mpc_frost_verify}.rs` and that crate's README on why `cargo fuzz`'s forced `panic=abort` can't itself confirm a `catch_unwind` fix); `crates/rln/src/air.rs::tests` (malformed-`TraceInfo` guards) and `crates/rln/tests/rln.rs::each_public_input_is_independently_load_bearing`; `crates/core/src/multidevice.rs::tests`/`crates/core/tests/multidevice.rs` (device-list wire round-trip, unknown-sender rejection, `RemoteAccount::remove_device`/`device_ids`); `crates/mpc/src/threshold_kem.rs` (ML-KEM-1024 per-operator keys + Shamir-shared master secret, no group DKG, security resting on module-LWE per operator instead of Ristretto discrete log — §4.2's "reuse what's already sound" applied to `evaluate`/`lagrange_coefficient_at_zero`) |
 | §6.2 A fix and its regression test are one change | the RLN Merkle off-by-one fix (§6.3) and `valid_membership_proof_verifies` |
 | §6.8 Dependency hygiene | every crate's declared dependencies are used; checked by grep audit (§6.8), no dead dependency left unresolved |
 | §9 Fair claims about proof/build status | `cargo test -p novachannel-rln --release` documented as the required invocation, with the debug-mode caveat explained rather than hidden |
@@ -107,6 +109,14 @@ novelty is flagged, loudly, at the top of `permutation.rs` and again in the
 crate's `lib.rs`: it has not been independently cryptanalyzed, and the crate
 says so rather than borrowing Rescue-Prime or Poseidon's reputation for a
 construction that isn't actually either of them.
+
+**Superseded by §6.21**: `NovaRescue` was later replaced by a verified
+port of an actual published Poseidon2 instance, closing the specific gap
+this section describes. Left as-is here rather than rewritten, since the
+reasoning above — evidence a novel construction's novelty, don't borrow a
+reputation it hasn't earned — is exactly the standard §6.21 applied to
+justify *removing* the novel construction once a verified alternative
+existed.
 
 ### 0.4 Say what is true
 
@@ -247,6 +257,44 @@ Pinned by the existing `cargo test -p novachannel-rln --release` suite still
 passing after the signature change (all five tests call `prove_message`,
 which now propagates the `Result`).
 
+### 3.3 A `Result`-returning entry point isn't enough if a *dependency* panics before returning one
+
+`novachannel_rln::air::verify` already returned `Result` (§3.2) — but a
+fuzz target (`crates/core/fuzz/fuzz_targets/rln_verify.rs`, added this
+session) found that `winterfell::Proof::from_bytes`, the deserializer
+every real caller must run on wire bytes before ever reaching `verify`,
+panics on some malformed inputs rather than returning its own `Err`: a
+4-byte input (`[0xdd, 0x00, 0x03, 0xdd]`) makes winterfell 0.13.1's
+`TraceInfo::read_from` compute `2usize.pow(attacker_controlled_exponent)`
+with no bounds check, aborting with "attempt to exponentiate with
+overflow." This reproduces under this workspace's own `overflow-checks =
+true` release profile (root `Cargo.toml`) — a genuine remote DoS for any
+caller parsing proof bytes directly, not a fuzz-build artifact. §3's rule
+("every function that accepts bytes from a peer returns `Result`") holds
+for this crate's own code; it does not automatically hold for a
+dependency's parser sitting between the peer and this crate's first line
+of code, and nothing before this pass checked that boundary specifically.
+
+The fix, `novachannel_rln::Message::from_proof_bytes`, wraps
+`Proof::from_bytes` in `std::panic::catch_unwind` and turns a caught panic
+into an ordinary `Err` — the same treatment `verify` itself now also gets,
+defensively, for whatever panic paths fuzzing hasn't found yet deeper in
+verification. Two regression tests
+(`a_four_byte_input_that_used_to_panic_winterfells_deserializer_is_rejected_cleanly`
+and a second, independently-discovered crash input) replay the exact bytes
+the fuzz target found and assert a clean `Err`, not a fixed-and-forgotten
+comment.
+
+**One caveat recorded rather than glossed over**: `cargo fuzz` forces
+`panic = "abort"` for ASan/libFuzzer compatibility, so `catch_unwind`
+cannot ever stop the fuzz *binary itself* from reporting a panicking input
+as a crash — the exact same code returns `Err` correctly in a normal
+`cargo build`/`cargo test`. A fix's correctness has to be checked against
+a normal build (the two regression tests above), not against whether the
+fuzz target "stops crashing" — see `crates/core/fuzz/README.md`'s own
+section on this for the reasoning, so a future crash report on this
+target doesn't get misread as evidence the fix regressed.
+
 ---
 
 ## 4. The proof-obligation law
@@ -274,6 +322,11 @@ that tries to violate it is.
 | A FROST signature does not verify against a different message | `a_signature_does_not_verify_against_a_different_message` |
 | A tampered FROST signature share is caught before aggregation, and identifies the signer at fault | `a_tampered_signature_share_fails_share_verification` |
 | FROST signature shares and the final signature match RFC 9591's own published test vector exactly | `official_test_vector_matches_rfc9591` (§6.9) |
+| A malformed RLN proof cannot crash the verifier's process, only fail cleanly | `a_four_byte_input_that_used_to_panic_winterfells_deserializer_is_rejected_cleanly`, `a_second_four_byte_input_that_used_to_panic_winterfells_deserializer_is_rejected_cleanly` (§3.3, §6.22) |
+| Every RLN public input (not just the root) is independently load-bearing | `each_public_input_is_independently_load_bearing` (§6.22) |
+| A below-threshold quorum cannot recover a `threshold_kem`-encrypted payload | `below_threshold_quorum_fails_to_decrypt` (§6.22) |
+| A ciphertext encapsulated to one operator cannot be decapsulated cleanly by another | `a_ciphertext_meant_for_a_different_operator_fails_to_decapsulate_cleanly` (§6.22) |
+| A tampered `threshold_kem` payload ciphertext is rejected | `tampered_payload_ciphertext_is_rejected` (§6.22) |
 
 A new cryptographic property added to any crate needs a row here and a test
 next to it before it's considered done — a property with no adversarial test
@@ -330,6 +383,24 @@ Current limitations, each documented in the crate that has them:
   against the official `FROST(ristretto255, SHA-512)` test vector from the
   CFRG `draft-irtf-cfrg-frost` repository — see §6.9 for how that
   verification actually happened and what it did and didn't confirm.
+  **`Dealer`/`frost`/`combine_partials` are entirely classical
+  elliptic-curve (Ristretto255) constructions** — a cryptographically
+  relevant quantum computer breaking Ristretto's discrete log breaks all
+  three outright, the same gap named for the rest of this crate before
+  §6.22. That gap is now closed for the *decryption* use case specifically
+  (not the *signing* one — no production-ready post-quantum threshold
+  signature scheme exists yet to replace FROST with; see the module doc
+  survey below) by `threshold_kem` (§6.22): each operator holds an
+  independent ML-KEM-1024 keypair — no group DKG needed at all, since
+  there's no shared EC point to commit to — and a sender Shamir-shares a
+  per-message master secret across them. An attacker needs `t` operators'
+  ML-KEM secret keys (`t` independent module-LWE problems) to reconstruct
+  anything; breaking Ristretto's discrete log gains nothing against this
+  path, unlike against `Dealer`/`frost`. Callers whose threat model needs
+  post-quantum *signing* (not decryption) still have no answer here —
+  `threshold_kem`'s own module doc names the state of that research
+  (closest is `lattice-safe/threshold-ml-dsa`, unaudited as of this
+  writing) rather than implying `frost` covers it.
 - `novachannel-oram`: the position map and stash (`Client`) are structurally
   separated from bucket storage (`ServerStorage`/`InMemoryServer`, §6.10) —
   no longer just a documented rule, a real deployment implements
@@ -1041,3 +1112,201 @@ automatically once whatever pulls it in raises its own requirement.
 Final state after this section: 104 resolved crate dependencies (down
 from 107 — the version bumps consolidated some previously-duplicated
 versions in the tree), full `scripts/check.sh` green, `cargo audit` clean.
+
+### 6.20 Raising RLN's STARK parameters and permutation round count to match the rest of the workspace's ≥128-bit bar
+
+§2.1/§6.19 already held every other primitive in this workspace to a
+≥128-bit security target (ML-KEM-1024, ML-DSA-87); `novachannel-rln`'s own
+defaults were still the reference-implementation values chosen when the
+crate was first built — `default_proof_options`'s conjectured soundness
+(winterfell's own formula, `num_queries * log2(blowup_factor) +
+grinding_factor`) worked out to ~96 bits (32 queries, blowup 16, grinding
+0, no field extension), and `NovaRescue`'s round count was 7. Neither was
+wrong for what it was — a reference implementation demonstrating a circuit
+shape — but both were short of the bar this workspace states for itself
+everywhere else, and nothing about "reference implementation" is a reason
+to leave a stated security number quietly lower than the rest of the
+document implies.
+
+Raised to `num_queries=32, blowup_factor=16, grinding_factor=20,
+FieldExtension::Quadratic` (~148 bits by the same formula, with the
+quadratic extension separately addressing winterfell's own documented
+caveat that a field this size can fall short of 100+ bits of
+*field-related* soundness without one — not something `num_queries`/
+`blowup_factor` alone capture) and `ROUNDS = 31` (the next value keeping
+`BLOCK_LEN = ROUNDS + 1` a power of two, `air.rs`'s trace-length
+assertion's requirement, comfortably above the estimated minimum for this
+S-box/width/field combination per `permutation.rs`'s own doc comment at
+the time). Cost stated plainly, not buried: proof size grew from ~25.8KB
+to ~36.7KB, measured by `crates/rln/examples/proof_size.rs`, not
+estimated — the same "measure, don't assume" instinct as §0.5 applied to
+a size/security tradeoff instead of a correctness bug. All 17
+`novachannel-rln` tests pass in `--release` (§0.4) after the change.
+
+### 6.21 `NovaRescue` replaced with a verified port of an audited Poseidon2 instance; `crate::erasure` replaced with a maintained Reed-Solomon crate
+
+§0.3 flagged `NovaRescue` as a from-scratch, uncryptanalyzed permutation
+from the day it was built, and §6.20 raised its round count without
+closing that gap — a higher round count on an unreviewed construction is
+still an unreviewed construction. Closed properly, the same way §6.11
+closed the pre-standard PQC dependency gap: not by inventing a fix, but by
+replacing the from-scratch piece with a verified port of something already
+independently reviewed.
+
+`crates/rln/src/permutation.rs` now ports Poseidon2-over-Goldilocks
+verbatim from `p3-goldilocks`/`p3-poseidon2` 0.6.3 (Plonky3's own
+instantiation — the hash underlying multiple independently audited
+production STARK provers, e.g. Succinct's SP1 and RISC Zero): every round
+constant and the internal diffusion matrix copied directly from that
+crate's source, the round structure a direct port of its generic
+algorithm, not a reinterpretation. `matches_official_poseidon2_goldilocks_width8_test_vector`
+checks the port against `p3-goldilocks`'s own published test vector
+byte-for-byte — the same "validate against ground truth, don't theorize
+from the prose" standard §6.9 already applied to FROST, applied here to a
+permutation instead of a signing protocol. Per §0.3/SECURITY.md's own
+standard for what this actually closes: porting the *algorithm* removes
+the "invented, uncryptanalyzed construction" risk category; it does not
+by itself constitute independent review of *this specific port* — a
+transcription error in a constant is still a real bug the test vector
+happens to catch, not one guaranteed to be caught in general. Stated as
+such in both `permutation.rs`'s module doc and `SECURITY.md`, not
+overclaimed as "audited" because the algorithm it's ported from has been.
+
+Two changes fell out of matching the reference instance rather than being
+independent decisions: the field changed from `f128` to `f64` (Goldilocks
+— `p3-goldilocks` is defined over that field specifically, not a
+field-independent algorithm choice this crate made on its own), and the
+permutation width changed from this crate's previous 4 to 8 (checked
+directly against `p3-goldilocks`'s source, which only publishes constants
+for widths 8, 12, 16, and 20 — no production Poseidon2/RPO instance ships
+at width 4, so porting a *published* instance meant porting the smallest
+one that exists, not the width this crate happened to pick before).
+`MerkleTree::root_bytes` changed from 16 bytes to 8 accordingly — a
+breaking wire-format change, stated as such per §6.11's standard for
+exactly this situation, not left implicit in a type signature.
+
+`crates/core/src/erasure.rs`'s from-scratch Cauchy-matrix GF(256)
+Reed-Solomon code (flagged in §6.17 the same way `NovaRescue` was — novel,
+unreviewed, evidence-flagged) is now a thin wrapper around
+`reed_solomon_simd` (Leopard-RS, FFT-based, `O(n log n)`, with a much
+larger production track record than a module-local Cauchy matrix could
+ever accumulate). Checked against this workspace's own `cargo audit` gate
+before committing to it, not assumed safe because it's popular: pulls in
+only two small dependencies with zero advisories, unlike the alternative
+`reed-solomon-erasure` crate this module considered first, which
+hard-pins an `lru` version `cargo audit` flags. One thing porting to a
+dependency didn't get for free: `reed_solomon_simd`'s own encoder/decoder
+`assert!`-panics on an odd `shard_bytes` length rather than returning
+`Result` — fine for `encode`, where this module picks the length itself,
+but `decode` runs on a length implied by whatever a peer sent. `decode`
+therefore checks for an odd length itself and returns `Malformed` before
+ever calling into the dependency — the same §3 "a parser boundary owns
+its own untrusted-input handling, even when it delegates the underlying
+algorithm" principle §6.22 (below) later found a second, independent
+instance of in a different dependency (`winterfell`).
+
+### 6.22 A fuzz target found a real remote-DoS panic in a dependency; two real coverage gaps closed; post-quantum threshold decryption added to `novachannel-mpc`
+
+Three pieces of work, landed together because each surfaced doing an
+honest answer to one question: **"is this workspace's post-quantum and
+robustness posture actually as strong as its docs claim, right now?"**
+
+**A real defect, found by fuzzing, not by inspection.** Two new fuzz
+targets (`rln_verify`, `mpc_frost_verify` — extending §6.8's parser-safety
+audit and the six targets already covering `crates/core`'s own
+untrusted-input boundaries) were added for the two crates that had none:
+`novachannel-rln`'s STARK proof verifier and `novachannel-mpc`'s FROST
+signature verifier. `mpc_frost_verify` ran 225,000 executions clean.
+`rln_verify` found a real bug within seconds: full details and the fix are
+§3.3, above — the short version is that a dependency's own deserializer
+could be driven to panic by four attacker-controlled bytes, reproducing
+under this workspace's own production release profile, and is now caught
+by `catch_unwind` at this crate's public API boundary with two regression
+tests pinning the exact crash inputs found.
+
+**Two real, measured coverage gaps, not assumed ones.** §6.16 already
+established that `tarpaulin`'s numbers for `novachannel-rln` need
+`--release` (§6.5) and separate per-crate measurement to be trusted; doing
+that measurement fresh (rather than trusting the "near-100%" figure §6.16
+left as a snapshot in time) found real drift since new features (the
+TreeKEM-style group ratchet, Sesame-style multi-device, the incremental
+ratchet, §6.17) landed without matching test density: `core::multidevice.rs`
+at 63% and `rln::air.rs` — the STARK constraint system itself, the part
+that decides whether a forged proof gets accepted — at 55%. Closed with
+tests targeting the specific uncovered branches rather than broad
+end-to-end coverage padding: `air.rs` gained a `#[cfg(test)]` module of
+its own (previously zero direct unit tests) covering `RlnAir::new`'s three
+malformed-`TraceInfo` guards — which also turned up a real, if harmless,
+finding: one of the three guards (a block count that's `>2` but not a
+power of two) is provably unreachable via the actual winterfell `verify`
+path, since `TraceInfo::new` itself already rejects any non-power-of-two
+length before this crate's guard could ever see one — and
+`each_public_input_is_independently_load_bearing`, which checks all five
+public inputs (root, epoch, x, y, nullifier) are load-bearing individually,
+not just root (the only one the existing test suite checked alone).
+`multidevice.rs` gained tests for `SignedDeviceList`'s wire round-trip
+(previously untested — `issue`/`verify` alone never exercises `write`/
+`read`), `RemoteAccount::remove_device`/`device_ids`, and
+`ReceivingDevice::open_from` against an unknown sender (the receiving
+side's counterpart to the sending side's existing
+`opening_from_an_unknown_device_is_rejected`).
+
+**Post-quantum threshold decryption, closing the gap §5 now names for
+`novachannel-mpc`.** `Dealer`/`frost`/`combine_partials` are entirely
+classical Ristretto255 constructions — a full quantum break of that
+curve's discrete log breaks all three, the same category of gap this
+workspace closed for its main channel in §6.11. No production-ready
+post-quantum threshold *signature* scheme exists to swap FROST for
+(checked directly, not assumed: the closest candidate,
+`lattice-safe/threshold-ml-dsa`, is unaudited research code as of this
+writing, and NIST's own IR 8214C is a call for submissions, not a
+standard). What the mixnode-operator use case actually needs, though, is
+threshold *decryption capability*, not threshold signing — a narrower
+problem with an answer buildable entirely from primitives already vetted
+elsewhere in this workspace, composed rather than invented, the same §4.2
+standard applied to a new module instead of an existing one.
+
+`crates/mpc/src/threshold_kem.rs`: each operator generates their own
+ML-KEM-1024 keypair independently (the same FIPS 203 KEM
+`novachannel::kex` already uses) — no group DKG round at all, since unlike
+`Dealer` there is no shared EC point for operators to jointly commit to,
+so the classic rushing-bias attack `Dealer`'s commit-then-reveal round
+exists to prevent doesn't apply here either. A sender Shamir-shares a
+per-message master secret and, for each operator, does a fresh ML-KEM
+encapsulation to wrap that operator's share. Reconstruction reuses this
+crate's own `evaluate`/`lagrange_coefficient_at_zero` (§4.2 — not a second,
+independent implementation of Shamir polynomial math that could drift from
+the one `Dealer`/`combine_partials` already use) applied directly to the
+shared scalar rather than in the exponent. Shamir's secrecy guarantee is
+information-theoretic and doesn't depend on the field being
+cryptographically hard, so reusing `curve25519-dalek::Scalar` purely as
+polynomial arithmetic here costs nothing in post-quantum security — the
+shared value is never used as an EC scalar multiplier against any public
+point, so even a full break of Ristretto's discrete log gains an attacker
+nothing against this path. An adversary instead needs `t` operators' own
+ML-KEM secret keys — `t` independent module-LWE problems.
+
+No Feldman-style commitments on the shares themselves, by design, not
+oversight: there's no group public key here for a share to be checked
+against, so a wrong or tampered share simply fails to derive the real
+payload AEAD key on reconstruction, and that AEAD tag is the check that
+matters — `tampered_payload_ciphertext_is_rejected` and
+`a_ciphertext_meant_for_a_different_operator_fails_to_decapsulate_cleanly`
+are the tests that pin this down as a real property, not an assumption.
+Six tests total: threshold quorum recovers the plaintext, below-threshold
+quorum fails (not "recovers the wrong thing silently"), an operator
+outside the group correctly has no share, a swapped-ciphertext attack
+fails AEAD authentication rather than decapsulating garbage, tampered
+payload ciphertext is rejected, and each operator's wrapped share is
+confirmed independently encapsulated (not one ciphertext reused across
+recipients).
+
+What this does *not* do, per §5's standard: `frost`/`Dealer` remain
+exactly as classical as before for callers whose threat model needs
+threshold *signing* — `threshold_kem` is additive, a second option for a
+different use case, not a replacement, and its own module doc says so
+rather than implying the whole crate is now post-quantum.
+
+Final state after this section: 168 tests across the workspace (up from
+132), 8 fuzz targets (up from 6), full `scripts/check.sh` green,
+`cargo audit` clean, `gitleaks detect` clean.

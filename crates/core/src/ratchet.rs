@@ -39,8 +39,8 @@
 //! an **incremental, erasure-coded** alternative
 //! ([`RatchetedSession::initiate_incremental_ratchet`]) that splits that
 //! same material into several small chunks plus redundant parity chunks
-//! (via [`crate::erasure`], a from-scratch Cauchy-Reed-Solomon-style code
-//! over GF(256)) so the exchange tolerates losing some of them — closer in
+//! (via [`crate::erasure`], built on the `reed_solomon_simd` crate)
+//! so the exchange tolerates losing some of them — closer in
 //! *shape* to SPQR's chunked, loss-tolerant design, while remaining honest
 //! about how much smaller it is than the real thing:
 //!
@@ -65,9 +65,10 @@
 //!   ruled out because each chunk is its own AEAD-sealed ratchet record)
 //!   is caught here rather than silently propagating a wrong KEX result
 //!   forward into the epoch it derives.
-//! - **No formal verification of the erasure code either** — see
-//!   [`crate::erasure`]'s own module docs for what was and wasn't checked
-//!   there.
+//! - **No formal verification of this module's own use of erasure coding**
+//!   — the coding itself is delegated to `reed_solomon_simd`, but the
+//!   chunk framing and reassembly logic here are this workspace's own;
+//!   see [`crate::erasure`]'s own module docs.
 //!
 //! Reordering across *chunks of the same step* is fine (that's the whole
 //! point — arrival order doesn't matter, only which `data_shards` of them

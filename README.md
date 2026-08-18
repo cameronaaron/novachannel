@@ -71,9 +71,14 @@ section of the engineering report for the complete list.
 ## Status
 
 This is a reference implementation and engineering exercise, not an audited
-or production-hardened product. Two components — `novachannel-rln`'s
-in-circuit hash (`NovaRescue`) and the incremental ratchet's erasure code —
-are new, from-scratch code that has not undergone independent cryptanalysis.
+or production-hardened product. `novachannel-rln`'s in-circuit hash is now a
+verified port of Poseidon2-over-Goldilocks (`p3-goldilocks`/`p3-poseidon2`,
+checked against its published test vector byte-for-byte) rather than a
+from-scratch construction, and the incremental ratchet's erasure coding is
+now the maintained `reed_solomon_simd` crate rather than a hand-rolled
+GF(256) implementation — but porting an algorithm is not the same as an
+independent review of this codebase's specific use of it, and neither claim
+has had one.
 [§9 of the engineering report](docs/SYSTEMIZATION.md#9-limitations-and-what-would-be-needed-for-a-real-research-contribution)
 states plainly what is and isn't established here, and what a publishable
 research contribution would still require.

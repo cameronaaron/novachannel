@@ -90,9 +90,11 @@ same re-key material into erasure-coded chunks tolerant of losing some of
 them, closer to SPQR's chunked design than the one-shot path is. It still
 serializes ordinary ML-KEM-1024 bytes and splits those, rather than
 re-encoding the KEM algorithm's internal structure the way SPQR's
-`incremental_mlkem768` does, and its erasure code has the same
-"reference implementation, not independently cryptanalyzed" status as
-`NovaRescue` (§1 below). Building it surfaced that chunks *cannot* be
+`incremental_mlkem768` does. Its erasure coding now delegates to the
+maintained `reed_solomon_simd` crate rather than a hand-rolled GF(256)
+implementation (`ENGINEERING-STANDARDS.md` §6.21) — the chunk framing and
+reassembly logic layered on top remains this workspace's own and unreviewed.
+Building it surfaced that chunks *cannot* be
 routed through the base ratchet's own strict-ordering `seal`/`open` — a
 finding demonstrated by a failing test, not just reasoned about — and a
 second real defect (stale-root-key derivation on chunks arriving after
@@ -152,11 +154,17 @@ want that instead).
 
 No, and the specific reasons (not a hedge):
 
-- `NovaRescue` (the RLN in-circuit hash) has had zero independent
-  cryptanalysis (`docs/SYSTEMIZATION.md` §3.2, §9).
-- The incremental ratchet's erasure code (`docs/SYSTEMIZATION.md` §4.1.1)
-  has the same status: a from-scratch construction, checked by this
-  project's own tests, not independently cryptanalyzed.
+- The RLN in-circuit hash is now a verified port of Poseidon2-over-Goldilocks
+  (`ENGINEERING-STANDARDS.md` §6.21), not the from-scratch `NovaRescue`
+  construction this document originally described — but porting the
+  algorithm from an audited reference is not the same as an independent
+  review of this specific port (`docs/SYSTEMIZATION.md` §3.2, §9).
+- The incremental ratchet's erasure coding now delegates to the maintained
+  `reed_solomon_simd` crate rather than a from-scratch implementation
+  (`ENGINEERING-STANDARDS.md` §6.21) — but the chunk framing and
+  reassembly logic built on top of it (`docs/SYSTEMIZATION.md` §4.1.1)
+  remains this project's own and has the same "checked by this project's
+  own tests, not independently reviewed" status as before.
 - The ratchet (either variant) gives real forward secrecy and
   post-compromise security, but is a hand-tested design, not SPQR's
   hax/F*/ProVerif-verified one — see §3 for the precise gap that remains.

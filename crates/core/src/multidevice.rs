@@ -456,3 +456,49 @@ impl ReceivingDevice {
             .contains_key(&(identity_key(sender), from_device))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::Identity;
+
+    fn dummy_entry(device_id: DeviceId) -> DeviceListEntry {
+        let identity = Identity::generate();
+        let dh_identity = DhIdentity::generate();
+        DeviceListEntry {
+            device_id,
+            identity: identity.public(),
+            dh_identity: dh_identity.public(),
+        }
+    }
+
+    /// `SignedDeviceList::write`/`read` isn't exercised by any test that
+    /// only calls `issue`/`verify` directly (those never round-trip
+    /// through wire bytes) -- this is the actual wire-format contract a
+    /// deployment sending the list over a transport depends on, so it
+    /// needs its own direct check that it round-trips and that the
+    /// result still verifies against the issuing account.
+    #[test]
+    fn signed_device_list_round_trips_through_wire_bytes() {
+        let account = Identity::generate();
+        let entries = vec![dummy_entry(DeviceId(1)), dummy_entry(DeviceId(2))];
+        let list = SignedDeviceList::issue(&account, 3, entries);
+
+        let mut w = Writer::new();
+        list.write(&mut w);
+        let bytes = w.into_bytes();
+
+        let mut r = Reader::new(&bytes);
+        let round_tripped = SignedDeviceList::read(&mut r).expect("well-formed encoding");
+
+        assert_eq!(round_tripped.version, list.version);
+        assert_eq!(round_tripped.entries().len(), list.entries().len());
+        for (a, b) in round_tripped.entries().iter().zip(list.entries()) {
+            assert_eq!(a.device_id, b.device_id);
+            assert_eq!(a.dh_identity.as_bytes(), b.dh_identity.as_bytes());
+        }
+        round_tripped
+            .verify(&account.public())
+            .expect("round-tripped list must still verify against the issuing account");
+    }
+}

@@ -19,6 +19,16 @@ authentication has happened:
 - `group_commit` — `Commit`/`Welcome` byte parsing, and, when a `Commit`
   happens to parse, `Group::apply_commit` against a real single-member
   group.
+- `rln_verify` — `novachannel_rln::Message::from_proof_bytes` +
+  `air::verify` (the RLN STARK proof verifier), against a real proof
+  generated once offline (see that target's doc comment for why: proving
+  live inside the fuzz binary hits a winterfell debug-assertion quirk
+  `novachannel-rln`'s own module docs already warn about).
+- `mpc_frost_verify` — decodes fuzzed bytes into a `RistrettoPoint`/
+  `Scalar` FROST signature and calls `novachannel_mpc::frost::verify`;
+  `novachannel-mpc` does no wire framing of its own (see its module docs),
+  so this fuzzes the decode-then-verify shape any real transport layer
+  would have.
 
 Each target builds fresh key material every iteration rather than reusing
 state across runs, so a successful parse on one input never changes how a
@@ -46,6 +56,26 @@ discarding it.
 
 `cargo +nightly fuzz run <target> -- -help=1` lists libFuzzer's own flags
 (corpus minimization, coverage reports, dictionaries, etc.).
+
+## `catch_unwind`-based fixes and this fuzz harness's own blind spot
+
+`cargo fuzz` builds with ASan/libFuzzer instrumentation, which forces
+`panic = "abort"` regardless of the crate under test's own profile
+settings — needed for the sanitizer to treat a panic as a reportable crash
+at all. That means a `std::panic::catch_unwind`-based fix (like
+`novachannel_rln::Message::from_proof_bytes`, added after `rln_verify`
+found a real panic in winterfell's proof deserializer) can never make the
+*fuzz binary itself* stop reporting that input as a crash — the process
+aborts before `catch_unwind` ever gets a chance to run, even though the
+exact same code correctly returns `Err` in a normal (unwind-enabled)
+`cargo build`/`cargo test`. Don't take a fuzz target "still crashing" on a
+previously-fixed input as evidence the fix didn't work; verify the fix
+against a normal build instead (a `#[test]` replaying the same bytes, per
+the workflow above — see `crates/rln/tests/rln.rs`'s two
+`..._is_rejected_cleanly` tests for the pattern). The fuzz target remains
+exactly as useful for what it's actually for: finding new
+panic-triggering inputs in an untrusted-input parser, one crash-file at a
+time, regardless of whether the library under test catches them.
 
 ## Status
 

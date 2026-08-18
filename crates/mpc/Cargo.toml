@@ -3,7 +3,7 @@ name = "novachannel-mpc"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "Pedersen/Feldman DKG, FROST threshold signatures, and threshold decryption for distributed mixnode keys — no single operator ever holds the full secret."
+description = "Pedersen/Feldman DKG, FROST threshold signatures, and post-quantum (ML-KEM + Shamir) threshold decryption for distributed mixnode keys — no single operator ever holds the full secret."
 
 [lints]
 workspace = true
@@ -14,6 +14,18 @@ rand_core = "0.10"
 getrandom = { version = "0.4", features = ["sys_rng"] }
 sha2 = "0.11"
 zeroize = { version = "1", features = ["derive"] }
+# `threshold_kem`'s post-quantum leg: same FIPS 203 KEM, same crate
+# versions, as `novachannel::kex` — see that module's own doc comment for
+# why ML-KEM-1024 specifically. `zeroize` on `ml-kem`: without it, its
+# `DecapsulationKey` doesn't actually clear its secret state on drop (its
+# `Drop` impl is entirely feature-gated).
+ml-kem = { version = "0.3", features = ["zeroize"] }
+kem = "0.3"
+# AEAD + KDF for wrapping each operator's Shamir share under their own
+# ML-KEM shared secret, and the reconstructed master secret's payload
+# key — same crates/versions `novachannel`'s transport layer already uses.
+chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
+hkdf = "0.13"
 
 [dev-dependencies]
 # Only for tests/frost_signs_rln_root.rs, demonstrating the FROST-signed

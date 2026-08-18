@@ -5,8 +5,15 @@ This repository (`novachannel` and its sibling crates: `novachannel-rln`,
 software. See `ENGINEERING-STANDARDS.md` for what correctness and testing
 bar this workspace holds itself to, and each crate's own module docs
 (`crates/*/src/lib.rs`) for what it does and does not claim to give you —
-in particular `novachannel-rln`'s permutation, which has not had
-independent cryptanalysis.
+in particular `novachannel-rln`'s permutation (`crates/rln/src/permutation.rs`),
+a hand-port of `p3-goldilocks`/`p3-poseidon2`'s Poseidon2-over-Goldilocks
+construction (the hash underlying multiple independently audited
+production STARK provers) rather than a from-scratch design, verified
+against that reference's own test vector byte-for-byte. Porting the
+*algorithm* closes the "invented, uncryptanalyzed construction" gap; it
+does not by itself constitute an independent review of *this port* — a
+transcription error in a constant would still be a real bug the test
+vector happens to catch, not one guaranteed to be caught in general.
 
 ## Reporting a vulnerability
 
@@ -38,9 +45,12 @@ that the code doesn't actually provide is itself a valid report.
 
 Out of scope: this is a research/engineering workspace, not a deployed
 service — there is no running infrastructure, hosted API, or user data to
-report against. `novachannel-rln`'s permutation being uncryptanalyzed is
-a known, documented limitation (see its module docs), not something that
-needs reporting on its own; a concrete attack exploiting it is in scope.
+report against. That said, a mismatch between `novachannel-rln`'s ported
+constants/round structure and the `p3-goldilocks`/`p3-poseidon2` reference
+they're ported from is very much in scope and exactly the kind of report
+this process wants — see its module docs for what's been checked (a
+test-vector match) and what hasn't (independent review of the port
+itself).
 
 ## Response
 

@@ -77,6 +77,7 @@ use sha2::{Digest, Sha256};
 
 pub type ParticipantId = u32;
 pub mod frost;
+pub mod threshold_kem;
 
 /// `rand_core` 0.10 (shared by `curve25519-dalek`, `ed25519-dalek`,
 /// `x25519-dalek`, `ml-kem`, `ml-dsa` across this workspace) no longer

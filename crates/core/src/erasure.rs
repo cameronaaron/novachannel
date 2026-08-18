@@ -1,31 +1,38 @@
-//! A small, from-scratch systematic Reed–Solomon-style erasure code over
-//! GF(2^8), built specifically for [`crate::ratchet`]'s incremental
-//! ratchet step: split one payload into `data_shards` chunks plus
-//! `parity_shards` redundant chunks, such that *any* `data_shards` of the
-//! resulting `data_shards + parity_shards` chunks (in any combination, not
-//! just "the first N to arrive") are enough to reconstruct the original
-//! bytes exactly.
+//! A thin, systematic wrapper around [`reed_solomon_simd`] for
+//! [`crate::ratchet`]'s incremental ratchet step: split one payload into
+//! `data_shards` chunks plus `parity_shards` redundant chunks, such that
+//! *any* `data_shards` of the resulting `data_shards + parity_shards`
+//! chunks (in any combination, not just "the first N to arrive") are
+//! enough to reconstruct the original bytes exactly.
 //!
-//! # Why Cauchy, not a generic Vandermonde matrix
-//! The parity rows are built from a Cauchy matrix
-//! (`entry[i][j] = 1 / (x_i XOR y_j)` over GF(256), with `{x_i}` and
-//! `{y_j}` disjoint) rather than the more commonly seen Vandermonde
-//! construction — the same choice, for the same reason, this workspace
-//! already made for `novachannel-rln`'s MDS matrix
-//! (`crates/rln/src/permutation.rs`): a Cauchy matrix's *every* square
-//! submatrix is invertible by a direct algebraic argument, so "any
-//! `data_shards` of the shards suffice" follows from the construction
-//! itself rather than needing to be checked case by case. It's still
-//! checked directly anyway (§0.5's "validate the instrument" standard) —
-//! `tests::any_k_of_n_shards_reconstruct_exactly` tries every combination
-//! for a small `(data_shards, parity_shards)` pair, not just one.
+//! # Why a crate, not a from-scratch GF(256) implementation
+//! This module used to hand-roll its own Cauchy-matrix Reed-Solomon code
+//! over GF(256) (log/antilog tables, Gauss-Jordan elimination). That's
+//! fine as an *algorithm* — Reed-Solomon is decades-old, textbook math
+//! with no novelty to get wrong in a way that matters here the way, say,
+//! [`crate::rln`]'s from-scratch permutation would — but it is still
+//! hand-written code with its own correctness surface (matrix inversion
+//! bugs, GF arithmetic bugs) that a maintained implementation already
+//! retired. [`reed_solomon_simd`] implements Leopard-RS (an
+//! FFT-based, O(n log n) construction with a much larger track record of
+//! production use in loss-tolerant data-distribution systems than a
+//! module-local Cauchy matrix could ever get) and, checked against this
+//! workspace's own `cargo audit` gate, pulls in only two small,
+//! cleanly-audited dependencies — no transitive advisories at all, unlike
+//! the alternative `reed-solomon-erasure` crate this module considered
+//! first (mature and widely used, but its `Cargo.toml` hard-pins a
+//! `lru` version cargo audit flags for RUSTSEC-2026-0253).
+//!
+//! # Untrusted-input handling
+//! [`reed_solomon_simd`]'s encoder/decoder `assert!`-panics if handed an
+//! odd `shard_bytes` length rather than returning a `Result` — fine for
+//! `encode` below, where this module picks the shard length itself, but
+//! `decode` runs on shard lengths implied by whatever a peer sent over
+//! the network. [`decode`] therefore rejects an odd shard length itself,
+//! as a `Malformed` error, before ever calling into the crate — a
+//! malformed peer message must fail cleanly here, not panic the process.
 //!
 //! # What this is not
-//! This is a correctness-focused, unoptimized implementation (GF(256)
-//! multiplication via log/antilog tables rebuilt on every call, Gauss–
-//! Jordan elimination on a `data_shards`×`data_shards` matrix) sized for
-//! the tiny payloads (~1-2 KB) a KEX handshake message needs — not a
-//! general-purpose or performance-competitive erasure-coding library.
 //! This module does not detect or correct *corruption* of a present
 //! shard, only reconstructs from *known-missing* ones — the two are
 //! different problems ("erasure" vs. "error") with different solutions;
@@ -36,154 +43,12 @@
 
 use crate::error::{Error, Result};
 
-/// log/antilog tables for GF(2^8) under the primitive polynomial
-/// `x^8 + x^4 + x^3 + x^2 + 1` (`0x11D`) and generator `2` — the same
-/// field and generator used by, e.g., QR codes' Reed–Solomon coding.
-/// Rebuilt fresh per call rather than cached: 256 iterations is a
-/// negligible cost next to the ML-KEM-1024 handshake material this module
-/// exists to chunk, and it avoids reaching for `std::sync::OnceLock` for
-/// a workspace-wide singleton to save microseconds nothing here is
-/// sensitive to.
-struct Gf256 {
-    exp: [u8; 512],
-    log: [u8; 256],
-}
-
-const GF256_POLY: u16 = 0x11D;
-
-impl Gf256 {
-    fn build() -> Self {
-        let mut exp = [0u8; 512];
-        let mut log = [0u8; 256];
-        let mut x: u16 = 1;
-        for (i, slot) in exp.iter_mut().take(255).enumerate() {
-            *slot = x as u8;
-            log[x as usize] = i as u8;
-            x <<= 1;
-            if x & 0x100 != 0 {
-                x ^= GF256_POLY;
-            }
-        }
-        for i in 255..512 {
-            exp[i] = exp[i - 255];
-        }
-        Gf256 { exp, log }
-    }
-
-    fn mul(&self, a: u8, b: u8) -> u8 {
-        if a == 0 || b == 0 {
-            return 0;
-        }
-        let sum = self.log[a as usize] as usize + self.log[b as usize] as usize;
-        self.exp[sum]
-    }
-
-    /// `a` must be nonzero — every caller in this module only ever
-    /// inverts a Cauchy-matrix entry (nonzero by construction, since its
-    /// two index sets are disjoint) or a Gauss-Jordan pivot (selected
-    /// specifically for being nonzero).
-    fn inv(&self, a: u8) -> u8 {
-        debug_assert_ne!(a, 0, "inv(0) is undefined in GF(256)");
-        self.exp[255 - self.log[a as usize] as usize]
-    }
-}
-
-/// Row `shard_idx` of the (`data_shards+parity_shards`) x `data_shards`
-/// systematic generator matrix: the identity for `shard_idx <
-/// data_shards`, a Cauchy row otherwise. `y`-set is `1..=data_shards`,
-/// `x`-set is `data_shards+1..=data_shards+parity_shards` — disjoint by
-/// construction (every `x` exceeds every `y`), which is exactly what
-/// makes every entry `1/(x XOR y)` well-defined and every square
-/// submatrix of the resulting generator invertible.
-fn generator_row(gf: &Gf256, data_shards: usize, shard_idx: usize) -> Vec<u8> {
-    let mut row = vec![0u8; data_shards];
-    if shard_idx < data_shards {
-        row[shard_idx] = 1;
-    } else {
-        let parity_index = shard_idx - data_shards;
-        let x = (data_shards + parity_index + 1) as u8;
-        for (j, slot) in row.iter_mut().enumerate() {
-            let y = (j + 1) as u8;
-            *slot = gf.inv(x ^ y);
-        }
-    }
-    row
-}
-
 fn check_shard_counts(data_shards: usize, parity_shards: usize) -> Result<()> {
     if data_shards == 0 || parity_shards == 0 || data_shards + parity_shards > 255 {
         Err(Error::Malformed("invalid erasure-coding shard counts"))
     } else {
         Ok(())
     }
-}
-
-/// A `k`x`k` matrix over GF(256), row-major.
-struct Matrix {
-    k: usize,
-    data: Vec<u8>,
-}
-
-impl Matrix {
-    fn get(&self, r: usize, c: usize) -> u8 {
-        self.data[r * self.k + c]
-    }
-    fn set(&mut self, r: usize, c: usize, v: u8) {
-        self.data[r * self.k + c] = v;
-    }
-}
-
-/// Gauss-Jordan elimination over GF(256). Every matrix this module
-/// inverts is a submatrix of a Cauchy-based generator matrix, which is
-/// invertible by construction (module docs) — a `Malformed` here would
-/// mean a caller passed a shard-index combination that isn't actually a
-/// submatrix of that generator, which the callers in this module never
-/// do, but the check stays a real `Result` rather than an `.expect()`
-/// since inversion has a genuine failure mode (a singular matrix) that a
-/// pure GF(256) construction argument doesn't fully rule out for
-/// hand-written, non-formally-verified code — the same "don't trust an
-/// algebraic argument over its own test" instinct
-/// `ENGINEERING-STANDARDS.md` §0.5 already applies elsewhere.
-fn invert(gf: &Gf256, m: &Matrix) -> Result<Matrix> {
-    let k = m.k;
-    let mut a = m.data.clone();
-    let mut inv = vec![0u8; k * k];
-    for (i, slot) in inv.iter_mut().enumerate().take(k * k) {
-        if i % k == i / k {
-            *slot = 1;
-        }
-    }
-
-    for col in 0..k {
-        let pivot_row = (col..k)
-            .find(|&r| a[r * k + col] != 0)
-            .ok_or(Error::Malformed("erasure matrix is singular"))?;
-        if pivot_row != col {
-            for c in 0..k {
-                a.swap(col * k + c, pivot_row * k + c);
-                inv.swap(col * k + c, pivot_row * k + c);
-            }
-        }
-        let pivot_inv = gf.inv(a[col * k + col]);
-        for c in 0..k {
-            a[col * k + c] = gf.mul(a[col * k + c], pivot_inv);
-            inv[col * k + c] = gf.mul(inv[col * k + c], pivot_inv);
-        }
-        for r in 0..k {
-            if r == col {
-                continue;
-            }
-            let factor = a[r * k + col];
-            if factor == 0 {
-                continue;
-            }
-            for c in 0..k {
-                a[r * k + c] ^= gf.mul(factor, a[col * k + c]);
-                inv[r * k + c] ^= gf.mul(factor, inv[col * k + c]);
-            }
-        }
-    }
-    Ok(Matrix { k, data: inv })
 }
 
 /// Splits `payload` into `data_shards` equal-length chunks (zero-padded
@@ -196,7 +61,13 @@ pub fn encode(
     parity_shards: usize,
 ) -> Result<(Vec<Vec<u8>>, usize)> {
     check_shard_counts(data_shards, parity_shards)?;
-    let shard_len = payload.len().div_ceil(data_shards).max(1);
+    // Rounded up to even: reed_solomon_simd requires an even shard length,
+    // and this module picks the length itself here, so it satisfies that
+    // up front rather than working around it.
+    let mut shard_len = payload.len().div_ceil(data_shards).max(1);
+    if !shard_len.is_multiple_of(2) {
+        shard_len += 1;
+    }
 
     let mut data: Vec<Vec<u8>> = Vec::with_capacity(data_shards);
     for i in 0..data_shards {
@@ -209,20 +80,11 @@ pub fn encode(
         data.push(shard);
     }
 
-    let gf = Gf256::build();
-    let mut shards = data.clone();
-    for p in 0..parity_shards {
-        let row = generator_row(&gf, data_shards, data_shards + p);
-        let mut parity_shard = vec![0u8; shard_len];
-        for (byte_pos, out_byte) in parity_shard.iter_mut().enumerate() {
-            let mut acc = 0u8;
-            for (j, coeff) in row.iter().enumerate() {
-                acc ^= gf.mul(*coeff, data[j][byte_pos]);
-            }
-            *out_byte = acc;
-        }
-        shards.push(parity_shard);
-    }
+    let parity = reed_solomon_simd::encode(data_shards, parity_shards, &data)
+        .map_err(|_| Error::Malformed("erasure encoding failed"))?;
+
+    let mut shards = data;
+    shards.extend(parity);
     Ok((shards, shard_len))
 }
 
@@ -240,68 +102,64 @@ pub fn decode(
         return Err(Error::Malformed("wrong number of erasure-coded shards"));
     }
 
-    let present: Vec<usize> = shards
-        .iter()
-        .enumerate()
-        .filter_map(|(i, s)| s.as_ref().map(|_| i))
-        .collect();
-    if present.len() < data_shards {
+    let present_count = shards.iter().filter(|s| s.is_some()).count();
+    if present_count < data_shards {
         return Err(Error::Malformed("too few shards to reconstruct"));
     }
 
-    let shard_len = shards[present[0]]
-        .as_ref()
-        .expect("index came from a Some entry")
-        .len();
-    for &i in &present {
-        let len = shards[i]
-            .as_ref()
-            .expect("index came from a Some entry")
-            .len();
-        if len != shard_len {
-            return Err(Error::Malformed(
-                "erasure-coded shards have inconsistent length",
-            ));
+    let mut shard_len = None;
+    for shard in shards.iter().flatten() {
+        match shard_len {
+            None => shard_len = Some(shard.len()),
+            Some(len) if len != shard.len() => {
+                return Err(Error::Malformed(
+                    "erasure-coded shards have inconsistent length",
+                ));
+            }
+            _ => {}
         }
     }
+    let shard_len = shard_len.expect("present_count >= data_shards >= 1");
+    // A peer-supplied shard length, not one this module picked -- reject
+    // rather than let reed_solomon_simd's internal `assert!` panic on it.
+    if !shard_len.is_multiple_of(2) {
+        return Err(Error::Malformed("erasure-coded shard length must be even"));
+    }
 
-    let chosen: Vec<usize> = present.into_iter().take(data_shards).collect();
-    if chosen.iter().enumerate().all(|(i, &c)| i == c) {
-        // The common case (no losses at all): the first `data_shards`
-        // shards received are exactly the original data shards in order,
-        // no matrix work needed.
+    if shards[..data_shards].iter().all(Option::is_some) {
+        // The common case (no losses at all): every data shard is
+        // present, no FFT work needed.
         let mut out = Vec::with_capacity(data_shards * shard_len);
-        for &i in &chosen {
-            out.extend_from_slice(shards[i].as_ref().expect("index came from a Some entry"));
+        for shard in &shards[..data_shards] {
+            out.extend_from_slice(shard.as_ref().expect("checked all Some above"));
         }
         return Ok(out);
     }
 
-    let gf = Gf256::build();
-    let mut m = Matrix {
-        k: data_shards,
-        data: vec![0u8; data_shards * data_shards],
-    };
-    for (row_idx, &shard_idx) in chosen.iter().enumerate() {
-        let row = generator_row(&gf, data_shards, shard_idx);
-        for (c, coeff) in row.into_iter().enumerate() {
-            m.set(row_idx, c, coeff);
-        }
-    }
-    let inv = invert(&gf, &m)?;
+    let original_present = shards[..data_shards]
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| s.as_ref().map(|shard| (i, shard)));
+    let recovery_present = shards[data_shards..]
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| s.as_ref().map(|shard| (i, shard)));
 
-    let mut out = vec![0u8; data_shards * shard_len];
-    for byte_pos in 0..shard_len {
-        let received: Vec<u8> = chosen
-            .iter()
-            .map(|&i| shards[i].as_ref().expect("index came from a Some entry")[byte_pos])
-            .collect();
-        for j in 0..data_shards {
-            let mut acc = 0u8;
-            for (i, &r) in received.iter().enumerate() {
-                acc ^= gf.mul(inv.get(j, i), r);
-            }
-            out[j * shard_len + byte_pos] = acc;
+    let restored = reed_solomon_simd::decode(
+        data_shards,
+        parity_shards,
+        original_present,
+        recovery_present,
+    )
+    .map_err(|_| Error::Malformed("erasure reconstruction failed"))?;
+
+    let mut out = Vec::with_capacity(data_shards * shard_len);
+    for (i, shard) in shards[..data_shards].iter().enumerate() {
+        match shard {
+            Some(shard) => out.extend_from_slice(shard),
+            None => out.extend_from_slice(restored.get(&i).ok_or(Error::Malformed(
+                "erasure reconstruction did not restore shard",
+            ))?),
         }
     }
     Ok(out)
@@ -310,43 +168,6 @@ pub fn decode(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn generator_cycles_through_all_255_nonzero_elements() {
-        let gf = Gf256::build();
-        // exp[0..255] must be a permutation of 1..=255 (every nonzero
-        // element reached exactly once) -- if the primitive polynomial or
-        // generator were wrong, the cycle would be shorter and some
-        // elements would repeat before index 255.
-        let mut seen = [false; 256];
-        for i in 0..255 {
-            let v = gf.exp[i] as usize;
-            assert!(v != 0);
-            assert!(!seen[v], "element {v} repeated before a full cycle");
-            seen[v] = true;
-        }
-        assert_eq!(gf.exp[255], gf.exp[0], "table must repeat after index 255");
-    }
-
-    #[test]
-    fn every_nonzero_element_times_its_inverse_is_one() {
-        let gf = Gf256::build();
-        for a in 1..=255u8 {
-            assert_eq!(gf.mul(a, gf.inv(a)), 1, "a={a}");
-        }
-    }
-
-    #[test]
-    fn multiplication_is_commutative_and_distributes_over_xor() {
-        let gf = Gf256::build();
-        for a in [1u8, 3, 7, 200, 255] {
-            for b in [1u8, 3, 7, 200, 255] {
-                assert_eq!(gf.mul(a, b), gf.mul(b, a));
-            }
-        }
-        let (a, b, c) = (5u8, 9u8, 200u8);
-        assert_eq!(gf.mul(a, b ^ c), gf.mul(a, b) ^ gf.mul(a, c));
-    }
 
     #[test]
     fn no_losses_round_trips_exactly() {
@@ -404,12 +225,26 @@ mod tests {
     fn inconsistent_shard_lengths_are_rejected() {
         let (mut shards, _len) = encode(b"abcdef", 3, 1).unwrap();
         shards[0].push(0xFF);
+        shards[0].push(0xFF); // keep it even, so the length check (not the parity check) is what fires
         let present: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
         assert!(matches!(
             decode(&present, 3, 1),
             Err(Error::Malformed(
                 "erasure-coded shards have inconsistent length"
             ))
+        ));
+    }
+
+    #[test]
+    fn odd_shard_length_is_rejected_without_panicking() {
+        let (mut shards, _len) = encode(b"abcdef", 3, 1).unwrap();
+        for shard in &mut shards {
+            shard.push(0xFF); // now every shard is odd-length
+        }
+        let present: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
+        assert!(matches!(
+            decode(&present, 3, 1),
+            Err(Error::Malformed("erasure-coded shard length must be even"))
         ));
     }
 

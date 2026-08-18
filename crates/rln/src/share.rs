@@ -10,7 +10,7 @@
 //! Shamir share). It's only the *second* point on the same line that pins
 //! down the line's intercept.
 
-use winterfell::math::fields::f128::BaseElement;
+use winterfell::math::fields::f64::BaseElement;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Share {

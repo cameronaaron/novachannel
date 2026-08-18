@@ -4,7 +4,7 @@
 //! event log); the privacy property comes from the STARK proof of
 //! membership in [`crate::proof`], not from the tree being secret.
 
-use winterfell::math::{fields::f128::BaseElement, FieldElement};
+use winterfell::math::{fields::f64::BaseElement, FieldElement};
 
 use crate::permutation::{compress2, Params};
 
@@ -69,8 +69,7 @@ impl MerkleTree {
     /// via `novachannel-mpc`'s FROST implementation, so clients trust the
     /// set of members via a threshold signature instead of needing
     /// separate PKI for the membership tree itself.
-    pub fn root_bytes(&self) -> [u8; 16] {
-        use winterfell::math::StarkField;
+    pub fn root_bytes(&self) -> [u8; 8] {
         self.root().as_int().to_be_bytes()
     }
 
@@ -128,7 +127,7 @@ mod tests {
     #[test]
     fn a_leafs_path_verifies_against_the_real_root() {
         let params = Params::new();
-        let leaves: Vec<BaseElement> = (0..4u128).map(BaseElement::new).collect();
+        let leaves: Vec<BaseElement> = (0..4u64).map(BaseElement::new).collect();
         let tree = MerkleTree::new(2, &leaves);
 
         for (i, &leaf) in leaves.iter().enumerate() {
@@ -140,7 +139,7 @@ mod tests {
     #[test]
     fn a_path_does_not_verify_against_the_wrong_leaf() {
         let params = Params::new();
-        let leaves: Vec<BaseElement> = (0..4u128).map(BaseElement::new).collect();
+        let leaves: Vec<BaseElement> = (0..4u64).map(BaseElement::new).collect();
         let tree = MerkleTree::new(2, &leaves);
 
         let path = tree.path(0);
@@ -156,7 +155,7 @@ mod tests {
     #[test]
     fn a_path_does_not_verify_against_the_wrong_root() {
         let params = Params::new();
-        let leaves: Vec<BaseElement> = (0..4u128).map(BaseElement::new).collect();
+        let leaves: Vec<BaseElement> = (0..4u64).map(BaseElement::new).collect();
         let tree = MerkleTree::new(2, &leaves);
         let other_tree = MerkleTree::new(2, &[BaseElement::new(99)]);
 
@@ -171,9 +170,7 @@ mod tests {
 
     #[test]
     fn root_bytes_is_the_big_endian_encoding_of_the_root_integer() {
-        use winterfell::math::StarkField;
-
-        let leaves: Vec<BaseElement> = (0..4u128).map(BaseElement::new).collect();
+        let leaves: Vec<BaseElement> = (0..4u64).map(BaseElement::new).collect();
         let tree = MerkleTree::new(2, &leaves);
 
         assert_eq!(tree.root_bytes(), tree.root().as_int().to_be_bytes());
@@ -181,7 +178,7 @@ mod tests {
 
     #[test]
     fn depth_and_params_getters_match_construction() {
-        let leaves: Vec<BaseElement> = (0..4u128).map(BaseElement::new).collect();
+        let leaves: Vec<BaseElement> = (0..4u64).map(BaseElement::new).collect();
         let tree = MerkleTree::new(2, &leaves);
         assert_eq!(tree.depth(), 2);
         // Just confirm it's callable and returns the same params `new()`
@@ -192,7 +189,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "too many leaves for this depth")]
     fn too_many_leaves_for_the_depth_panics() {
-        let leaves: Vec<BaseElement> = (0..5u128).map(BaseElement::new).collect();
+        let leaves: Vec<BaseElement> = (0..5u64).map(BaseElement::new).collect();
         MerkleTree::new(2, &leaves);
     }
 }

@@ -37,23 +37,27 @@ struct Config {
 }
 
 fn main() {
-    // Blowup factor 8 is the minimum this AIR accepts (`ProofOptions`
-    // enforces a floor derived from the circuit's own constraint degrees —
-    // 4 is rejected outright), so it's held fixed here and query count is
-    // the dial: proof size and conjectured soundness both scale with it,
-    // isolating that one relationship instead of conflating two dials.
+    // Blowup factor 16 is the minimum this AIR accepts (`ProofOptions`
+    // enforces a floor derived from the circuit's own constraint degrees;
+    // 8 is rejected outright since the Poseidon2 port's degree-7 S-box
+    // combined with its five blended periodic selectors pushes the
+    // dominant transition constraint's degree bound past what blowup 8
+    // covers -- the from-scratch `NovaRescue` permutation this AIR used
+    // before accepted blowup 8), so it's held fixed here and query count
+    // is the dial: proof size and conjectured soundness both scale with
+    // it, isolating that one relationship instead of conflating two dials.
     let configs = [
         Config {
             label: "fewer queries, weaker",
             num_queries: 16,
-            blowup_factor: 8,
+            blowup_factor: 16,
             grinding_factor: 0,
             field_extension: FieldExtension::None,
         },
         Config {
             label: "old default before the 128-bit hardening pass (~96-bit)",
-            num_queries: 32,
-            blowup_factor: 8,
+            num_queries: 24,
+            blowup_factor: 16,
             grinding_factor: 0,
             field_extension: FieldExtension::None,
         },
@@ -66,8 +70,8 @@ fn main() {
         },
         Config {
             label: "more queries, stronger (~192-bit conjectured)",
-            num_queries: 64,
-            blowup_factor: 8,
+            num_queries: 48,
+            blowup_factor: 16,
             grinding_factor: 0,
             field_extension: FieldExtension::None,
         },
@@ -105,7 +109,7 @@ fn main() {
         );
 
         let trace = air::build_trace(&params, &witness, epoch, x);
-        let root = trace.get(0, air::ROOT_ROW_PUB);
+        let root = trace.get(0, air::root_row(air::DEPTH));
         let pub_inputs = air::PublicInputs {
             root,
             epoch,

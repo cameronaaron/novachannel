@@ -15,9 +15,17 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+winterfell = "0.13"
+curve25519-dalek = { version = "5", features = ["rand_core"] }
 
 [dependencies.novachannel]
 path = ".."
+
+[dependencies.novachannel-rln]
+path = "../../rln"
+
+[dependencies.novachannel-mpc]
+path = "../../mpc"
 
 [[bin]]
 name = "prekey_bundle"
@@ -57,6 +65,20 @@ bench = false
 [[bin]]
 name = "group_commit"
 path = "fuzz_targets/group_commit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rln_verify"
+path = "fuzz_targets/rln_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mpc_frost_verify"
+path = "fuzz_targets/mpc_frost_verify.rs"
 test = false
 doc = false
 bench = false
