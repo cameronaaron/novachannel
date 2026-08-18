@@ -175,6 +175,12 @@ reason to prefer Groth16 instead; this project's choice optimizes for the
 opposite priority, and the numbers above are what that choice actually
 costs, not an abstract tradeoff.
 
+Unlike proof size, proving *time* — the CPU cost of generating one of
+these proofs — isn't benchmarked anywhere in this repository. STARK
+proving is CPU-bound work proportional to the circuit's trace length and
+the query/blowup parameters above; on a constrained mobile CPU that cost
+is paid per rate-limited action, not just per byte transmitted. See §9.
+
 ### 3.3 A defect found by validating against ground truth
 
 While building the circuit, a discrepancy surfaced between the STARK's
@@ -508,6 +514,16 @@ mixnet); `novachannel-dp` calibrates *when a given channel sends*, not
 *whether the channel's endpoints or existence are hidden*, and does not
 attempt the latter. See §9.
 
+Randomized response also isn't free at runtime: hiding the presence bit
+requires the client to independently decide, and potentially send, a
+dummy message on *every* empty slot — constant background network
+activity by construction of the mechanism, not an implementation detail
+that could be optimized away. Neither this crate nor this document
+quantifies what that costs in battery or metered data on a mobile
+device; the crate itself has no networking code and doesn't assume any
+particular transport (WebSocket or otherwise) — that choice, and its
+resource cost, is the caller's. See §9.
+
 ## 6. `novachannel-oram`: access-pattern obliviousness for server state
 
 Standard Path ORAM (Stefanov et al., CCS 2013): `O(log n)` bucket touches
@@ -676,6 +692,7 @@ At a glance, the gaps not yet closed anywhere else in this document:
 | DP size-correlation side channel | DP was strictly scoped to the presence bit; message size was unaddressed. | Closed for size (`ENGINEERING-STANDARDS.md` §6.24): `SizeBucketer` pads plaintext up to one of a fixed set of byte-length buckets before encryption, so ciphertext length reveals only which bucket a message fell into. Timing/latency correlation remains open — closing it means actually scheduling traffic (real sends delayed to a grid, not just padded), a materially larger undertaking than a padding function, not attempted here. |
 | PKI/directory-service distribution | Account PKI and `SignedDeviceList` distribution have no built-in transport. | Still open, and not really fixable *inside this library*: a directory service is a network service with its own trust and availability model, the same "trust/transport provisioning is the caller's problem" boundary every other module in this workspace already draws (`crate::handshake`'s peer-identity pinning, §4.2, §4.4). |
 | Network-layer/transport anonymity | `novachannel-dp` (§5) bounds an observer's ability to distinguish a real send from cover traffic *given* they can already see the channel. | Not addressed at all: IP addresses, connection timing, and TCP/TLS-level metadata are fully visible to a network-level observer. Defending against a global passive adversary requires an anonymizing transport (Tor, a mixnet) underneath this stack — out of scope for `novachannel-dp`, which calibrates *when this channel* sends, not *whether the channel's existence or endpoints* are hidden. |
+| Resource cost on constrained devices | Neither STARK proving time (`novachannel-rln`, §3.2) nor the bandwidth/battery cost of constant dummy traffic (`novachannel-dp`, §5) is benchmarked or quantified anywhere in this repository. | Still open: proof *size* is measured (§3.2's table) but proof *generation* is CPU-bound work with no measured cost, and randomized response requires sending a dummy message on every empty slot by construction, not an optional tuning knob. Both are real, per-action costs on a low-end mobile CPU/radio that a deployment integrating this crate needs to budget for; this repository doesn't measure or bound either. |
 | Classical/PQ primitive assurance ceiling | `crates/core` builds on RustCrypto (`ml-kem`/`ml-dsa`) and `dalek-cryptography` (`x25519-dalek`/`ed25519-dalek`) — actively maintained, not independently audited, and `curve25519-dalek` had a real timing-variability CVE (RUSTSEC-2024-0344) fixed in 2024. | Not closed, deliberately scoped instead of attempted casually: `docs/LIBCRUX_MIGRATION.md` scopes a migration to Cryspen's formally-verified `libcrux` (already production-proven as OpenMLS's post-quantum backend) — a larger, wire-format-breaking undertaking than any primitive swap this workspace has done before, so it's documented as a deliberate future decision with stated decision criteria, not implemented here. |
 
 Stated plainly, per §1:
