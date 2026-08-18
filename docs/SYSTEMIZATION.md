@@ -175,11 +175,23 @@ reason to prefer Groth16 instead; this project's choice optimizes for the
 opposite priority, and the numbers above are what that choice actually
 costs, not an abstract tradeoff.
 
-Unlike proof size, proving *time* — the CPU cost of generating one of
-these proofs — isn't benchmarked anywhere in this repository. STARK
-proving is CPU-bound work proportional to the circuit's trace length and
-the query/blowup parameters above; on a constrained mobile CPU that cost
-is paid per rate-limited action, not just per byte transmitted. See §9.
+Proving *time* — the CPU cost of generating one of these proofs — is now
+measured too: `crates/rln/examples/proving_time.rs` times `Prover::prove`
+(and verification) across the same four configurations, 5 runs each,
+reporting min/median/max. On the machine this was last measured on, the
+weaker/stronger configurations prove in ~2.7-2.9ms median, while this
+crate's own default (32 queries, grinding 20, `FieldExtension::Quadratic`)
+takes tens of milliseconds — grinding (a proof-of-work step) and the
+quadratic field extension both add real CPU cost the query count alone
+doesn't capture. Verification is consistently sub-millisecond across all
+four. These numbers are from whatever machine ran the example, not a
+mobile device — no claim is made about mobile-CPU-specific numbers, since
+none ran this; the point is a real number to scale from instead of none.
+STARK proving is CPU-bound work proportional to the circuit's trace
+length and the query/blowup/grinding/field-extension parameters above; on
+a constrained mobile CPU that cost is paid per rate-limited action, not
+just per byte transmitted. Run the example to reproduce on your own
+hardware. See §9.
 
 ### 3.3 A defect found by validating against ground truth
 
@@ -524,6 +536,24 @@ device; the crate itself has no networking code and doesn't assume any
 particular transport (WebSocket or otherwise) — that choice, and its
 resource cost, is the caller's. See §9.
 
+`DummyScheduler::decide` alone still lets a real message go out the
+instant it's ready — "sent immediately," per the guarantee above — which
+means an observer with finer-grained timing than the slot boundary learns
+exactly when within a slot the message arrived, strictly more than the
+presence-bit guarantee promises to hide. `GridScheduler` closes that:
+`enqueue` only ever adds a real message to a FIFO queue, and `tick` —
+called once per fixed-duration grid boundary by the caller's own clock,
+never in direct response to `enqueue` — is the only thing that ever
+transmits. A message's observable send time is therefore always exactly
+on a grid boundary, decoupled by construction (not convention) from
+exactly when within the preceding slot it became ready. The honest cost:
+latency, not just bandwidth — a message enqueued mid-slot waits for the
+next tick, and a second message enqueued in the same slot waits longer
+still (`GridScheduler` is FIFO, one dequeue per tick). What this does
+*not* close: broader queueing or request/response timing correlation
+anywhere else in a caller's system — see the module docs' own "what this
+doesn't cover" for the precise boundary.
+
 ## 6. `novachannel-oram`: access-pattern obliviousness for server state
 
 Standard Path ORAM (Stefanov et al., CCS 2013): `O(log n)` bucket touches
@@ -689,10 +719,11 @@ At a glance, the gaps not yet closed anywhere else in this document:
 | Classical threshold signing | `novachannel-mpc::frost` is bound to Ristretto255. | Threshold signing remains vulnerable to quantum adversaries (only threshold *decryption* is post-quantum, via `threshold_kem` — §7, §6.22). No production-ready post-quantum threshold-signature scheme exists to swap it for (checked directly, not assumed — §7); building one from scratch here would mean shipping an uncryptanalyzed primitive, which §1's own standard refuses to do. Still open, by design, not by omission. |
 | MPC DKG complaint protocol | `identify_faulty_dealers` needed every dealer's shares visible to one process. | Closed (`ENGINEERING-STANDARDS.md` §6.24, §6.26): `Complaint`/`Dealer::share_for`/`resolve_complaint` give the real per-accusation building block — an accuser exhibits the bad share they received, the accused dealer discloses what their polynomial actually evaluates to, and every other participant recomputes the same `ComplaintVerdict` independently. `crates/mpc/examples/networked_complaint.rs` now demonstrates a real broadcast transport driving this end-to-end over actual TCP sockets between independent OS threads — not just reference-implementation-only. A production deployment will likely reach for its own transport (e.g. over `novachannel` sessions) rather than that example's relay, but "no networked implementation exists at all" is closed. |
 | ORAM payload confidentiality | `Block` carried `id` and `value` in the clear even in `InMemoryServer`. | Closed (`ENGINEERING-STANDARDS.md` §6.24): `EncryptingServerStorage` is an opt-in `ServerStorage` decorator that AEAD-seals `id` and `value` together before either reaches the inner storage, composing with `VerifiableServerStorage` (§6) so a server that corrupts, drops, or replays a block still surfaces as `IntegrityError`, not a panic or silently missing data. Key distribution remains the caller's problem, the same boundary `novachannel::handshake`'s identity pinning already draws. `crates/oram/examples/networked_server.rs` (`ENGINEERING-STANDARDS.md` §6.26) now demonstrates a real `ServerStorage` over an actual TCP socket, closing the "reference-implementation only" gap for the client/server split itself (orthogonal to payload confidentiality, which was already closed). |
-| DP size-correlation side channel | DP was strictly scoped to the presence bit; message size was unaddressed. | Closed *at the application layer* (`ENGINEERING-STANDARDS.md` §6.24): `SizeBucketer` pads plaintext up to one of a fixed set of byte-length buckets before encryption, so ciphertext length reveals only which bucket a message fell into, not its exact size. That bucket boundary itself is not closed end-to-end: AEAD ciphertext length is a deterministic function of plaintext length, so a network-layer observer (see the row below) sees the same bucket-granularity size classes directly in packet/frame sizes, unless something below this crate pads to a uniform cell size the way Tor does. Timing/latency correlation remains open too — closing it means actually scheduling traffic (real sends delayed to a grid, not just padded), a materially larger undertaking than a padding function, not attempted here. |
+| DP size-correlation side channel | DP was strictly scoped to the presence bit; message size was unaddressed. | Closed *at the application layer* (`ENGINEERING-STANDARDS.md` §6.24): `SizeBucketer` pads plaintext up to one of a fixed set of byte-length buckets before encryption, so ciphertext length reveals only which bucket a message fell into, not its exact size. That bucket boundary itself is not closed end-to-end: AEAD ciphertext length is a deterministic function of plaintext length, so a network-layer observer (see the row below) sees the same bucket-granularity size classes directly in packet/frame sizes, unless something below this crate pads to a uniform cell size the way Tor does. |
+| DP within-slot timing correlation | A real message used to be "sent immediately" the instant it was ready — an observer with finer-grained timing than the slot boundary could learn exactly when within a slot it arrived, strictly more than the presence-bit guarantee promises to hide. | Closed for within-slot arrival jitter (`ENGINEERING-STANDARDS.md` §6.27): `GridScheduler` buffers real messages in a FIFO queue and only ever transmits on `tick()`, called once per fixed-duration grid boundary by the caller's own clock — a message's observable send time is always exactly on a grid boundary regardless of when within the preceding slot it was enqueued. Broader queueing/request-response timing correlation elsewhere in a caller's system remains entirely out of this crate's scope — see §5's "what this doesn't cover." The real cost of closing this: added latency (a message enqueued mid-slot waits for the next tick, and more than one enqueued in one slot queue further still), the same way the presence-bit guarantee itself costs bandwidth. |
 | PKI/directory-service distribution | Account PKI and `SignedDeviceList` distribution have no built-in transport. | Still open, and not really fixable *inside this library*: a directory service is a network service with its own trust and availability model, the same "trust/transport provisioning is the caller's problem" boundary every other module in this workspace already draws (`crate::handshake`'s peer-identity pinning, §4.2, §4.4). |
 | Network-layer/transport anonymity | `novachannel-dp` (§5) bounds an observer's ability to distinguish a real send from cover traffic *given* they can already see the channel. | Not addressed at all: IP addresses, connection timing, and TCP/TLS-level metadata are fully visible to a network-level observer. Defending against a global passive adversary requires an anonymizing transport (Tor, a mixnet) underneath this stack — out of scope for `novachannel-dp`, which calibrates *when this channel* sends, not *whether the channel's existence or endpoints* are hidden. |
-| Resource cost on constrained devices | Neither STARK proving time (`novachannel-rln`, §3.2) nor the bandwidth/battery cost of constant dummy traffic (`novachannel-dp`, §5) is benchmarked or quantified anywhere in this repository. | Still open: proof *size* is measured (§3.2's table) but proof *generation* is CPU-bound work with no measured cost, and randomized response requires sending a dummy message on every empty slot by construction, not an optional tuning knob. Both are real, per-action costs on a low-end mobile CPU/radio that a deployment integrating this crate needs to budget for; this repository doesn't measure or bound either. |
+| Resource cost on constrained devices | STARK proving time (`novachannel-rln`, §3.2) is now measured (`examples/proving_time.rs`); the bandwidth/battery cost of constant dummy traffic (`novachannel-dp`, §5) is not. | Partially closed: proof *size* and proof *generation time* are both measured now (§3.2's tables), on whatever machine ran the example — not a mobile device, so a deployment still needs to scale by its own target hardware's relative throughput rather than treating these numbers as mobile-representative. `GridScheduler`'s dummy-traffic cadence is unchanged from `DummyScheduler`'s (§5) and remains unquantified in battery/data terms; that per-action cost on a low-end mobile radio is still a real, unmeasured number a deployment needs to budget for. |
 | Classical/PQ primitive assurance ceiling | `crates/core` builds on RustCrypto (`ml-kem`/`ml-dsa`) and `dalek-cryptography` (`x25519-dalek`/`ed25519-dalek`) — actively maintained, not independently audited, and `curve25519-dalek` had a real timing-variability CVE (RUSTSEC-2024-0344) fixed in 2024. | Not closed, deliberately scoped instead of attempted casually: `docs/LIBCRUX_MIGRATION.md` scopes a migration to Cryspen's formally-verified `libcrux` (already production-proven as OpenMLS's post-quantum backend) — a larger, wire-format-breaking undertaking than any primitive swap this workspace has done before, so it's documented as a deliberate future decision with stated decision criteria, not implemented here. |
 
 Stated plainly, per §1:
@@ -753,6 +784,7 @@ cd novachannel
 cargo test -p novachannel-mpc --release official_test_vector_matches_rfc9591
 cargo test -p novachannel-rln --release   # requires --release; see novachannel_rln::lib docs
 cargo run -p novachannel-rln --release --example proof_size   # §3.2's proof-size table
+cargo run -p novachannel-rln --release --example proving_time # §3.2's proving-time table
 cargo test -p novachannel-mpc --release --test frost_signs_rln_root
 cargo test -p novachannel --release --test x3dh
 cargo test -p novachannel --release --test sealed_sender

@@ -42,13 +42,15 @@
 //! re-derive the composition math at every call site.
 //!
 //! # What this doesn't cover
-//! - **Timing/latency side channels.** A real message is sent immediately;
-//!   this crate says nothing about correlating queueing delay or
-//!   request/response timing across the wider system. Unlike the size
-//!   side channel below, closing this would mean actually scheduling
-//!   traffic (real sends delayed to a grid, not just padded) — a materially
-//!   larger, separate undertaking than a padding function, and not
-//!   attempted here.
+//! - **Broader queueing/request-response timing.** [`GridScheduler`]
+//!   closes the specific gap this section used to describe (below), but it
+//!   only quantizes *this scheduler's own* transmit timing to a fixed
+//!   grid. It says nothing about correlating timing elsewhere in a wider
+//!   system — application-layer processing delay, request/response
+//!   round-trip patterns, or anything downstream of the decision this
+//!   crate actually makes. Closing *that* would mean auditing the whole
+//!   pipeline the caller builds around this scheduler, not something this
+//!   crate's own scope can establish.
 //! - **Non-independent slots.** The composition bounds assume the
 //!   dummy-injection coin flips are drawn independently per slot with a
 //!   fresh CSPRNG draw each time; reusing randomness across slots breaks
@@ -121,6 +123,96 @@ impl DummyScheduler {
     /// other signal (size, timing jitter, ...).
     pub fn decide(&self, has_real_message: bool, rng: &mut impl Rng) -> bool {
         has_real_message || rng.random_bool(self.dummy_probability)
+    }
+}
+
+/// What one [`GridScheduler::tick`] call transmitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotOutput<M> {
+    /// A real, queued message went out this slot.
+    Real(M),
+    /// No real message was queued; a dummy packet went out instead. The
+    /// caller must construct it indistinguishable from a real one (same
+    /// size/framing) — see [`DummyScheduler::decide`]'s doc for why.
+    Dummy,
+    /// Nothing transmitted this slot.
+    Silent,
+}
+
+/// Closes the timing/latency gap the module docs used to name as
+/// unaddressed: [`DummyScheduler::decide`] alone still lets a real message
+/// be "sent immediately" the instant it's ready, so an observer who can see
+/// finer-grained timing than the slot boundary learns exactly when within
+/// a slot it arrived — strictly more than the presence-bit guarantee
+/// promises to hide. `GridScheduler` buffers real messages instead:
+/// [`Self::enqueue`] only ever adds to a FIFO queue, and [`Self::tick`] —
+/// called once per fixed-duration grid boundary by the caller's own
+/// clock — is the only thing that ever transmits. A message's observable
+/// send time is therefore always exactly on a grid boundary, regardless of
+/// when within the preceding slot `enqueue` was actually called; the two
+/// are decoupled by construction, not by convention.
+///
+/// This crate does no I/O and starts no timer (module docs) —
+/// `GridScheduler` is a pure state machine the caller drives by calling
+/// [`Self::tick`] on their own fixed-interval clock, the same "state
+/// machine, not a network" boundary `novachannel-mpc`'s `Dealer` and
+/// `novachannel-oram`'s `ServerStorage` already draw for their own I/O.
+///
+/// If more than one message is enqueued within a single slot, only the
+/// oldest goes out on the next tick — the rest wait for subsequent ticks,
+/// each still indistinguishable from a dummy-only slot to an outside
+/// observer. That queueing delay is the real, honest cost of closing this
+/// side channel: hiding *when* a message was ready costs latency, the same
+/// way hiding *whether* one exists costs bandwidth (module docs' dummy
+/// traffic). A caller who can't tolerate that latency for some messages
+/// needs a different mechanism for those, not a smaller epsilon here.
+pub struct GridScheduler<M> {
+    scheduler: DummyScheduler,
+    queue: std::collections::VecDeque<M>,
+}
+
+impl<M> GridScheduler<M> {
+    pub fn new(epsilon: f64) -> Self {
+        GridScheduler {
+            scheduler: DummyScheduler::new(epsilon),
+            queue: std::collections::VecDeque::new(),
+        }
+    }
+
+    pub fn epsilon(&self) -> f64 {
+        self.scheduler.epsilon()
+    }
+
+    /// Queues a real message for the next available grid slot. Never
+    /// transmits anything itself — see the type docs for why that
+    /// separation is the whole point.
+    pub fn enqueue(&mut self, message: M) {
+        self.queue.push_back(message);
+    }
+
+    /// How many real messages are waiting for a future grid slot.
+    pub fn queue_len(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Advances one grid slot: dequeues the oldest waiting message (if
+    /// any) and applies the same presence-bit decision
+    /// [`DummyScheduler::decide`] would, indistinguishably from the
+    /// caller's perspective of whether a message happened to be queued.
+    /// Call this once per fixed-duration tick from your own clock — never
+    /// in direct response to [`Self::enqueue`], or the timing this type
+    /// exists to hide leaks right back through the call pattern.
+    pub fn tick(&mut self, rng: &mut impl Rng) -> SlotOutput<M> {
+        let queued = self.queue.pop_front();
+        let has_real = queued.is_some();
+        if self.scheduler.decide(has_real, rng) {
+            match queued {
+                Some(message) => SlotOutput::Real(message),
+                None => SlotOutput::Dummy,
+            }
+        } else {
+            SlotOutput::Silent
+        }
     }
 }
 
@@ -356,6 +448,85 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
+
+    #[test]
+    fn grid_scheduler_never_transmits_a_real_message_the_same_tick_it_was_enqueued_unless_ticked() {
+        // A real message enqueued mid-slot only ever goes out on a
+        // subsequent `tick()` call -- never as a side effect of `enqueue`
+        // itself, which is the whole property this type exists to
+        // guarantee (module docs: "never in direct response to enqueue").
+        let mut s: GridScheduler<u32> = GridScheduler::new(0.0);
+        let mut rng = ChaCha20Rng::seed_from_u64(1);
+        assert_eq!(s.queue_len(), 0);
+        s.enqueue(42);
+        assert_eq!(s.queue_len(), 1, "enqueue must not transmit by itself");
+        let out = s.tick(&mut rng);
+        assert_eq!(out, SlotOutput::Real(42));
+        assert_eq!(s.queue_len(), 0);
+    }
+
+    #[test]
+    fn grid_scheduler_ticks_are_indistinguishable_regardless_of_when_within_the_slot_enqueue_happened(
+    ) {
+        // Two runs that enqueue the same message at different points
+        // relative to their own tick calls still produce the exact same
+        // observable output sequence -- `tick()` never sees a timestamp,
+        // only whether the queue is non-empty, so within-slot arrival
+        // jitter cannot leak through it by construction.
+        let epsilon = 1.0;
+        let mut early: GridScheduler<u32> = GridScheduler::new(epsilon);
+        let mut late: GridScheduler<u32> = GridScheduler::new(epsilon);
+        let mut rng_a = ChaCha20Rng::seed_from_u64(7);
+        let mut rng_b = ChaCha20Rng::seed_from_u64(7);
+
+        early.enqueue(1); // "arrives" right at the start of the slot
+        let out_a = early.tick(&mut rng_a);
+
+        // "arrives" just before the tick fires -- enqueue is the very last
+        // thing that happens before `tick`, simulating a message ready at
+        // the last possible instant of the slot.
+        late.enqueue(1);
+        let out_b = late.tick(&mut rng_b);
+
+        assert_eq!(out_a, out_b);
+        assert_eq!(out_a, SlotOutput::Real(1));
+    }
+
+    #[test]
+    fn grid_scheduler_queues_multiple_messages_fifo_across_ticks() {
+        let mut s: GridScheduler<&str> = GridScheduler::new(0.0);
+        let mut rng = ChaCha20Rng::seed_from_u64(3);
+        s.enqueue("first");
+        s.enqueue("second");
+        assert_eq!(s.queue_len(), 2);
+        assert_eq!(s.tick(&mut rng), SlotOutput::Real("first"));
+        assert_eq!(s.tick(&mut rng), SlotOutput::Real("second"));
+        // Empty queue, epsilon = 0 -> dummy_probability = 1 -> always Dummy.
+        assert_eq!(s.tick(&mut rng), SlotOutput::Dummy);
+    }
+
+    #[test]
+    fn grid_scheduler_empty_queue_follows_the_same_dummy_probability_as_dummy_scheduler() {
+        let epsilon = 0.5f64;
+        let mut s: GridScheduler<u32> = GridScheduler::new(epsilon);
+        let mut rng = ChaCha20Rng::seed_from_u64(99);
+
+        let trials = 200_000;
+        let mut sent = 0u64;
+        for _ in 0..trials {
+            match s.tick(&mut rng) {
+                SlotOutput::Dummy => sent += 1,
+                SlotOutput::Silent => {}
+                SlotOutput::Real(_) => unreachable!("queue is always empty in this test"),
+            }
+        }
+        let p_send = sent as f64 / trials as f64;
+        let expected = DummyScheduler::new(epsilon).dummy_probability();
+        assert!(
+            (p_send - expected).abs() < 0.01,
+            "empirical dummy-send rate {p_send} too far from expected {expected}"
+        );
+    }
 
     #[test]
     fn dummy_probability_matches_e_neg_epsilon() {

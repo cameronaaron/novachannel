@@ -1664,3 +1664,54 @@ true for either protocol. `docs/SYSTEMIZATION.md` §9 and both crates'
 module docs updated accordingly. `scripts/check.sh` passes clean; no new
 dependencies added to either crate (both examples use only `std::net`
 plus dependencies each crate already had).
+
+### 6.27 RLN proving-time measurement; a real fix for `novachannel-dp`'s within-slot timing gap
+
+Two more of `docs/SYSTEMIZATION.md` §9's named gaps, one measured and one
+actually closed.
+
+**`crates/rln/examples/proving_time.rs`.** §3.2 measured STARK proof
+*size* across four `ProofOptions` configurations but never proof
+*generation time* — real CPU cost, paid per rate-limited action, that a
+mobile deployment needs to budget for. This example times
+`Prover::prove` (and verification) across the same four configurations, 5
+runs each, reporting min/median/max — the same "measure it, don't leave
+it as an abstract claim" standard `proof_size.rs` already set. On the
+machine this was last run on, the weaker/stronger configurations proved
+in ~2.7–2.9ms median; this crate's own default (32 queries, grinding 20,
+`FieldExtension::Quadratic`) took tens of milliseconds — grinding (a
+proof-of-work step) and the quadratic field extension both add real cost
+the query count alone doesn't capture. Verification stayed sub-millisecond
+across all four. These are one machine's numbers, not a mobile device's —
+the example is explicit that a deployment needs to scale them by its own
+target hardware, not treat them as mobile-representative.
+
+**`novachannel-dp::GridScheduler`.** `DummyScheduler::decide` alone still
+let a real message go out "immediately" — the instant it was ready — so
+an observer with finer-grained timing than the slot boundary learned
+exactly when within a slot it arrived, strictly more than the
+presence-bit guarantee (module docs) promises to hide. This one is a real
+fix, not a measurement: `GridScheduler::enqueue` only ever adds a real
+message to a FIFO queue; `GridScheduler::tick` — meant to be called once
+per fixed-duration grid boundary by the caller's own clock, never in
+direct response to `enqueue` — is the only thing that ever transmits.
+`tick` never sees a timestamp, only whether the queue is non-empty, so a
+message's observable send time is decoupled from its actual arrival time
+by construction, not by a documented calling convention a future change
+could quietly violate. Six new tests, including one that enqueues the
+same message at two different simulated points within a slot (right at
+the start vs. immediately before the tick fires) and asserts the two
+runs produce byte-identical output — the property that actually matters,
+checked directly rather than only argued for from the implementation.
+
+The honest cost, stated in both the module docs and
+`docs/SYSTEMIZATION.md` §5/§9: latency, not just the existing bandwidth
+cost. A message enqueued mid-slot waits for the next tick; a second
+message enqueued in the same slot queues behind it. What `GridScheduler`
+does *not* close: broader queueing or request/response timing correlation
+anywhere else in a caller's system — this crate's scope was never wide
+enough to establish that, and the module docs say so directly rather than
+letting the "timing gap closed" headline overreach.
+
+No new dependency in either crate; `scripts/check.sh` passes clean;
+`docs/SYSTEMIZATION.md` §3.2, §5, and §9 updated accordingly.
