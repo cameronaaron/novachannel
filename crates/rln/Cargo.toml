@@ -11,3 +11,17 @@ workspace = true
 [dependencies]
 winterfell = "0.13"
 rand = "0.10"
+
+[dev-dependencies]
+# Cross-checks `src/permutation.rs`'s hand-port against the real upstream
+# crate it was transcribed from, on thousands of random inputs -- not a
+# replacement for the port (winterfell's `math::FieldElement` and
+# Plonky3's `p3-field::Field` are unrelated trait hierarchies with no
+# adapter between them, so the AIR's in-circuit permutation still has to
+# be this crate's own port; see that module's own doc comment), but a much
+# stronger check than the single fixed test vector it was checked against
+# before this dependency existed on crates.io.
+p3-goldilocks = "0.6.3"
+p3-field = "0.6"
+p3-symmetric = "0.6"
+rand_chacha = "0.10"

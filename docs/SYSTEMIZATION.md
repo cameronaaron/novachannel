@@ -132,7 +132,12 @@ test vector byte-for-byte
 Matching a published instance meant matching its field (`f64`/Goldilocks,
 not `f128`) and its smallest published width (8, not this crate's
 previous 4 — `p3-goldilocks` only ships constants for widths 8, 12, 16,
-and 20).
+and 20). `p3-goldilocks`/`p3-poseidon2` weren't publishable crates.io
+dependencies when this port was originally written; now that they are,
+`permutation::tests::matches_the_real_upstream_crate_on_many_random_inputs`
+(`ENGINEERING-STANDARDS.md` §6.25) cross-checks the port against the
+genuine upstream crate directly on 10,000 random inputs, not just the one
+fixed vector above.
 
 **Porting the algorithm is not the same as an independent review of this
 specific port**, and this document does not claim more than the former:
@@ -226,6 +231,22 @@ challenge, binding identity to *this specific exchange* rather than to a
 replayable value, and derives traffic keys from a hash of the entire
 transcript including both signatures — standard "channel binding," applied
 here rather than invented here.
+
+`crate::identity::Identity` held both secret keys in process memory
+unconditionally until `ENGINEERING-STANDARDS.md` §6.25 added
+`Ed25519SigningBackend`/`MlDsaSigningBackend`: implement either trait
+against an HSM, a cloud KMS, or a hardware token, and
+`Identity::from_backends` builds an `Identity` that delegates every
+signing operation to it, with no change needed anywhere else in this
+crate. This crate deliberately depends on no specific vendor's SDK to
+implement those traits — the same "networked implementation is the
+caller's problem" boundary `novachannel-oram`'s `ServerStorage` trait
+already draws — but a real one is buildable against AWS KMS today: AWS
+KMS natively supports `ML_DSA_87` (FIPS 204, generally available since
+mid-2025) for the post-quantum leg and Ed25519 for the classical leg, an
+HSM-backed story for both halves of this hybrid identity. No cloud KMS or
+HSM yet supports ML-KEM encapsulation, so `crate::kex`'s key-exchange half
+has no equivalent seam and still runs in-process.
 
 ### 4.1 `ratchet`: forward secrecy per message, post-compromise security per epoch
 
@@ -583,8 +604,10 @@ replacement.
 
 ## 8. What was actually verified, and how
 
-190 tests across the workspace (up from 132), plus 8 `cargo-fuzz` targets
-(up from 6) covering every crate with an untrusted-input parsing
+200 tests across the workspace (up from 132), plus 8 `cargo-fuzz` targets,
+now run continuously via [ClusterFuzzLite](https://google.github.io/clusterfuzzlite/)
+(`ENGINEERING-STANDARDS.md` §6.25) rather than a once-a-day smoke run,
+covering every crate with an untrusted-input parsing
 boundary — `novachannel-rln`'s STARK proof verifier and
 `novachannel-mpc`'s FROST signature verifier are new additions, and
 `rln_verify` found a real remote-DoS panic in a dependency's proof
@@ -594,7 +617,9 @@ against the same "what can an unauthenticated party do" standard (§4.5)
 found two more defects of the identical class in this workspace's own
 code — a forgeable zero-capacity panic and a missing proof-of-possession
 binding on `LeafKeyPackage` — recorded and fixed in
-`ENGINEERING-STANDARDS.md` §6.23. All adversarial where the claim
+`ENGINEERING-STANDARDS.md` §6.23, with further hardening (self-removal,
+cross-group, and path-key-consistency cases) in §6.25. All adversarial
+where the claim
 is adversarial (not merely "does the happy path run"): tamper, replay,
 wrong-key, wrong-message, below-threshold-quorum,
 server-tampers-a-bucket, server-replays-a-stale-bucket,
@@ -637,6 +662,7 @@ At a glance, the gaps not yet closed anywhere else in this document:
 | ORAM payload confidentiality | `Block` carried `id` and `value` in the clear even in `InMemoryServer`. | Closed (`ENGINEERING-STANDARDS.md` §6.24): `EncryptingServerStorage` is an opt-in `ServerStorage` decorator that AEAD-seals `id` and `value` together before either reaches the inner storage, composing with `VerifiableServerStorage` (§6) so a server that corrupts, drops, or replays a block still surfaces as `IntegrityError`, not a panic or silently missing data. Key distribution remains the caller's problem, the same boundary `novachannel::handshake`'s identity pinning already draws. |
 | DP size-correlation side channel | DP was strictly scoped to the presence bit; message size was unaddressed. | Closed for size (`ENGINEERING-STANDARDS.md` §6.24): `SizeBucketer` pads plaintext up to one of a fixed set of byte-length buckets before encryption, so ciphertext length reveals only which bucket a message fell into. Timing/latency correlation remains open — closing it means actually scheduling traffic (real sends delayed to a grid, not just padded), a materially larger undertaking than a padding function, not attempted here. |
 | PKI/directory-service distribution | Account PKI and `SignedDeviceList` distribution have no built-in transport. | Still open, and not really fixable *inside this library*: a directory service is a network service with its own trust and availability model, the same "trust/transport provisioning is the caller's problem" boundary every other module in this workspace already draws (`crate::handshake`'s peer-identity pinning, §4.2, §4.4). |
+| Classical/PQ primitive assurance ceiling | `crates/core` builds on RustCrypto (`ml-kem`/`ml-dsa`) and `dalek-cryptography` (`x25519-dalek`/`ed25519-dalek`) — actively maintained, not independently audited, and `curve25519-dalek` had a real timing-variability CVE (RUSTSEC-2024-0344) fixed in 2024. | Not closed, deliberately scoped instead of attempted casually: `docs/LIBCRUX_MIGRATION.md` scopes a migration to Cryspen's formally-verified `libcrux` (already production-proven as OpenMLS's post-quantum backend) — a larger, wire-format-breaking undertaking than any primitive swap this workspace has done before, so it's documented as a deliberate future decision with stated decision criteria, not implemented here. |
 
 Stated plainly, per §1:
 

@@ -1,0 +1,57 @@
+name: ClusterFuzzLite batch fuzzing
+
+# Sustained, unattended fuzzing every 6 hours (1 hour per target per run,
+# vs. the 180-seconds-once-a-day this replaced) — real fuzzing value comes
+# from a corpus that keeps growing between runs, not from a human
+# re-running a short local smoke test occasionally. Corpus and coverage
+# reports are uploaded as GitHub Actions artifacts (no separate storage
+# repo configured) since this is a single-maintainer project without a
+# second repo to dedicate to it; see
+# https://google.github.io/clusterfuzzlite/build-integration/ for the
+# storage-repo option if that changes.
+#
+# OSS-Fuzz itself was considered and rejected for now: acceptance requires
+# "a significant user base and/or [being] critical to global IT
+# infrastructure" (https://google.github.io/oss-fuzz/getting-started/accepting-new-projects/),
+# which this project doesn't yet meet, on top of an application/review
+# process with no fixed turnaround. ClusterFuzzLite needs no acceptance at
+# all — it's this project's own GitHub Actions minutes, self-hosted from
+# day one.
+
+on:
+  schedule:
+    - cron: "0 0/6 * * *"
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: "Seconds to fuzz each target"
+        required: false
+        default: "3600"
+
+permissions: read-all
+
+jobs:
+  BatchFuzzing:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer:
+          - address
+    steps:
+      - name: Build fuzzers (${{ matrix.sanitizer }})
+        id: build
+        uses: google/clusterfuzzlite/actions/build_fuzzers@v1
+        with:
+          language: rust
+          sanitizer: ${{ matrix.sanitizer }}
+
+      - name: Run fuzzers (${{ matrix.sanitizer }})
+        id: run
+        uses: google/clusterfuzzlite/actions/run_fuzzers@v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: ${{ github.event.inputs.fuzz_seconds || 3600 }}
+          mode: "batch"
+          sanitizer: ${{ matrix.sanitizer }}
+          output-sarif: true

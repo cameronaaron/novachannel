@@ -1822,4 +1822,108 @@ mod tests {
         assert_eq!(sender, 3);
         assert_eq!(plaintext, b"from leaf 3");
     }
+
+    /// A member removing themselves (e.g. "leave group") isn't guarded
+    /// against by `propose_remove` — the committer's own leaf and ancestor
+    /// path get blanked by `spliced` like any other removal, and every
+    /// other member applies the resulting commit exactly like a normal
+    /// remove. Confirmed end-to-end rather than assumed: this is a real,
+    /// working path, not an untested edge case that happens to compile.
+    #[test]
+    fn a_member_can_remove_themselves_and_the_group_converges() {
+        let (mut alice, mut bob, alice_id, _bob_id) = two_member_group();
+        let alice_leaf = alice.my_leaf_index();
+
+        let commit = alice.propose_remove(&alice_id, alice_leaf).unwrap();
+        assert!(!alice.is_member(alice_leaf));
+
+        bob.apply_commit(&commit).unwrap();
+        assert_eq!(bob.epoch(), alice.epoch());
+        assert!(!bob.is_member(alice_leaf));
+        assert!(bob.is_member(bob.my_leaf_index()));
+
+        // Bob's group is still fully functional after Alice's self-removal.
+        let record = bob.seal(b"alice is gone").unwrap();
+        assert_eq!(record.len(), 20 + b"alice is gone".len() + 16);
+    }
+
+    /// `apply_commit` checks `commit.group_id` before anything else — a
+    /// commit legitimately produced for one group must not be mistaken for
+    /// one meant for a different, unrelated group merely because both
+    /// happen to be applied against the same `Group` type.
+    #[test]
+    fn apply_commit_rejects_a_commit_for_a_different_group() {
+        let (mut alice_a, _bob_a, alice_a_id, _bob_a_id) = two_member_group();
+        let (_alice_b, mut bob_b, _alice_b_id, _bob_b_id) = two_member_group();
+        assert_ne!(alice_a.group_id(), bob_b.group_id());
+
+        let foreign_commit = alice_a.propose_update(&alice_a_id).unwrap();
+        let result = bob_b.apply_commit(&foreign_commit);
+        assert!(matches!(result, Err(Error::Malformed(_))));
+    }
+
+    /// A `Commit` embedding a `GroupOp::Add` whose `LeafKeyPackage` has
+    /// been tampered with (here: a swapped identity, the same forgery
+    /// [`a_leaf_key_package_with_a_swapped_identity_is_rejected`] checks
+    /// for `LeafKeyPackage::from_bytes` directly) must be rejected at
+    /// `Commit::from_bytes` too — the nested-parsing path a real commit
+    /// actually travels over the wire, not just the standalone package
+    /// path a caller might otherwise assume is the only checked one.
+    #[test]
+    fn a_commit_with_a_tampered_add_key_package_is_rejected_from_bytes() {
+        let alice_id = Identity::generate();
+        let mut alice = Group::create(&alice_id, 4).unwrap();
+
+        let victim = MyLeafKeyPackage::generate(&Identity::generate());
+        let attacker = MyLeafKeyPackage::generate(&Identity::generate());
+        let mut forged = attacker.public();
+        forged.identity = victim.public().identity;
+
+        let (commit, _welcome) = alice.propose_add(&alice_id, forged).unwrap();
+        let commit_bytes = commit.to_bytes();
+        assert!(matches!(
+            Commit::from_bytes(&commit_bytes),
+            Err(Error::BadSignature)
+        ));
+    }
+
+    /// A signature-valid `Commit` whose path public key doesn't match what
+    /// decrypting its own path secret re-derives (a compromised or buggy
+    /// committer signing something inconsistent, not a wire-tamper —
+    /// hence re-signed after corruption rather than mutated post-hoc) must
+    /// be rejected as `PathKeyMismatch`, not accepted on signature
+    /// validity alone.
+    #[test]
+    fn a_commit_whose_path_key_does_not_match_its_own_secret_is_rejected() {
+        let (mut alice, mut bob, alice_id, _bob_id) = two_member_group();
+        let mut commit = alice.propose_update(&alice_id).unwrap();
+        assert!(
+            commit.path.len() >= 2,
+            "test setup expects a multi-level path to swap within"
+        );
+
+        // Swap two levels' public keys only -- ciphertexts stay put, so
+        // level 0's decrypted path secret now re-derives a different
+        // NodePublicKey than the one sitting in `commit.path[0]`. Each
+        // swapped-in key is still individually a validly-encoded
+        // NodePublicKey, just not the one this level's own secret
+        // actually derives.
+        let tmp = commit.path[0].public_key.clone();
+        commit.path[0].public_key = commit.path[1].public_key.clone();
+        commit.path[1].public_key = tmp;
+
+        // Re-sign over the now-corrupted path so this is caught by the
+        // key-consistency check, not merely by signature verification.
+        let signed = commit_signed_bytes(
+            &commit.group_id,
+            commit.from_epoch,
+            commit.sender_leaf,
+            &commit.op,
+            &commit.path,
+        );
+        commit.signature = alice_id.sign(&signed);
+
+        let result = bob.apply_commit(&commit);
+        assert!(matches!(result, Err(Error::PathKeyMismatch)));
+    }
 }

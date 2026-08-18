@@ -42,6 +42,15 @@
 //! below would be a real bug. That's exactly what the test-vector check
 //! above exists to catch: if this file's constants or round structure ever
 //! drifted from `p3-goldilocks`'s, that test fails.
+//!
+//! `p3-goldilocks`/`p3-poseidon2` weren't publishable crates.io
+//! dependencies when this port was written; now that they are (0.6.3),
+//! [`tests::matches_the_real_upstream_crate_on_many_random_inputs`]
+//! cross-checks this port against the real upstream crate directly on
+//! 10,000 random inputs, not just the one fixed test vector above —
+//! meaningfully stronger evidence against a transcription error than a
+//! single point can give, though still not the same thing as an
+//! independent human review of this specific port.
 
 use winterfell::math::{fields::f64::BaseElement, FieldElement};
 
@@ -491,6 +500,54 @@ mod tests {
         }
         let p_minus_1 = u128::from(BaseElement::MODULUS) - 1;
         assert_eq!(gcd(u128::from(SBOX_DEGREE), p_minus_1), 1);
+    }
+
+    /// [`matches_official_poseidon2_goldilocks_width8_test_vector`] checks
+    /// this port against exactly one fixed input from `p3-goldilocks`'s own
+    /// test suite -- a real check, but a single point, not a systematic
+    /// one. `p3-goldilocks`/`p3-poseidon2` weren't publishable crates when
+    /// this module's port was originally written (module docs); now that
+    /// they are, this property-tests the port against the actual upstream
+    /// crate directly on thousands of random inputs, closing the residual
+    /// "transcription error in a constant a single test vector doesn't
+    /// happen to exercise" risk the module docs' own "Remaining honest
+    /// caveat" section names. This does not replace the port itself:
+    /// winterfell's `math::FieldElement` and Plonky3's `p3-field::Field`
+    /// are unrelated trait hierarchies with no adapter between them, so
+    /// the AIR's in-circuit permutation still has to be this crate's own
+    /// port (see that section for why) -- this is a stronger check on it,
+    /// not a replacement for it.
+    #[test]
+    fn matches_the_real_upstream_crate_on_many_random_inputs() {
+        use p3_field::PrimeField64;
+        use p3_symmetric::Permutation;
+        use rand::{RngExt, SeedableRng};
+        use rand_chacha::ChaCha20Rng;
+
+        let params = Params::new();
+        let upstream = p3_goldilocks::default_goldilocks_poseidon2_8();
+        let mut rng = ChaCha20Rng::seed_from_u64(0xC0FFEE);
+
+        for trial in 0..10_000u32 {
+            let raw: [u64; WIDTH] = core::array::from_fn(|_| rng.random::<u64>());
+
+            let this_crate_input: [BaseElement; WIDTH] = raw.map(BaseElement::new);
+            let this_crate_output = *trace_permutation(&params, this_crate_input)
+                .last()
+                .expect("trace_permutation always returns ROUNDS + 1 states");
+
+            let mut upstream_state = p3_goldilocks::Goldilocks::new_array(raw);
+            upstream.permute_mut(&mut upstream_state);
+
+            for lane in 0..WIDTH {
+                assert_eq!(
+                    this_crate_output[lane].as_int(),
+                    upstream_state[lane].as_canonical_u64(),
+                    "trial {trial}, lane {lane} diverged from the real p3-goldilocks/\
+                     p3-poseidon2 permutation on input {raw:?}"
+                );
+            }
+        }
     }
 
     #[test]

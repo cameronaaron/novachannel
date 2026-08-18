@@ -1,0 +1,48 @@
+name: ClusterFuzzLite PR fuzzing
+
+# Fast feedback on every PR: builds all 8 fuzz targets under
+# `.clusterfuzzlite/` and runs each briefly against the diff introduced by
+# the PR ("code-change" mode), so a regression that would otherwise only
+# surface during the next scheduled batch run (cflite_batch.yml) is caught
+# before merge instead of after. Complements, not duplicates,
+# scheduled-security.yml's `cargo-audit` job, which checks dependency
+# advisories rather than this crate's own code.
+
+on:
+  pull_request:
+    paths:
+      - "crates/**"
+      - ".clusterfuzzlite/**"
+      - ".github/workflows/cflite_pr.yml"
+
+permissions: read-all
+
+jobs:
+  PR:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer:
+          - address
+    steps:
+      - name: Build fuzzers (${{ matrix.sanitizer }})
+        id: build
+        uses: google/clusterfuzzlite/actions/build_fuzzers@v1
+        with:
+          language: rust
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          sanitizer: ${{ matrix.sanitizer }}
+
+      - name: Run fuzzers (${{ matrix.sanitizer }})
+        id: run
+        uses: google/clusterfuzzlite/actions/run_fuzzers@v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 600
+          mode: "code-change"
+          sanitizer: ${{ matrix.sanitizer }}
+          output-sarif: true

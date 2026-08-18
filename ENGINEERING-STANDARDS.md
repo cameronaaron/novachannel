@@ -1495,3 +1495,117 @@ rather than a panic.
 Final state after this section: 190 tests across the workspace (up from
 172), full `scripts/check.sh` green, `cargo audit` clean, `gitleaks
 detect` clean.
+
+### 6.25 Continuous fuzzing, further `crate::group` hardening, a real cross-check for the RLN permutation, and a key-custody seam
+
+Four pieces of work, each answering a direct "how do we get closer to
+cutting-edge, not just correct" question rather than fixing a defect.
+
+**Fuzzing that actually runs continuously, not once a day for three
+minutes.** `scheduled-security.yml`'s hand-rolled `fuzz:` job only ever
+covered 6 of this workspace's 8 targets — `rln_verify`/`mpc_frost_verify`
+were added later (§6.22) and never backfilled into its hardcoded matrix,
+exactly the class of drift a hardcoded list invites. Replaced with
+[ClusterFuzzLite](https://google.github.io/clusterfuzzlite/)
+(`.clusterfuzzlite/`, `cflite_pr.yml`, `cflite_batch.yml`): every target
+under `fuzz_targets/` is auto-discovered by `build.sh`'s own loop, so a
+newly added target needs no matching workflow edit ever again. Coverage
+went from 180 seconds once a day to 10 minutes per target on every PR
+touching `crates/`, plus an hour per target every 6 hours on a schedule.
+`oss-fuzz` itself was checked directly, not assumed out of reach:
+acceptance requires "a significant user base and/or [being] critical to
+global IT infrastructure," which this project doesn't meet yet, with no
+fixed-turnaround review process either way — ClusterFuzzLite is the same
+underlying tooling family with no acceptance gate at all, worth revisiting
+`oss-fuzz` itself if that calculus changes.
+
+**`crate::group`, hardened against the three gaps §6.23 named but didn't
+close.** Each turned out to be a real, previously-unexercised code path:
+a member can validly remove themselves (`propose_remove` has no guard
+against `leaf_index == my_leaf`, and it turns out it doesn't need one —
+`a_member_can_remove_themselves_and_the_group_converges` confirms both
+sides converge to a consistent post-removal state rather than assuming
+so), a commit for a different group is rejected by the `group_id` check
+`apply_commit` already had but had never been tested directly, and a
+tampered `Add` key package embedded inside a full `Commit` (not just a
+standalone `LeafKeyPackage`) is caught by the same proof-of-possession
+check §6.23 added, exercised this time through `Commit::from_bytes`'s
+actual nested-parsing path rather than only the standalone one. A fourth,
+previously-untested path turned up along the way: `Error::PathKeyMismatch`
+had no test at all — closed with a commit re-signed (not merely
+byte-tampered, since the signature covers the path) after swapping two
+levels' public keys, confirming a signature-valid-but-internally-
+inconsistent commit is still rejected on the actual property that
+matters, not just on signature validity.
+
+**The RLN permutation now checked against the real upstream crate, not
+just one fixed test vector.** `p3-goldilocks`/`p3-poseidon2` weren't
+publishable crates.io dependencies when `permutation.rs`'s port was
+written (§3.2, §6.21); now that they are (0.6.3, matching the exact
+version the port already documents itself against),
+`matches_the_real_upstream_crate_on_many_random_inputs` runs both the
+hand-port and the genuine upstream `Poseidon2Goldilocks<8>` permutation on
+10,000 random inputs and checks bit-for-bit agreement — a systematic check
+against the specific "transcription error in a constant a single test
+vector doesn't happen to exercise" risk §9 already named as open, though
+still not the same thing as an independent human review of this port.
+This does not replace the port itself: winterfell's `math::FieldElement`
+and Plonky3's `p3-field::Field` are unrelated trait hierarchies with no
+adapter between them (checked directly against `p3-poseidon2`'s actual
+public API before assuming otherwise), so the AIR's in-circuit permutation
+still has to be this crate's own port. One disclosed, accepted cost: the
+Plonky3 dependency chain pulls in `paste` (a proc-macro crate,
+RUSTSEC-2024-0436, "no longer maintained") as a transitive dev-only
+dependency — `cargo audit` surfaces it as a warning, not a failure, and it
+never reaches any production build (dev-dependencies only), but it's
+disclosed here rather than left for someone else to notice.
+
+**A key-custody seam for `crate::identity::Identity`, not a specific
+vendor's SDK.** Every secret in this crate previously lived in process
+memory unconditionally — reasonable for the default case, but a real gap
+for a production deployment wanting an HSM, a cloud KMS, or a hardware
+token to hold the key instead. `Ed25519SigningBackend`/
+`MlDsaSigningBackend` are the seam: `Identity::from_backends` builds an
+`Identity` whose every operation (`public`, `sign`, `try_sign`) delegates
+to whatever implements them, with zero change needed anywhere else in this
+crate, since every other module already goes through `Identity`'s public
+methods rather than its concrete key fields. `Identity::sign` keeps its
+existing infallible signature and behavior for the default, in-process
+case (`Identity::generate` — zero breaking change, confirmed by the full
+existing test suite passing unmodified); the new `Identity::try_sign`
+surfaces a backend failure as `Error::SigningBackend` instead, since a
+real backend call (network, hardware) can fail in a way in-process signing
+never could, and `Identity::sign` now documents that it panics on that
+failure rather than silently claiming infallibility it no longer has.
+Deliberately not implemented: any specific vendor's backend — that would
+force every consumer of this crate to pull in a cloud SDK or a PKCS#11
+library whether or not they use it, the same reasoning `novachannel-oram`'s
+`ServerStorage` trait already applies to a networked server
+implementation. What's concretely true today instead, checked directly
+rather than assumed: **AWS KMS now supports both halves of this hybrid
+identity natively** — `ML_DSA_87` (FIPS 204, generally available since
+mid-2025) for the post-quantum leg, `ECC_NIST_EDWARDS25519`/`ED25519_SHA_512`
+for the classical leg — so a real HSM-backed `Identity` is buildable
+against `Ed25519SigningBackend`/`MlDsaSigningBackend` today, not
+hypothetically. No cloud KMS or HSM yet supports ML-KEM encapsulation, so
+`crate::kex`'s key-exchange half has no equivalent seam yet and still runs
+in-process. Five new tests, including a backend that always fails,
+confirming the failure surfaces as `Error::SigningBackend` from
+`try_sign` and as a documented panic from `sign` — not a silently wrong
+signature either way.
+
+Separately, `docs/LIBCRUX_MIGRATION.md` scopes (without implementing) a
+further assurance upgrade: Cryspen's `libcrux` — formally verified via
+`hax`/F*, already production-proven as OpenMLS's post-quantum backend —
+as a replacement for this crate's current RustCrypto/`dalek-cryptography`
+primitives. Deliberately not attempted here: every previous crypto-backend
+swap in this workspace was a deliberate, separately-scoped, breaking
+event (§6.11's ML-KEM migration, §6.21's Poseidon2 port), and this one is
+larger than either — the scoping document exists so that decision can be
+made deliberately, with the real effort and wire-format-breaking cost
+stated up front, rather than either dismissed or attempted casually
+inside an unrelated change.
+
+Final state after this section: 200 tests across the workspace (up from
+190), full `scripts/check.sh` green, `cargo audit` clean (one disclosed,
+dev-only, transitive warning — see above), `gitleaks detect` clean.

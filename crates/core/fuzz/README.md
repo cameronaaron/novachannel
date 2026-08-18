@@ -1,6 +1,6 @@
 # Fuzz targets
 
-Six [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) harnesses, one
+Eight [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) harnesses, one
 per untrusted-input parsing boundary in this crate — the places a real
 deployment would feed attacker-controlled bytes into a parser before any
 authentication has happened:
@@ -79,28 +79,46 @@ time, regardless of whether the library under test catches them.
 
 ## Status
 
-All six targets have been smoke-tested (a few seconds to low tens of
+All eight targets have been smoke-tested (a few seconds to low tens of
 seconds each, on the order of 10^3–10^6 executions depending on how
-expensive that target's per-iteration setup is) with zero crashes found.
-That is a smoke test, not a clean bill of health — a few seconds of
-fuzzing per target finds the shallow bugs, not the deep ones.
+expensive that target's per-iteration setup is) with zero crashes found
+beyond the one `rln_verify` found in `winterfell`'s own proof deserializer
+(§3.3/§6.22, fixed and now regression-tested). A smoke test alone is not a
+clean bill of health — a few seconds of fuzzing per target finds the
+shallow bugs, not the deep ones, which is exactly what continuous fuzzing
+below is for.
 
-`.github/workflows/scheduled-security.yml` now runs all six targets daily
-(`workflow_dispatch`-able on demand too), each for a bounded time
-(`fuzz_seconds_per_target`, default 180s), with the discovered corpus
-cached and restored between runs so coverage compounds over time instead
-of restarting cold every day. A crash fails that target's job and uploads
-the reproducer as a build artifact — pull it down, add it as a
-regression input (a new file under `corpus/<target>/`, or a `#[test]` in
-the main crate replaying the same bytes), fix the bug, and confirm the
-same input passes before considering it closed. The same workflow also
-runs `cargo audit` daily against both `Cargo.lock`s (this crate's and
-this fuzz crate's own), independent of whether anything changed — a
-dependency can go from clean to CVE'd on a day nobody touches the repo,
-and `ENGINEERING-STANDARDS.md`'s "run cargo audit before committing"
+**Continuous fuzzing runs via [ClusterFuzzLite](https://google.github.io/clusterfuzzlite/)**,
+not a hand-rolled GitHub Actions loop: `.clusterfuzzlite/` (`project.yaml`,
+`Dockerfile`, `build.sh`) defines the build, and
+`.github/workflows/cflite_pr.yml`/`cflite_batch.yml` run it — 10 minutes
+per target on every PR touching `crates/`, and up to an hour per target
+every 6 hours on a schedule (`workflow_dispatch`-able on demand too), with
+corpus and coverage reports persisted as GitHub Actions artifacts between
+runs so coverage compounds over time instead of restarting cold every
+run. `build.sh` auto-discovers every file under `fuzz_targets/`, so a
+newly added target needs no matching edit to either workflow — the
+previous hand-rolled version of this setup listed each target explicitly
+in a job matrix and silently missed `rln_verify`/`mpc_frost_verify` for a
+while after they were added, exactly the class of drift auto-discovery
+avoids. A crash fails the run and is reported via the configured output
+(SARIF); pull the reproducer down, add it as a regression input (a new
+file under `corpus/<target>/`, or a `#[test]` in the main crate replaying
+the same bytes), fix the bug, and confirm the same input passes before
+considering it closed.
+
+`.github/workflows/scheduled-security.yml` separately runs `cargo audit`
+daily against both `Cargo.lock`s (this crate's and this fuzz crate's
+own), independent of whether anything changed — a dependency can go from
+clean to CVE'd on a day nobody touches the repo, and
+`ENGINEERING-STANDARDS.md`'s "run cargo audit before committing"
 convention only ever checks the day of the commit.
 
-If you're looking for a next step beyond that: `oss-fuzz` integration,
-given this is a security-relevant crate, gets continuous fuzzing at a
-scale (and with sanitizers/ClusterFuzz infrastructure) a GitHub Actions
-schedule can't match.
+**`oss-fuzz` itself was considered and rejected, for now**: acceptance
+requires "a significant user base and/or [being] critical to global IT
+infrastructure," which this project doesn't yet meet, on top of an
+application/review process with no fixed turnaround.
+[ClusterFuzzLite](https://google.github.io/clusterfuzzlite/) is the same
+underlying tooling family (Google's, built for exactly this fuzz-target
+shape) with no acceptance gate at all — worth revisiting `oss-fuzz` itself
+if this project's user base ever changes that calculus.

@@ -46,6 +46,13 @@ pub enum Error {
         "a received commit's public path key did not match the key its decrypted secret derives"
     )]
     PathKeyMismatch,
+    /// An [`crate::identity::Identity`] backed by an external signing
+    /// backend (HSM, cloud KMS, hardware token — see that module's "Key
+    /// custody" docs) failed to sign. Never returned for the default,
+    /// in-process [`crate::identity::Identity::generate`] case, which
+    /// cannot fail this way.
+    #[error("external signing backend failed: {0}")]
+    SigningBackend(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 pub type Result<T> = core::result::Result<T, Error>;
