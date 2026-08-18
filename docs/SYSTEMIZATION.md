@@ -495,6 +495,19 @@ same document is precise about what that argument does *not* cover
 (cross-epoch traffic-pattern fingerprinting), which is a real, different,
 still-open gap.
 
+The guarantee above is scoped to an observer who already sees the
+channel: it bounds their ability to tell a real send from a dummy one, at
+the granularity of a slot this mechanism controls. It says nothing about
+who can see the channel in the first place. Network-layer metadata —
+source/destination IP addresses, TCP/TLS connection timing, the fact that
+a connection to the server exists at all — sits below this mechanism and
+is fully visible to a network-level observer regardless of the DP
+calibration on top of it. Defending against a global passive adversary at
+that layer needs an anonymizing transport underneath this stack (Tor, a
+mixnet); `novachannel-dp` calibrates *when a given channel sends*, not
+*whether the channel's endpoints or existence are hidden*, and does not
+attempt the latter. See §9.
+
 ## 6. `novachannel-oram`: access-pattern obliviousness for server state
 
 Standard Path ORAM (Stefanov et al., CCS 2013): `O(log n)` bucket touches
@@ -662,6 +675,7 @@ At a glance, the gaps not yet closed anywhere else in this document:
 | ORAM payload confidentiality | `Block` carried `id` and `value` in the clear even in `InMemoryServer`. | Closed (`ENGINEERING-STANDARDS.md` §6.24): `EncryptingServerStorage` is an opt-in `ServerStorage` decorator that AEAD-seals `id` and `value` together before either reaches the inner storage, composing with `VerifiableServerStorage` (§6) so a server that corrupts, drops, or replays a block still surfaces as `IntegrityError`, not a panic or silently missing data. Key distribution remains the caller's problem, the same boundary `novachannel::handshake`'s identity pinning already draws. |
 | DP size-correlation side channel | DP was strictly scoped to the presence bit; message size was unaddressed. | Closed for size (`ENGINEERING-STANDARDS.md` §6.24): `SizeBucketer` pads plaintext up to one of a fixed set of byte-length buckets before encryption, so ciphertext length reveals only which bucket a message fell into. Timing/latency correlation remains open — closing it means actually scheduling traffic (real sends delayed to a grid, not just padded), a materially larger undertaking than a padding function, not attempted here. |
 | PKI/directory-service distribution | Account PKI and `SignedDeviceList` distribution have no built-in transport. | Still open, and not really fixable *inside this library*: a directory service is a network service with its own trust and availability model, the same "trust/transport provisioning is the caller's problem" boundary every other module in this workspace already draws (`crate::handshake`'s peer-identity pinning, §4.2, §4.4). |
+| Network-layer/transport anonymity | `novachannel-dp` (§5) bounds an observer's ability to distinguish a real send from cover traffic *given* they can already see the channel. | Not addressed at all: IP addresses, connection timing, and TCP/TLS-level metadata are fully visible to a network-level observer. Defending against a global passive adversary requires an anonymizing transport (Tor, a mixnet) underneath this stack — out of scope for `novachannel-dp`, which calibrates *when this channel* sends, not *whether the channel's existence or endpoints* are hidden. |
 | Classical/PQ primitive assurance ceiling | `crates/core` builds on RustCrypto (`ml-kem`/`ml-dsa`) and `dalek-cryptography` (`x25519-dalek`/`ed25519-dalek`) — actively maintained, not independently audited, and `curve25519-dalek` had a real timing-variability CVE (RUSTSEC-2024-0344) fixed in 2024. | Not closed, deliberately scoped instead of attempted casually: `docs/LIBCRUX_MIGRATION.md` scopes a migration to Cryspen's formally-verified `libcrux` (already production-proven as OpenMLS's post-quantum backend) — a larger, wire-format-breaking undertaking than any primitive swap this workspace has done before, so it's documented as a deliberate future decision with stated decision criteria, not implemented here. |
 
 Stated plainly, per §1:
