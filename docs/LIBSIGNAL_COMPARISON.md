@@ -174,8 +174,14 @@ No, and the specific reasons (not a hedge):
   its signer remain the caller's problem (`docs/SYSTEMIZATION.md` §4.4,
   §9). `RemoteAccount::new`/`add_device` also remain available fully
   unauthenticated, so using the signed path is opt-in, not enforced.
-- No fuzzing anywhere in this workspace. Signal fuzzes `libsignal-protocol`
-  extensively; nothing here has been fuzzed at all.
+- 8 `cargo-fuzz` targets now run continuously via ClusterFuzzLite
+  (`ENGINEERING-STANDARDS.md` §6.25) — 10 min/target on every PR, 1hr/target
+  every 6 hours — covering every crate with an untrusted-input parsing
+  boundary, and already found a real remote-DoS panic in a dependency's
+  proof deserializer (`docs/SYSTEMIZATION.md` §8). Real, but far short of
+  Signal's own fuzzing investment: 8 targets against `libsignal-protocol`'s
+  broader and longer-running corpus, with no comparable per-target time
+  budget claimed here.
 - No external security audit of anything in this workspace.
 - The DKG's complaint mechanism (`novachannel-mpc`) has no networked
   broadcast/reveal implementation — reference-implementation only.
