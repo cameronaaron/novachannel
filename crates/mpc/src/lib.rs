@@ -57,24 +57,36 @@
 //!   every other participant can recompute independently from the same
 //!   three public values, without trusting either party's word alone.
 //!   This is the standard complaint/accusation resolution from Gennaro et
-//!   al.'s malicious-secure DKG; what it does *not* include is the
-//!   broadcast transport itself (see "no networking" below) — what's
-//!   implemented is the decision procedure that exchange exists to
-//!   compute, on both sides of it.
+//!   al.'s malicious-secure DKG; the decision procedure lives in this
+//!   crate, and `examples/networked_complaint.rs` (see "does not do
+//!   networking" below) demonstrates a real broadcast transport driving it
+//!   end-to-end, though a production deployment will likely reach for its
+//!   own transport instead of that example's relay.
 //!
 //! Either path feeds [`finalize_key_share_excluding_faulty`], so a proven-
 //! faulty dealer costs the group nothing beyond their own contribution
 //! instead of aborting DKG for everyone.
 //!
-//! # This crate does not do networking
+//! # This crate does not do networking, but a real deployment of it exists
 //! [`Dealer`] is a pure state machine: it produces messages for the caller
-//! to transport (broadcast commitments, point-to-point shares, and now
+//! to transport (broadcast commitments, point-to-point shares, and
 //! complaints/disclosures) however their deployment does so (over
 //! `novachannel` sessions, most naturally) — reaching every honest
 //! participant with the same broadcast values, so they all compute the
 //! same [`ComplaintVerdict`], is the caller's problem, the same "this
 //! crate is a state machine, not a network" boundary the module docs
-//! already drew for the commit/reveal round above.
+//! already drew for the commit/reveal round above. `examples/networked_complaint.rs`
+//! is that transport, not just an assertion that one is possible: five
+//! participants, each its own OS thread with its own real TCP socket to a
+//! small broadcast relay, exchange a real [`Complaint`] and the accused
+//! dealer's real [`Dealer::share_for`] disclosure over the network, and
+//! every participant independently computes the same [`ComplaintVerdict`]
+//! from what it received over the wire. The relay only ever forwards
+//! complaint/disclosure messages — exactly the values this doc already
+//! calls "safe to broadcast" — and never sees a dealer's private
+//! polynomial or the raw per-dealer shares from the earlier reveal round,
+//! which the example keeps local to its own `main()`, the same as every
+//! other test in this crate.
 
 #![forbid(unsafe_code)]
 // Every `.unwrap()` this catches either gets replaced with a

@@ -1609,3 +1609,58 @@ inside an unrelated change.
 Final state after this section: 200 tests across the workspace (up from
 190), full `scripts/check.sh` green, `cargo audit` clean (one disclosed,
 dev-only, transitive warning — see above), `gitleaks detect` clean.
+
+### 6.26 Real networked deployments of two protocols that were reference-implementation-only
+
+`docs/SYSTEMIZATION.md` §9 named two gaps as "reference-implementation
+only, real networking is the caller's problem": `novachannel-mpc`'s DKG
+complaint round, and `novachannel-oram`'s `ServerStorage` split. Both
+statements were true but incomplete — nothing in either crate's test
+suite exercised an actual socket, so "the split is real" rested entirely
+on the type system, not on a demonstration. Both crates deliberately stay
+transport-agnostic (`novachannel-mpc`'s and `novachannel-oram`'s own
+module docs draw that boundary explicitly, and for good reason — neither
+crate should depend on a specific network stack), so the fix isn't adding
+networking to the library; it's adding an example that proves a real one
+is buildable against the existing trait/API surface with zero library
+changes, the same role `crates/core/examples/echo.rs` already plays for
+`novachannel`'s own handshake.
+
+**`crates/mpc/examples/networked_complaint.rs`.** Five participants, each
+its own OS thread with its own TCP socket to a small broadcast relay,
+run the exact fault scenario
+`complaint_resolution_agrees_with_the_batch_identify_faulty_dealers_path`
+(§8) already covers in-process — a corrupted-in-transit share from dealer
+2 to participant 4 — but now the `Complaint` and the dealer's
+`Dealer::share_for` disclosure travel over real sockets between separate
+threads holding separate private state, not shared struct fields. The
+relay only ever forwards those two message types, which the crate's own
+module docs already call "safe to broadcast" (a Feldman share reveals
+nothing about the underlying polynomial on its own) — it never sees a
+dealer's private coefficients or any participant's raw per-dealer shares
+from the earlier reveal round, which stays local to the example's
+`main()`, same as every other test in this crate. All five participant
+threads independently compute `resolve_complaint` from what they received
+over the wire and reach the identical verdict.
+
+**`crates/oram/examples/networked_server.rs`.** A `TcpServerStorage`
+implementing `ServerStorage<Vec<u8>>` entirely over `std::net` (a
+length-prefixed frame protocol, no new dependency) against a server
+thread backed by the existing `InMemoryServer`. `Client<Vec<u8>,
+TcpServerStorage>` runs the same `read`/`write` sequence the in-process
+tests already cover, and every value round-trips correctly through the
+real socket — the architectural claim in the module docs
+("`Client`'s logic doesn't change at all" against a different
+`ServerStorage`), demonstrated rather than only asserted by
+`CountingServer` (§8's own test suite, deliberately still in-process to
+keep the unit tests fast and hermetic).
+
+Neither example is a production transport — the relay is a bare
+store-and-forward router with no authentication of its own, and
+`TcpServerStorage` assumes a single trusted connection, not a hardened
+RPC service. What's closed is narrower and accurate: "no networked
+implementation exists to demonstrate this is deployable" is no longer
+true for either protocol. `docs/SYSTEMIZATION.md` §9 and both crates'
+module docs updated accordingly. `scripts/check.sh` passes clean; no new
+dependencies added to either crate (both examples use only `std::net`
+plus dependencies each crate already had).

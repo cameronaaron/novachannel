@@ -183,11 +183,17 @@ No, and the specific reasons (not a hedge):
   broader and longer-running corpus, with no comparable per-target time
   budget claimed here.
 - No external security audit of anything in this workspace.
-- The DKG's complaint mechanism (`novachannel-mpc`) has no networked
-  broadcast/reveal implementation — reference-implementation only.
-- Every `ServerStorage`/transport "server" in this workspace
-  (`InMemoryServer`, etc.) is an in-process reference implementation, not
-  a networked one.
+- The DKG's complaint mechanism (`novachannel-mpc`) and `ServerStorage`
+  (`novachannel-oram`) each now have a real networked implementation
+  demonstrated end-to-end over actual TCP sockets
+  (`ENGINEERING-STANDARDS.md` §6.26: `examples/networked_complaint.rs`,
+  `examples/networked_server.rs`) rather than reference-implementation
+  only. Neither example is a hardened production transport — the relay
+  has no authentication of its own, and `TcpServerStorage` assumes a
+  single trusted connection — a real deployment still needs to build (or
+  reuse `novachannel`'s own sessions for) an authenticated transport on
+  top; what's closed is "no networked implementation exists to show this
+  is deployable at all."
 - RLN proofs run 85–230x larger than a Groth16 equivalent for the same
   relation (§3.2) — a real bandwidth cost nobody has yet decided is
   acceptable for a specific deployment.

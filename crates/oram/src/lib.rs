@@ -31,9 +31,13 @@
 //! adding a field to the wrong struct. [`InMemoryServer`] is the reference
 //! `ServerStorage` implementation used for testing; a networked deployment
 //! implements the same trait over RPCs instead, and `Client`'s logic
-//! doesn't change at all. [`PathOram`] is `Client<V, InMemoryServer<V>>`
-//! — the batteries-included default for when you don't need a different
-//! `ServerStorage`.
+//! doesn't change at all — `examples/networked_server.rs` is that claim
+//! demonstrated, not just asserted: a real `TcpServerStorage` sends every
+//! bucket read/write over an actual TCP socket to a server thread backed
+//! by [`InMemoryServer`], and the same `Client::read`/`write` calls this
+//! crate's in-process tests use round-trip correctly through it. [`PathOram`]
+//! is `Client<V, InMemoryServer<V>>` — the batteries-included default for
+//! when you don't need a different `ServerStorage`.
 //!
 //! One thing this split does *not* do on its own: [`Block`] carries `id`
 //! and `value` in the clear in [`InMemoryServer`]. [`EncryptingServerStorage`]
@@ -306,7 +310,8 @@ impl<V: Clone, S: ServerStorage<V>> Client<V, S> {
 
 /// The batteries-included default: a [`Client`] paired with the reference
 /// [`InMemoryServer`]. Reach for [`Client`] directly with your own
-/// [`ServerStorage`] impl for a networked deployment.
+/// [`ServerStorage`] impl for a networked deployment — see
+/// `examples/networked_server.rs` for a real one.
 pub type PathOram<V> = Client<V, InMemoryServer<V>>;
 
 impl<V: Clone> PathOram<V> {
