@@ -628,6 +628,15 @@ trail.
 
 ## 9. Limitations and what would be needed for a real research contribution
 
+At a glance, the gaps not yet closed anywhere else in this document:
+
+| Area | Current state | Gap |
+| --- | --- | --- |
+| Classical threshold signing | `novachannel-mpc::frost` is bound to Ristretto255. | Threshold signing remains vulnerable to quantum adversaries (only threshold *decryption* is post-quantum, via `threshold_kem` — §7, §6.22). |
+| MPC network layer | DKG is an in-process state machine. | Lacks an asynchronous network broadcast and complaint sub-protocol for handling network faults/timeouts between dealers. |
+| Caller offloading | ORAM block payloads travel in cleartext over `ServerStorage`; account PKI and `SignedDeviceList` distribution have no built-in transport. | `novachannel-oram`'s module docs already require the caller's `ServerStorage` implementation to encrypt block contents before they leave the client (§6); a real deployment's directory service for account/device keys is likewise the caller's responsibility (§4.4). |
+| Side-channel limits | DP is strictly scoped to the presence bit. | `novachannel-dp` gives no protection against message-size, timing, or latency correlation attacks (§5). |
+
 Stated plainly, per §1:
 
 - `novachannel-rln`'s in-circuit permutation is now a verified port of
