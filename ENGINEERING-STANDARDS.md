@@ -1310,3 +1310,95 @@ rather than implying the whole crate is now post-quantum.
 Final state after this section: 168 tests across the workspace (up from
 132), 8 fuzz targets (up from 6), full `scripts/check.sh` green,
 `cargo audit` clean, `gitleaks detect` clean.
+
+### 6.23 `crate::group`: a module that fell outside this document's own audit trail, and two real defects that gap let through
+
+`crates/core/src/group.rs` — a ~1,700-line TreeKEM-inspired group ratchet,
+publicly exported from the crate root since it was added — was, on
+inspection, absent from every place this workspace's own process says a
+module like it should appear: not in `docs/SYSTEMIZATION.md`'s
+architecture or verification sections, not in §6.8's unwrap/parser-safety
+audit, no dedicated integration test file alongside `crates/core/tests/`'s
+one per other module. §6.14 exists specifically because "found once,
+manually" isn't a standing guarantee; this is the same lesson applied to
+an entire module that manual review simply never reached, not to one
+function inside a module that had already been looked at.
+
+Two real, adversarially-reachable defects were in exactly the shape §6.14
+predicts: the kind that only shows up once you ask "what can a party with
+no group membership at all — just a victim's *published* invite
+material — get this code to do?", not "does the happy path work?"
+
+**A forgeable remote-DoS panic.** `Welcome`/`seal_to_node` are a one-shot,
+sender-anonymous envelope, the same shape as `crate::sealed_sender`'s
+(§4.3) — deliberately: anyone can seal a `Welcome` to a prospective
+member's public `LeafKeyPackage` without proving they're a real group
+sender. What was missing is the corollary that shape requires: the
+*plaintext* inside that envelope is therefore attacker-controlled by
+anyone who knows the victim's published package, not just by legitimate
+inviters. `WelcomeSnapshot::read` trusted its plaintext's `capacity` field
+directly into `2 * (capacity as usize) - 1` before any check — a forged
+`capacity = 0` underflows that subtraction and panics under this
+workspace's own `overflow-checks = true` release profile (Cargo.toml),
+the identical failure class §6.22/§3.3 already fixed once in a
+*dependency's* deserializer, recurring here in this workspace's own code.
+A forged `target_leaf >= capacity` had the same gap one step further down
+`Group::join`, as an out-of-bounds `Vec` index instead of a subtract
+overflow. Both are now checked against the same invariant
+`Group::create` already enforces for a legitimately-constructed group,
+before either value drives an allocation or an index —
+`a_forged_zero_capacity_welcome_snapshot_is_rejected_not_panicked_on` and
+`a_forged_out_of_range_target_leaf_is_rejected_not_panicked_on` pin down
+both as `Error::Malformed`, not a panic.
+
+**Missing proof-of-possession, the one gap `crate::multidevice` already
+closed for the same threat model.** `LeafKeyPackage` bundled a
+`PublicIdentity` next to a `NodePublicKey` with nothing binding the two
+together — so a `LeafKeyPackage` naming a victim's real, already-published
+identity could be paired with an attacker's own key material, and nothing
+in `Group::propose_add` or deserialization would catch it before the tree
+recorded the attacker's key under the victim's name. `crate::prekey`
+(§4.2) and `crate::multidevice::SignedDeviceList` (§6.18) both already
+solve this exact problem for their own published-key-material with a
+signature binding identity to key; `LeafKeyPackage` had simply never
+gotten the same treatment. Fixed the same way: `MyLeafKeyPackage::generate`
+now takes the prospective member's own `&Identity` (not just its public
+half) and signs a proof-of-possession over `(identity, public_key)`
+(`leaf_key_package_pop_message`) using this crate's existing hybrid
+Ed25519+ML-DSA signing, verified by `LeafKeyPackage::read` itself — the
+one choke point every deserialization path (`from_bytes`, a
+`GroupOp::Add` inside a received `Commit`, a `Welcome` snapshot's tree)
+already goes through, so there's no second call site to forget to check.
+`a_leaf_key_package_with_a_swapped_identity_is_rejected` constructs
+exactly that attack — a real identity's `PublicIdentity` frankensteined
+onto a different real package's key material and (still-valid-for-its-own-
+package) signature — and confirms it fails verification rather than
+silently succeeding.
+
+**Zeroization, extended to the modules that didn't have it yet.**
+`crates/mpc/src/threshold_kem.rs` (§6.22) derived master secrets, wrap
+keys, payload keys, and reconstructed Shamir shares as plain
+`Scalar`/`[u8; 32]` locals with no `zeroize()` call anywhere — inconsistent
+with §2.1's standing rule, simply not yet applied when that module was
+written. Every such intermediate in `encrypt_to_group`, `partial_decrypt`,
+and `combine_and_decrypt` is now explicitly zeroized once no longer
+needed (`curve25519-dalek::Scalar` and `ml-kem`'s shared-secret type both
+already implement `Zeroize`, so this cost no new dependency). `Group`'s
+own `Drop` impl (`group.rs`) already zeroized `epoch_secret`,
+`application_secret`, and `known_secrets` at final drop; `apply` is now
+one step stricter, zeroizing each field's *old* value at the moment it's
+superseded by a new epoch's secret rather than only at the struct's own
+end of life.
+
+What this section does not claim: `crate::group`'s per-sender chain still
+requires strict in-order delivery within an epoch with no replay-window
+tolerance, and there is still no test exercising self-removal, a
+wrong-group commit, or a tampered `Add` key package specifically — all
+three are the module's own documented scope boundary (its own module
+docs, "No concurrent-commit resolution" et al.), the same
+honestly-scoped-limitation stance §5 already applies elsewhere in this
+workspace, not a defect being asserted away here.
+
+Final state after this section: 172 tests across the workspace (up from
+168), full `scripts/check.sh` green, `cargo audit` clean, `gitleaks
+detect` clean.

@@ -12,7 +12,8 @@ publishable, this document says that instead of asserting the claim.
 `novachannel` is a five-crate Rust workspace implementing a hybrid
 classical/post-quantum secure channel (`novachannel`, with async/deniable
 X3DH session establishment, sealed sender, Sesame-style multi-device
-fan-out, and a one-shot or incremental/erasure-coded ratchet), zero-knowledge
+fan-out, a one-shot or incremental/erasure-coded ratchet, and an
+`O(log n)` TreeKEM-inspired group ratchet), zero-knowledge
 rate-limiting nullifiers over a hash-based STARK
 (`novachannel-rln`), differential-privacy-calibrated cover traffic
 (`novachannel-dp`), oblivious server-side storage
@@ -398,6 +399,47 @@ account key to trust as its signer remain the caller's problem, the same
 scope boundary `crate::handshake` already draws for peer-identity
 provisioning.
 
+### 4.5 `group`: `O(log n)` group rekeying via a TreeKEM-inspired ratchet
+
+`crate::multidevice` (§4.4) fans one sender's message out to every device
+of a *known set of peers*; it says nothing about groups whose membership
+itself changes over time, or about doing that at less than `O(n)` pairwise
+sessions. `crate::group::Group` borrows MLS/TreeKEM's central idea — an
+array-based binary tree where committing a membership change or a
+plain re-key means re-encrypting one root-to-leaf path, each step sealed
+to the resolution of its sibling subtree so only current members can
+decrypt it — reusing this crate's own primitives (hybrid X25519 +
+ML-KEM-1024 sealing, HKDF, the hybrid Ed25519 + ML-DSA-87
+`crate::identity::Identity` for signing commits) rather than a second,
+independent set of cryptographic building blocks. It is explicitly **not**
+RFC 9420: no TLS presentation-language wire encoding, no HPKE per RFC 9180
+specifically, no X.509/credential machinery, no interoperability with any
+other MLS implementation, fixed capacity chosen once at creation (no tree
+resizing), one proposal per commit, and current-epoch-only message
+decryption with no MLS "secret tree" — a member's send chain for an epoch
+is a single forward hash chain, mirroring `crate::ratchet::ChainKey`, so
+in-order delivery within an epoch is required. What is preserved is what
+actually justifies TreeKEM over pairwise ratchets: `O(log n)` hybrid-sealed
+values per commit instead of one per other member, forward secrecy and
+post-compromise security on every commit, and a removed member
+structurally excluded going forward — their entire ancestor path is
+blanked and never re-sent, not merely told to stop.
+
+A `LeafKeyPackage` — the public half of a prospective member's leaf,
+published so an existing member can invite them — carries a
+proof-of-possession signature binding its `PublicIdentity` to its leaf key
+material, checked by every deserialization path before the package is
+trusted; without it, a `LeafKeyPackage` naming a real victim's identity
+could be paired with an attacker's own key material by whoever publishes
+it, the same class of gap `SignedPreKey` (§4.2) and `SignedDeviceList`
+(§4.4) already close for their own published key material.
+`WelcomeSnapshot::read`'s `capacity`/`target_leaf` fields are validated
+against the same invariant `Group::create` enforces before either drives
+an allocation or an index — both defects, and why they're reachable by
+anyone who merely knows a victim's published `LeafKeyPackage` rather than
+by an actual group member, are recorded in
+`ENGINEERING-STANDARDS.md` §6.23.
+
 ## 5. `novachannel-dp`: formal differential privacy on the presence bit
 
 The specific engineering claim — "an observer watching the channel has
@@ -541,13 +583,18 @@ replacement.
 
 ## 8. What was actually verified, and how
 
-168 tests across the workspace (up from 132), plus 8 `cargo-fuzz` targets
+172 tests across the workspace (up from 132), plus 8 `cargo-fuzz` targets
 (up from 6) covering every crate with an untrusted-input parsing
 boundary — `novachannel-rln`'s STARK proof verifier and
 `novachannel-mpc`'s FROST signature verifier are new additions, and
 `rln_verify` found a real remote-DoS panic in a dependency's proof
 deserializer within seconds of running (`ENGINEERING-STANDARDS.md` §3.3,
-§6.22), now fixed and regression-tested. All adversarial where the claim
+§6.22), now fixed and regression-tested. A later audit of `crate::group`
+against the same "what can an unauthenticated party do" standard (§4.5)
+found two more defects of the identical class in this workspace's own
+code — a forgeable zero-capacity panic and a missing proof-of-possession
+binding on `LeafKeyPackage` — recorded and fixed in
+`ENGINEERING-STANDARDS.md` §6.23. All adversarial where the claim
 is adversarial (not merely "does the happy path run"): tamper, replay,
 wrong-key, wrong-message, below-threshold-quorum,
 server-tampers-a-bucket, server-replays-a-stale-bucket,

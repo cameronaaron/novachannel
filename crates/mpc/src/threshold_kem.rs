@@ -75,6 +75,7 @@ use kem::{Decapsulate, Encapsulate, Kem};
 use ml_kem::MlKem1024;
 use rand_core::Rng;
 use sha2::Sha256;
+use zeroize::Zeroize;
 
 use crate::{csprng, evaluate, lagrange_coefficient_at_zero, scalar_from_id, ParticipantId};
 
@@ -177,7 +178,7 @@ pub fn encrypt_to_group(
     assert!(threshold >= 1 && (threshold as usize) <= operators.len());
 
     let mut rng = csprng();
-    let master_secret = Scalar::random(&mut rng);
+    let mut master_secret = Scalar::random(&mut rng);
 
     // Shamir-share the master secret: same random-polynomial-evaluation
     // technique `Dealer::new`/`Dealer::reveal` use, just for a
@@ -192,10 +193,13 @@ pub fn encrypt_to_group(
     let shares = operators
         .iter()
         .map(|(&id, public_key)| {
-            let share = evaluate(&coefficients, scalar_from_id(id));
-            let (ciphertext, shared_secret) = public_key.encapsulate_with_rng(&mut rng);
-            let wrap_key = hkdf_expand_32(&shared_secret, SHARE_WRAP_INFO);
+            let mut share = evaluate(&coefficients, scalar_from_id(id));
+            let (ciphertext, mut shared_secret) = public_key.encapsulate_with_rng(&mut rng);
+            let mut wrap_key = hkdf_expand_32(&shared_secret, SHARE_WRAP_INFO);
+            shared_secret.zeroize();
             let wrapped_share = aead_seal(&wrap_key, share.as_bytes());
+            wrap_key.zeroize();
+            share.zeroize();
             (
                 id,
                 OperatorShare {
@@ -206,8 +210,14 @@ pub fn encrypt_to_group(
         })
         .collect();
 
-    let payload_key = hkdf_expand_32(master_secret.as_bytes(), PAYLOAD_KEY_INFO);
+    for c in &mut coefficients {
+        c.zeroize();
+    }
+
+    let mut payload_key = hkdf_expand_32(master_secret.as_bytes(), PAYLOAD_KEY_INFO);
     let payload = aead_seal(&payload_key, plaintext);
+    payload_key.zeroize();
+    master_secret.zeroize();
 
     GroupCiphertext {
         shares,
@@ -233,15 +243,20 @@ pub fn partial_decrypt(
         .shares
         .get(&operator.id)
         .ok_or("this operator has no share in the given ciphertext")?;
-    let shared_secret = operator.secret.decapsulate(&my_share.ciphertext);
-    let wrap_key = hkdf_expand_32(&shared_secret, SHARE_WRAP_INFO);
-    let share_bytes = aead_open(&wrap_key, &my_share.wrapped_share)?;
-    let share_arr: [u8; 32] = share_bytes
+    let mut shared_secret = operator.secret.decapsulate(&my_share.ciphertext);
+    let mut wrap_key = hkdf_expand_32(&shared_secret, SHARE_WRAP_INFO);
+    shared_secret.zeroize();
+    let mut share_bytes = aead_open(&wrap_key, &my_share.wrapped_share)?;
+    wrap_key.zeroize();
+    let mut share_arr: [u8; 32] = share_bytes
+        .as_slice()
         .try_into()
         .map_err(|_| "unwrapped share had the wrong length".to_string())?;
+    share_bytes.zeroize();
     let share = Scalar::from_canonical_bytes(share_arr)
         .into_option()
         .ok_or("unwrapped share was not a canonical scalar")?;
+    share_arr.zeroize();
     Ok((operator.id, share))
 }
 
@@ -262,11 +277,14 @@ pub fn combine_and_decrypt(
     group_ciphertext: &GroupCiphertext,
 ) -> Result<Vec<u8>, String> {
     let ids: Vec<ParticipantId> = partials.iter().map(|(id, _)| *id).collect();
-    let master_secret = partials.iter().fold(Scalar::ZERO, |acc, (id, share)| {
+    let mut master_secret = partials.iter().fold(Scalar::ZERO, |acc, (id, share)| {
         acc + lagrange_coefficient_at_zero(*id, &ids) * share
     });
-    let payload_key = hkdf_expand_32(master_secret.as_bytes(), PAYLOAD_KEY_INFO);
-    aead_open(&payload_key, &group_ciphertext.payload)
+    let mut payload_key = hkdf_expand_32(master_secret.as_bytes(), PAYLOAD_KEY_INFO);
+    master_secret.zeroize();
+    let result = aead_open(&payload_key, &group_ciphertext.payload);
+    payload_key.zeroize();
+    result
 }
 
 #[cfg(test)]

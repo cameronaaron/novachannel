@@ -90,6 +90,7 @@ const LABEL_SENDER_CHAIN: &[u8] = b"novachannel group v1 sender chain";
 const LABEL_MESSAGE_KEY: &[u8] = &[0x01];
 const LABEL_NEXT_CHAIN: &[u8] = &[0x02];
 const COMMIT_SIGNATURE_CONTEXT: &[u8] = b"novachannel group v1 commit";
+const LEAF_KEY_PACKAGE_POP_CONTEXT: &[u8] = b"novachannel group v1 leaf key package";
 const PATH_SECRET_AAD_CONTEXT: &[u8] = b"novachannel group v1 path secret";
 const WELCOME_AAD_CONTEXT: &[u8] = b"novachannel group v1 welcome";
 
@@ -210,27 +211,55 @@ impl PartialEq for NodePublicKey {
     }
 }
 
+/// The message a [`LeafKeyPackage`]'s proof-of-possession signature covers:
+/// binds `identity` to this specific `public_key` so a package can't be
+/// forged by pairing a victim's real, published `PublicIdentity` with an
+/// attacker-chosen `NodePublicKey` — the same signed-binding pattern
+/// `crate::prekey::SignedPreKey` and `crate::multidevice::SignedDeviceList`
+/// already use for the same reason. Without it, whoever calls
+/// [`Group::propose_add`] on an unverified `LeafKeyPackage` has no way to
+/// tell "the real Bob asked to join" from "someone published Bob's public
+/// identity next to their own key material," and the tree would then
+/// record the attacker's key under Bob's name.
+fn leaf_key_package_pop_message(identity: &PublicIdentity, public_key: &NodePublicKey) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.put_fixed(LEAF_KEY_PACKAGE_POP_CONTEXT);
+    identity.write(&mut w);
+    public_key.write(&mut w);
+    w.into_bytes()
+}
+
 /// A prospective or current member's leaf: their signing identity plus the
 /// public half of their leaf's hybrid key, published so an existing member
-/// can [`Group::propose_add`] them.
+/// can [`Group::propose_add`] them. `pop` is a proof-of-possession
+/// signature over `identity`+`public_key` from `identity`'s own long-term
+/// signing key, checked by [`Self::read`] (and so by every deserialization
+/// path — [`Self::from_bytes`], a [`GroupOp::Add`] inside a received
+/// [`Commit`], and a [`Welcome`] snapshot's tree) before the package is
+/// ever trusted.
 #[derive(Clone)]
 pub struct LeafKeyPackage {
     pub identity: PublicIdentity,
     public_key: NodePublicKey,
+    pop: HybridSignature,
 }
 
 impl LeafKeyPackage {
     fn write(&self, w: &mut Writer) {
         self.identity.write(w);
         self.public_key.write(w);
+        self.pop.write(w);
     }
 
     fn read(r: &mut Reader) -> Result<Self> {
         let identity = PublicIdentity::read(r)?;
         let public_key = NodePublicKey::read(r)?;
+        let pop = HybridSignature::read(r)?;
+        identity.verify(&leaf_key_package_pop_message(&identity, &public_key), &pop)?;
         Ok(LeafKeyPackage {
             identity,
             public_key,
+            pop,
         })
     }
 
@@ -270,20 +299,34 @@ pub struct MyLeafKeyPackage {
     dh_public: X25519Public,
     kem_secret: MlKemDecapsulationKey,
     kem_public: MlKemEncapsulationKey,
+    pop: HybridSignature,
 }
 
 impl MyLeafKeyPackage {
-    pub fn generate(identity: PublicIdentity) -> Self {
+    /// `signing_identity` must be this prospective member's own long-term
+    /// [`Identity`] — its secret key signs the freshly generated leaf key
+    /// pair's proof-of-possession (see [`leaf_key_package_pop_message`]),
+    /// which is what lets [`Group::propose_add`]'s caller (and every peer
+    /// who later reads this package off the wire) trust that `identity`
+    /// and this leaf's key material actually belong together.
+    pub fn generate(signing_identity: &Identity) -> Self {
         let mut rng = csprng();
         let dh_secret = StaticSecret::random_from_rng(&mut rng);
         let dh_public = X25519Public::from(&dh_secret);
         let (kem_secret, kem_public) = MlKem1024::generate_keypair_from_rng(&mut rng);
+        let identity = signing_identity.public();
+        let public_key = NodePublicKey {
+            dh_public,
+            kem_public: kem_public.clone(),
+        };
+        let pop = signing_identity.sign(&leaf_key_package_pop_message(&identity, &public_key));
         MyLeafKeyPackage {
             identity,
             dh_secret,
             dh_public,
             kem_secret,
             kem_public,
+            pop,
         }
     }
 
@@ -294,6 +337,7 @@ impl MyLeafKeyPackage {
                 dh_public: self.dh_public,
                 kem_public: self.kem_public.clone(),
             },
+            pop: self.pop.clone(),
         }
     }
 }
@@ -759,6 +803,32 @@ impl WelcomeSnapshot {
                 .try_into()
                 .expect("get_fixed(4) already guarantees the length"),
         );
+        // `capacity`/`target_leaf` arrive inside an AEAD-authenticated
+        // plaintext, but the sender who *produced* that plaintext is
+        // unauthenticated at this layer (`seal_to_node` is a one-shot,
+        // sender-anonymous envelope, the same shape as
+        // `crate::sealed_sender` — see its module docs): anyone who knows
+        // the joining member's published `LeafKeyPackage` can construct a
+        // `Welcome` that decrypts cleanly under that member's own keys,
+        // with arbitrary contents. `capacity` must therefore be checked
+        // against exactly the same invariant `Group::create` enforces
+        // before it drives a subtraction/allocation, not trusted as
+        // already valid.
+        if capacity < 2 || !capacity.is_power_of_two() {
+            return Err(Error::Malformed(
+                "welcome snapshot capacity must be a power of two of at least 2",
+            ));
+        }
+        if capacity > (1 << 20) {
+            return Err(Error::Malformed(
+                "welcome snapshot capacity exceeds this implementation's sanity bound",
+            ));
+        }
+        if target_leaf >= capacity {
+            return Err(Error::Malformed(
+                "welcome snapshot target leaf is not within its own capacity",
+            ));
+        }
         let node_count = 2 * (capacity as usize) - 1;
         let mut nodes = Vec::with_capacity(node_count);
         for _ in 0..node_count {
@@ -899,7 +969,7 @@ impl Group {
                 "group capacity must be a power of two of at least 2",
             ));
         }
-        let my_key_package = MyLeafKeyPackage::generate(my_identity.public());
+        let my_key_package = MyLeafKeyPackage::generate(my_identity);
         let mut nodes = vec![TreeNode::Blank; 2 * capacity - 1];
         nodes[leaf_to_node(capacity, 0)] = TreeNode::Leaf(Box::new(my_key_package.public()));
 
@@ -1281,7 +1351,9 @@ impl Group {
         hk.expand(&info, &mut new_epoch_secret)
             .map_err(|_| Error::Malformed("HKDF expand failed"))?;
 
+        self.epoch_secret.zeroize();
         self.epoch_secret = new_epoch_secret;
+        self.application_secret.zeroize();
         self.application_secret = derive_application_secret(&self.epoch_secret)?;
         self.epoch += 1;
         self.send_chain = derive_sender_chain(&self.application_secret, self.my_leaf as u32)?;
@@ -1420,7 +1492,7 @@ mod tests {
         let bob_id = Identity::generate();
         let mut alice = Group::create(&alice_id, 4).unwrap();
 
-        let bob_key_package = MyLeafKeyPackage::generate(bob_id.public());
+        let bob_key_package = MyLeafKeyPackage::generate(&bob_id);
         let (commit, welcome) = alice
             .propose_add(&alice_id, bob_key_package.public())
             .unwrap();
@@ -1432,7 +1504,7 @@ mod tests {
     fn commit_and_welcome_round_trip_through_bytes() {
         let alice_id = Identity::generate();
         let mut alice = Group::create(&alice_id, 4).unwrap();
-        let bob_key_package = MyLeafKeyPackage::generate(Identity::generate().public());
+        let bob_key_package = MyLeafKeyPackage::generate(&Identity::generate());
 
         let (commit, welcome) = alice
             .propose_add(&alice_id, bob_key_package.public())
@@ -1459,7 +1531,7 @@ mod tests {
     fn leaf_key_package_round_trips_through_bytes_and_still_joins() {
         let alice_id = Identity::generate();
         let mut alice = Group::create(&alice_id, 4).unwrap();
-        let bob_key_package = MyLeafKeyPackage::generate(Identity::generate().public());
+        let bob_key_package = MyLeafKeyPackage::generate(&Identity::generate());
 
         let sent_bytes = bob_key_package.public().to_bytes();
         let received = LeafKeyPackage::from_bytes(&sent_bytes).unwrap();
@@ -1470,6 +1542,79 @@ mod tests {
         assert_eq!(bob.my_leaf_index(), 1);
 
         assert!(LeafKeyPackage::from_bytes(b"not a real leaf key package").is_err());
+    }
+
+    /// `seal_to_node`/`Welcome` are a one-shot, sender-anonymous envelope
+    /// (module docs on [`leaf_key_package_pop_message`]): anyone who knows
+    /// a victim's published `LeafKeyPackage` can encrypt an arbitrary
+    /// plaintext that decrypts cleanly under the victim's own keys. A
+    /// forged `capacity` of 0 used to reach `2 * (capacity as usize) - 1`
+    /// in `WelcomeSnapshot::read` and panic on subtract-overflow (this
+    /// workspace's release profile runs with `overflow-checks = true`) —
+    /// a remote crash triggerable by anyone who can address a `Welcome` to
+    /// a member's public key, no group membership required. It must be
+    /// rejected as malformed instead.
+    #[test]
+    fn a_forged_zero_capacity_welcome_snapshot_is_rejected_not_panicked_on() {
+        let mut w = Writer::new();
+        w.put_fixed(&[0u8; 16]); // group_id
+        w.put_fixed(&0u32.to_be_bytes()); // capacity = 0
+        w.put_fixed(&0u64.to_be_bytes()); // epoch
+        w.put_fixed(&[0u8; 32]); // epoch_secret
+        w.put_fixed(&[0u8; 32]); // transcript_hash
+        w.put_fixed(&0u32.to_be_bytes()); // target_leaf
+        let bytes = w.into_bytes();
+        let mut r = Reader::new(&bytes);
+        assert!(matches!(
+            WelcomeSnapshot::read(&mut r),
+            Err(Error::Malformed(_))
+        ));
+    }
+
+    /// Same forged-plaintext threat model as the zero-capacity case above,
+    /// but targeting `target_leaf`: a value at or past `capacity` used to
+    /// have nothing checking it, so `Group::join` would later index
+    /// `nodes` out of bounds and panic instead of erroring.
+    #[test]
+    fn a_forged_out_of_range_target_leaf_is_rejected_not_panicked_on() {
+        let mut w = Writer::new();
+        w.put_fixed(&[0u8; 16]); // group_id
+        w.put_fixed(&4u32.to_be_bytes()); // capacity = 4
+        w.put_fixed(&0u64.to_be_bytes()); // epoch
+        w.put_fixed(&[0u8; 32]); // epoch_secret
+        w.put_fixed(&[0u8; 32]); // transcript_hash
+        w.put_fixed(&4u32.to_be_bytes()); // target_leaf == capacity, out of range
+        let bytes = w.into_bytes();
+        let mut r = Reader::new(&bytes);
+        assert!(matches!(
+            WelcomeSnapshot::read(&mut r),
+            Err(Error::Malformed(_))
+        ));
+    }
+
+    /// A `LeafKeyPackage` whose `identity` doesn't match the key material
+    /// its proof-of-possession was actually signed over (here: swapping in
+    /// a *different* real identity, itself perfectly validly signed on its
+    /// own package) must not deserialize — otherwise whoever calls
+    /// [`Group::propose_add`] on it has no way to tell that the party
+    /// publishing this package doesn't actually control the identity it
+    /// claims, and the tree would record an attacker's key under a
+    /// victim's name.
+    #[test]
+    fn a_leaf_key_package_with_a_swapped_identity_is_rejected() {
+        let victim = MyLeafKeyPackage::generate(&Identity::generate());
+        let attacker = MyLeafKeyPackage::generate(&Identity::generate());
+
+        let mut forged = attacker.public();
+        forged.identity = victim.public().identity;
+        // `forged.pop` is still the attacker's signature over the
+        // attacker's own (identity, public_key) pair, not this
+        // frankensteined combination, so it must fail verification.
+        let bytes = forged.to_bytes();
+        assert!(matches!(
+            LeafKeyPackage::from_bytes(&bytes),
+            Err(Error::BadSignature)
+        ));
     }
 
     #[test]
@@ -1510,7 +1655,7 @@ mod tests {
     fn a_third_member_joins_and_everyone_converges() {
         let (mut alice, mut bob, alice_id, _bob_id) = two_member_group();
         let carol_id = Identity::generate();
-        let carol_key_package = MyLeafKeyPackage::generate(carol_id.public());
+        let carol_key_package = MyLeafKeyPackage::generate(&carol_id);
 
         let (commit, welcome) = alice
             .propose_add(&alice_id, carol_key_package.public())
@@ -1552,7 +1697,7 @@ mod tests {
     fn removed_member_cannot_decrypt_future_traffic() {
         let (mut alice, mut bob, alice_id, _bob_id) = two_member_group();
         let carol_id = Identity::generate();
-        let carol_key_package = MyLeafKeyPackage::generate(carol_id.public());
+        let carol_key_package = MyLeafKeyPackage::generate(&carol_id);
         let (commit, welcome) = alice
             .propose_add(&alice_id, carol_key_package.public())
             .unwrap();
@@ -1582,12 +1727,12 @@ mod tests {
     fn adding_past_capacity_fails() {
         let alice_id = Identity::generate();
         let mut alice = Group::create(&alice_id, 2).unwrap();
-        let bob_key_package = MyLeafKeyPackage::generate(Identity::generate().public());
+        let bob_key_package = MyLeafKeyPackage::generate(&Identity::generate());
         alice
             .propose_add(&alice_id, bob_key_package.public())
             .unwrap();
 
-        let carol_key_package = MyLeafKeyPackage::generate(Identity::generate().public());
+        let carol_key_package = MyLeafKeyPackage::generate(&Identity::generate());
         let result = alice.propose_add(&alice_id, carol_key_package.public());
         assert!(matches!(result, Err(Error::GroupFull)));
     }
@@ -1630,7 +1775,7 @@ mod tests {
         let member_ids: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
         let mut members = Vec::new();
         for id in &member_ids {
-            let key_package = MyLeafKeyPackage::generate(id.public());
+            let key_package = MyLeafKeyPackage::generate(id);
             let (commit, welcome) = founder
                 .propose_add(&founder_id, key_package.public())
                 .unwrap();
