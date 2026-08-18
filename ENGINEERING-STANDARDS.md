@@ -1402,3 +1402,96 @@ workspace, not a defect being asserted away here.
 Final state after this section: 172 tests across the workspace (up from
 168), full `scripts/check.sh` green, `cargo audit` clean, `gitleaks
 detect` clean.
+
+### 6.24 Three of `docs/SYSTEMIZATION.md` §9's own named gaps, closed
+
+§9's limitations table names five open gaps. Two are not really fixable
+*in this workspace* — no production-ready post-quantum threshold-signature
+scheme exists to swap `frost` for (§7, checked directly, not assumed), and
+a directory service for account/device PKI is a network service with its
+own trust and availability model, the same boundary `crate::handshake`'s
+identity pinning already draws (§4.2, §4.4) — building either here would
+mean either shipping an uncryptanalyzed primitive (§0.3) or a fake service
+this crate was never meant to be. The other three were genuinely in
+scope, and are closed here.
+
+**`novachannel-mpc`: a real per-accusation complaint protocol, not just
+its batch outcome.** `identify_faulty_dealers` (§ above) already computes
+the *outcome* of Gennaro et al.'s complaint resolution, but only when
+every dealer's every share is visible to one process — true for this
+crate's own test suite or a trusted coordinator, not for participants who
+each only see the shares addressed to them. `Complaint`/
+`Dealer::share_for`/`resolve_complaint` give the real building block: a
+participant whose received share fails `verify_share` exhibits it in a
+`Complaint` (safe to broadcast — a single Feldman share is
+information-theoretically independent of the underlying polynomial, so
+revealing one's own costs nothing the dealer didn't already send them
+directly); the accused dealer recomputes and discloses what their
+polynomial actually evaluates to for that participant
+(`Dealer::share_for`); `resolve_complaint` takes the dealer's
+already-public commitments, the complaint, and that disclosure, and
+reaches a `ComplaintVerdict` — `DealerCannotProduceAValidShare`,
+`DealersDisclosureContradictsWhatWasSent`, or `ComplaintWasUnfounded` —
+that every other participant recomputes independently from the same three
+public values, trusting neither party's word alone. Four new tests,
+including `complaint_resolution_agrees_with_the_batch_identify_faulty_dealers_path`,
+which checks the new per-accusation path and the existing batch path reach
+the same verdict for the same underlying fault — two ways to compute one
+outcome, not two different outcomes. The wire transport for actually
+broadcasting a `Complaint`/disclosure is still the caller's problem,
+unchanged from the module docs' existing "this crate does not do
+networking" stance.
+
+**`novachannel-oram`: an opt-in confidentiality layer, composing with the
+integrity layer §6.12 already added.** `EncryptingServerStorage` is a
+`ServerStorage` decorator — the same composability §6.12's
+`VerifiableServerStorage` already demonstrated needs no change to
+`Client` — that AEAD-seals a block's `id` and `value` *together* before
+handing it to `inner` (sealing `id`, not just `value`, matters: leaving
+the logical id in the clear next to an now-opaque value would still let a
+server correlate "id X's ciphertext changed" across accesses). The one
+real design question it raised: `ServerStorage::read_and_clear` is
+infallible by signature, so what happens when a block's AEAD tag fails to
+authenticate? Panicking there would be a new, self-inflicted DoS vector —
+worse than this crate's own documented baseline for the non-integrity-
+checked path ("nothing stops an active server from tampering... `Client`
+would have no way to notice"). The chosen answer: drop the undecryptable
+block from what `read_and_clear` returns rather than panic. Working
+through the consequence rather than assuming it was safe: composed with
+`VerifiableServerStorage`, a missing block changes the bucket's plaintext
+hash, which `Client`'s own Merkle check already catches as `IntegrityError`
+— so confidentiality and integrity compose correctly with no shared
+implementation between them, verified directly by
+`a_corrupted_ciphertext_is_caught_as_an_integrity_error_not_a_panic`, not
+just asserted. A strictly monotonic per-block nonce counter is used
+instead of a random nonce, since one key here can seal many blocks over a
+long-lived deployment and ChaCha20-Poly1305 is catastrophic under nonce
+reuse — a counter cannot collide short of 2^64 blocks under one key,
+avoiding the birthday-bound risk a random 96-bit nonce would carry at that
+volume. Five new tests, covering round-trip correctness, confirming the
+plaintext marker never appears in what physical storage holds, a
+wrong-key read cleanly observing nothing rather than garbage, and
+composition with the integrity layer both on the happy path and under
+direct ciphertext corruption.
+
+**`novachannel-dp`: closing the size half of the "what this doesn't
+cover" list, leaving the timing half honestly open.** `SizeBucketer` pads
+plaintext up to one of a fixed set of byte-length buckets (a configurable
+list, or the conventional `power_of_two_buckets` shape used by, e.g., Tor
+cell padding) before encryption, so an observer of ciphertext length
+learns only which bucket a message fell into — a length-prefixed pad/unpad
+pair, independent of and much simpler than the presence-bit DP mechanism
+above (no epsilon, no composition math). Timing/latency correlation is
+explicitly *not* addressed: closing it would mean actually scheduling
+traffic (real sends delayed to a grid, not just padded), a materially
+larger, separate undertaking than a padding function — the module docs
+say so directly rather than letting the size fix read as more complete
+than it is. Nine new tests, including the property that actually matters
+(two different-length plaintexts landing in the same bucket produce
+identically-sized padded output, not just "padding exists"), an
+oversized-message rejection, and malformed-input rejection on `unpad`
+rather than a panic.
+
+Final state after this section: 190 tests across the workspace (up from
+172), full `scripts/check.sh` green, `cargo audit` clean, `gitleaks
+detect` clean.

@@ -583,7 +583,7 @@ replacement.
 
 ## 8. What was actually verified, and how
 
-172 tests across the workspace (up from 132), plus 8 `cargo-fuzz` targets
+190 tests across the workspace (up from 132), plus 8 `cargo-fuzz` targets
 (up from 6) covering every crate with an untrusted-input parsing
 boundary — `novachannel-rln`'s STARK proof verifier and
 `novachannel-mpc`'s FROST signature verifier are new additions, and
@@ -632,10 +632,11 @@ At a glance, the gaps not yet closed anywhere else in this document:
 
 | Area | Current state | Gap |
 | --- | --- | --- |
-| Classical threshold signing | `novachannel-mpc::frost` is bound to Ristretto255. | Threshold signing remains vulnerable to quantum adversaries (only threshold *decryption* is post-quantum, via `threshold_kem` — §7, §6.22). |
-| MPC network layer | DKG is an in-process state machine. | Lacks an asynchronous network broadcast and complaint sub-protocol for handling network faults/timeouts between dealers. |
-| Caller offloading | ORAM block payloads travel in cleartext over `ServerStorage`; account PKI and `SignedDeviceList` distribution have no built-in transport. | `novachannel-oram`'s module docs already require the caller's `ServerStorage` implementation to encrypt block contents before they leave the client (§6); a real deployment's directory service for account/device keys is likewise the caller's responsibility (§4.4). |
-| Side-channel limits | DP is strictly scoped to the presence bit. | `novachannel-dp` gives no protection against message-size, timing, or latency correlation attacks (§5). |
+| Classical threshold signing | `novachannel-mpc::frost` is bound to Ristretto255. | Threshold signing remains vulnerable to quantum adversaries (only threshold *decryption* is post-quantum, via `threshold_kem` — §7, §6.22). No production-ready post-quantum threshold-signature scheme exists to swap it for (checked directly, not assumed — §7); building one from scratch here would mean shipping an uncryptanalyzed primitive, which §1's own standard refuses to do. Still open, by design, not by omission. |
+| MPC DKG complaint protocol | `identify_faulty_dealers` needed every dealer's shares visible to one process. | Closed (`ENGINEERING-STANDARDS.md` §6.24): `Complaint`/`Dealer::share_for`/`resolve_complaint` give the real per-accusation building block — an accuser exhibits the bad share they received, the accused dealer discloses what their polynomial actually evaluates to, and every other participant recomputes the same `ComplaintVerdict` independently. The broadcast transport itself is still the caller's problem, the same boundary `Dealer` already drew for the commit/reveal round. |
+| ORAM payload confidentiality | `Block` carried `id` and `value` in the clear even in `InMemoryServer`. | Closed (`ENGINEERING-STANDARDS.md` §6.24): `EncryptingServerStorage` is an opt-in `ServerStorage` decorator that AEAD-seals `id` and `value` together before either reaches the inner storage, composing with `VerifiableServerStorage` (§6) so a server that corrupts, drops, or replays a block still surfaces as `IntegrityError`, not a panic or silently missing data. Key distribution remains the caller's problem, the same boundary `novachannel::handshake`'s identity pinning already draws. |
+| DP size-correlation side channel | DP was strictly scoped to the presence bit; message size was unaddressed. | Closed for size (`ENGINEERING-STANDARDS.md` §6.24): `SizeBucketer` pads plaintext up to one of a fixed set of byte-length buckets before encryption, so ciphertext length reveals only which bucket a message fell into. Timing/latency correlation remains open — closing it means actually scheduling traffic (real sends delayed to a grid, not just padded), a materially larger undertaking than a padding function, not attempted here. |
+| PKI/directory-service distribution | Account PKI and `SignedDeviceList` distribution have no built-in transport. | Still open, and not really fixable *inside this library*: a directory service is a network service with its own trust and availability model, the same "trust/transport provisioning is the caller's problem" boundary every other module in this workspace already draws (`crate::handshake`'s peer-identity pinning, §4.2, §4.4). |
 
 Stated plainly, per §1:
 

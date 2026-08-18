@@ -44,13 +44,26 @@
 //! # What this doesn't cover
 //! - **Timing/latency side channels.** A real message is sent immediately;
 //!   this crate says nothing about correlating queueing delay or
-//!   request/response timing across the wider system.
-//! - **Volume/size side channels.** Padding message *content* to a fixed
-//!   size is a separate, simpler problem, not addressed here.
+//!   request/response timing across the wider system. Unlike the size
+//!   side channel below, closing this would mean actually scheduling
+//!   traffic (real sends delayed to a grid, not just padded) — a materially
+//!   larger, separate undertaking than a padding function, and not
+//!   attempted here.
 //! - **Non-independent slots.** The composition bounds assume the
 //!   dummy-injection coin flips are drawn independently per slot with a
 //!   fresh CSPRNG draw each time; reusing randomness across slots breaks
 //!   the guarantee.
+//!
+//! [`SizeBucketer`] closes the other side channel this module used to
+//! leave open: padding a message's *content* to one of a fixed set of
+//! sizes before it's encrypted, so an observer of ciphertext length learns
+//! only which bucket a message fell into, not its exact size. This is a
+//! genuinely separate, much simpler mechanism than the presence-bit DP
+//! above — no epsilon, no composition math, just a length-hiding pad/unpad
+//! pair — composed by the caller with whatever does the actual encryption
+//! (`novachannel`, most naturally): pad the plaintext first, then seal the
+//! padded bytes, so the padding itself is never visible to an observer,
+//! only the resulting bucket size is.
 
 #![forbid(unsafe_code)]
 // Every `.unwrap()` this catches either gets replaced with a
@@ -195,6 +208,149 @@ impl Budget {
     }
 }
 
+// SIZE BUCKETING
+// ================================================================================================
+//
+// A separate, independent mechanism from the presence-bit DP above (module
+// docs): closes the size-correlation side channel by padding plaintext
+// content up to one of a fixed set of byte-length "buckets" before
+// encryption, so ciphertext length reveals only which bucket a message
+// fell into, not its exact size.
+
+const LENGTH_PREFIX_LEN: usize = 4;
+
+/// Returned by [`SizeBucketer::pad`]/[`SizeBucketer::unpad`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaddingError {
+    /// The plaintext, plus the 4-byte length prefix `pad` adds, is larger
+    /// than every configured bucket — there is no bucket size that would
+    /// hide it. The caller needs either a larger bucket or to split the
+    /// message.
+    MessageTooLargeForAnyBucket,
+    /// `unpad`'s input is shorter than the length prefix, or the prefix
+    /// claims more content bytes than the padded buffer actually holds.
+    /// Composed with an authenticated channel (the documented intended
+    /// use — module docs), this should only ever be reachable via a
+    /// caller bug: a genuinely tampered message already fails that
+    /// channel's own AEAD verification before its plaintext ever reaches
+    /// `unpad`.
+    Malformed,
+}
+
+impl std::fmt::Display for PaddingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PaddingError::MessageTooLargeForAnyBucket => write!(
+                f,
+                "message plus its length prefix exceeds every configured padding bucket"
+            ),
+            PaddingError::Malformed => write!(
+                f,
+                "padded input is too short, or its length prefix is inconsistent with its size"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PaddingError {}
+
+/// Pads plaintext up to a fixed set of size buckets so a passive observer
+/// of ciphertext length learns only which bucket a message fell into —
+/// see the module docs' "What this doesn't cover" section for the full
+/// scope and how this composes with an actual encrypted channel.
+#[derive(Clone, Debug)]
+pub struct SizeBucketer {
+    /// Strictly increasing, deduplicated bucket sizes in bytes.
+    buckets: Vec<usize>,
+}
+
+impl SizeBucketer {
+    /// `bucket_sizes` need not be sorted or deduplicated — both happen
+    /// here. Any bucket smaller than the length-prefix overhead `pad`
+    /// itself adds is dropped first, since no plaintext (not even an
+    /// empty one) could ever fit in it.
+    ///
+    /// # Panics
+    /// Panics if this leaves zero usable buckets.
+    pub fn new(bucket_sizes: impl IntoIterator<Item = usize>) -> Self {
+        let mut buckets: Vec<usize> = bucket_sizes
+            .into_iter()
+            .filter(|&b| b >= LENGTH_PREFIX_LEN)
+            .collect();
+        buckets.sort_unstable();
+        buckets.dedup();
+        assert!(
+            !buckets.is_empty(),
+            "SizeBucketer needs at least one bucket >= the length-prefix overhead ({LENGTH_PREFIX_LEN} bytes)"
+        );
+        SizeBucketer { buckets }
+    }
+
+    /// Powers of two from `2^min_log2` through `2^max_log2` bytes
+    /// inclusive — the conventional choice (the same shape Tor cell
+    /// padding uses) when there's no application-specific size
+    /// distribution to tune buckets against instead.
+    ///
+    /// # Panics
+    /// Panics if `min_log2 > max_log2`.
+    pub fn power_of_two_buckets(min_log2: u32, max_log2: u32) -> Self {
+        assert!(min_log2 <= max_log2, "min_log2 must be <= max_log2");
+        Self::new((min_log2..=max_log2).map(|k| 1usize << k))
+    }
+
+    /// The configured bucket sizes, sorted ascending.
+    pub fn buckets(&self) -> &[usize] {
+        &self.buckets
+    }
+
+    /// Pads `plaintext` up to the smallest configured bucket that fits
+    /// `plaintext.len()` plus the length prefix. Encrypt the *result*, not
+    /// `plaintext` directly, for the padding to hide anything — an
+    /// observer who only ever sees the padded bytes in the clear learns
+    /// nothing this function was meant to hide.
+    pub fn pad(&self, plaintext: &[u8]) -> Result<Vec<u8>, PaddingError> {
+        if plaintext.len() > u32::MAX as usize {
+            return Err(PaddingError::MessageTooLargeForAnyBucket);
+        }
+        let needed = plaintext
+            .len()
+            .checked_add(LENGTH_PREFIX_LEN)
+            .ok_or(PaddingError::MessageTooLargeForAnyBucket)?;
+        let bucket = self
+            .buckets
+            .iter()
+            .find(|&&b| b >= needed)
+            .copied()
+            .ok_or(PaddingError::MessageTooLargeForAnyBucket)?;
+
+        let mut out = Vec::with_capacity(bucket);
+        out.extend_from_slice(&(plaintext.len() as u32).to_be_bytes());
+        out.extend_from_slice(plaintext);
+        out.resize(bucket, 0u8);
+        Ok(out)
+    }
+
+    /// Inverse of [`Self::pad`]: recovers the original plaintext, dropping
+    /// the trailing pad bytes.
+    pub fn unpad(&self, padded: &[u8]) -> Result<Vec<u8>, PaddingError> {
+        if padded.len() < LENGTH_PREFIX_LEN {
+            return Err(PaddingError::Malformed);
+        }
+        let len = u32::from_be_bytes(
+            padded[..LENGTH_PREFIX_LEN]
+                .try_into()
+                .expect("checked length"),
+        ) as usize;
+        let end = LENGTH_PREFIX_LEN
+            .checked_add(len)
+            .ok_or(PaddingError::Malformed)?;
+        if end > padded.len() {
+            return Err(PaddingError::Malformed);
+        }
+        Ok(padded[LENGTH_PREFIX_LEN..end].to_vec())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,5 +432,96 @@ mod tests {
         assert!((b.spent() - 1.0).abs() < 1e-9);
         assert_eq!(b.slots_remaining(), 0);
         assert!(!b.spend_slot());
+    }
+
+    #[test]
+    fn pad_then_unpad_round_trips_for_a_range_of_lengths() {
+        let bucketer = SizeBucketer::power_of_two_buckets(4, 13);
+        for len in [0usize, 1, 15, 16, 17, 255, 4000, 4092] {
+            let plaintext: Vec<u8> = (0..len).map(|i| (i % 256) as u8).collect();
+            let padded = bucketer.pad(&plaintext).unwrap();
+            assert_eq!(bucketer.unpad(&padded).unwrap(), plaintext);
+        }
+    }
+
+    #[test]
+    fn padded_output_length_always_matches_a_configured_bucket() {
+        let bucketer = SizeBucketer::power_of_two_buckets(4, 12);
+        for len in [0usize, 1, 100, 4092] {
+            let padded = bucketer.pad(&vec![0u8; len]).unwrap();
+            assert!(
+                bucketer.buckets().contains(&padded.len()),
+                "padded length {} is not one of the configured buckets",
+                padded.len()
+            );
+        }
+    }
+
+    /// The actual property that matters: two plaintexts of different
+    /// lengths that land in the *same* bucket produce identically-sized
+    /// padded output — an observer of ciphertext length alone cannot
+    /// distinguish them.
+    #[test]
+    fn messages_in_the_same_bucket_produce_identical_padded_lengths() {
+        let bucketer = SizeBucketer::power_of_two_buckets(4, 12);
+        // Both need a bucket >= len + 4: 130 -> 256, 250 -> 256 — same
+        // bucket, different plaintext lengths.
+        let short = bucketer.pad(&[0xAAu8; 130]).unwrap();
+        let long = bucketer.pad(&[0xBBu8; 250]).unwrap();
+        assert_eq!(short.len(), long.len());
+        assert_eq!(short.len(), 256);
+        assert_ne!(short, long);
+    }
+
+    #[test]
+    fn a_message_larger_than_every_bucket_is_rejected() {
+        let bucketer = SizeBucketer::power_of_two_buckets(4, 8); // largest bucket: 256 bytes
+        let plaintext = vec![0u8; 10_000];
+        assert_eq!(
+            bucketer.pad(&plaintext),
+            Err(PaddingError::MessageTooLargeForAnyBucket)
+        );
+    }
+
+    #[test]
+    fn unpad_rejects_a_too_short_buffer_not_panicked_on() {
+        let bucketer = SizeBucketer::power_of_two_buckets(4, 8);
+        assert_eq!(bucketer.unpad(&[]), Err(PaddingError::Malformed));
+        assert_eq!(bucketer.unpad(&[1, 2, 3]), Err(PaddingError::Malformed));
+    }
+
+    #[test]
+    fn unpad_rejects_a_length_prefix_claiming_more_than_the_buffer_holds() {
+        let bucketer = SizeBucketer::power_of_two_buckets(4, 8);
+        // A length prefix claiming 1000 content bytes, in a 16-byte buffer.
+        let mut forged = 1000u32.to_be_bytes().to_vec();
+        forged.resize(16, 0);
+        assert_eq!(bucketer.unpad(&forged), Err(PaddingError::Malformed));
+    }
+
+    #[test]
+    fn duplicate_and_unsorted_bucket_sizes_are_normalized() {
+        let bucketer = SizeBucketer::new([64, 16, 64, 32, 16]);
+        assert_eq!(bucketer.buckets(), &[16, 32, 64]);
+    }
+
+    #[test]
+    fn buckets_smaller_than_the_length_prefix_are_dropped() {
+        let bucketer = SizeBucketer::new([1, 2, 3, 64]);
+        assert_eq!(bucketer.buckets(), &[64]);
+    }
+
+    #[test]
+    #[should_panic(expected = "needs at least one bucket")]
+    fn no_usable_buckets_panics_rather_than_silently_accepting_nothing() {
+        SizeBucketer::new([1, 2, 3]);
+    }
+
+    #[test]
+    fn padding_error_has_a_human_readable_display() {
+        assert!(PaddingError::MessageTooLargeForAnyBucket
+            .to_string()
+            .contains("bucket"));
+        assert!(PaddingError::Malformed.to_string().contains("length"));
     }
 }

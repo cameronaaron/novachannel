@@ -11,6 +11,11 @@ workspace = true
 [dependencies]
 rand = "0.10"
 sha2 = "0.11"
+# `EncryptingServerStorage`'s confidentiality layer -- same AEAD crate and
+# version this workspace already uses everywhere else (`novachannel`,
+# `novachannel-mpc`).
+chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
+zeroize = "1"
 
 [dev-dependencies]
 rand_chacha = "0.10"

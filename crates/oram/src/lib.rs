@@ -35,11 +35,19 @@
 //! — the batteries-included default for when you don't need a different
 //! `ServerStorage`.
 //!
-//! One thing this split does *not* do: [`Block`] carries `id` and `value`
-//! in the clear even in [`InMemoryServer`]. A real deployment's
-//! `ServerStorage` implementation must encrypt both before they leave the
-//! client — this crate provides the access-pattern obliviousness, not
-//! confidentiality of what's stored, which is `novachannel`'s job.
+//! One thing this split does *not* do on its own: [`Block`] carries `id`
+//! and `value` in the clear in [`InMemoryServer`]. [`EncryptingServerStorage`]
+//! (the CONFIDENTIALITY section, below) closes that for the common case —
+//! opaque `Vec<u8>` values, e.g. serialized rate-limit counters or
+//! nullifier-set entries, the module docs' own motivating example — as an
+//! opt-in [`ServerStorage`] decorator requiring no change to [`Client`].
+//! What it does not do: manage or distribute the AEAD key it's
+//! constructed with, the same "key provisioning is the caller's problem"
+//! boundary `novachannel::handshake`'s peer-identity pinning already draws
+//! — this crate provides access-pattern obliviousness and, opt-in,
+//! confidentiality of what's stored; it was never going to be the place a
+//! key-distribution system lives, any more than `novachannel-oram` is the
+//! place `novachannel`'s own key exchange lives.
 //!
 //! # Algorithm
 //! Standard Path ORAM (Stefanov et al., CCS 2013): a binary tree of
@@ -637,6 +645,191 @@ impl<V: Clone + AsRef<[u8]>, S: VerifiableServerStorage<V>> Client<V, S> {
     }
 }
 
+// CONFIDENTIALITY
+// ================================================================================================
+//
+// The INTEGRITY section above closes the gap between "the server can't
+// tell which block an access targets" and "the server can't get away with
+// tampering, dropping, or replaying what it stores." This section closes
+// a different, independent gap the module docs name directly: obliviousness
+// and integrity both say nothing about whether the server can just *read*
+// `Block::value` outright, since [`InMemoryServer`]/[`IntegrityCheckedServer`]
+// store it exactly as given.
+//
+// [`EncryptingServerStorage`] is a [`ServerStorage`] decorator, the same
+// composability pattern [`IntegrityCheckedServer`] already demonstrates
+// requires no change to [`Client`]: it sits between `Client` and whatever
+// `ServerStorage` actually reaches the untrusted server, AEAD-sealing each
+// block's `id` and `value` *together* into one opaque ciphertext before
+// handing it to `inner` (with a throwaway `id` of `0` on the physical
+// block `inner` sees — the real id lives only inside the ciphertext), and
+// unsealing on the way back. Sealing `id`, not just `value`, matters:
+// leaving the logical block id in the clear next to an now-opaque value
+// would still let a server watching writes correlate "id X's ciphertext
+// changed" across accesses, a real leak independent of which physical
+// bucket it landed in.
+//
+// Composing with [`VerifiableServerStorage`] (`Client<Vec<u8>,
+// EncryptingServerStorage<IntegrityCheckedServer<Vec<u8>>>>`) needs no
+// third implementation either, and gets both properties at once: `Client`
+// computes its Merkle hashes over the *plaintext* blocks this layer hands
+// back (§6.13-style "compose via bytes", not two hashing implementations
+// that could drift apart), so a server that tampers with, drops, or
+// replays ciphertext changes what a bucket decrypts to (or means nothing
+// decrypts at all), which changes the plaintext bucket's hash, which
+// `Client::verified_read`/`verified_write` already catches as
+// `IntegrityError` — this layer doesn't need its own separate tamper
+// detection. The one narrow case worth naming: an AEAD authentication
+// failure (raw ciphertext bit-corruption, not a whole-bucket
+// swap/replay/drop, all of which decrypt cleanly per-block and get caught
+// by the Merkle check instead) makes `read_and_clear` drop that one block
+// from the bucket it returns rather than panic — a missing block still
+// changes the bucket's plaintext hash, so `verified_read`/`verified_write`
+// still surface it as `IntegrityError`, not as a crash or a silent wrong
+// answer. Used *without* the integrity layer (`EncryptingServerStorage<
+// InMemoryServer<Vec<u8>>>`, plain `Client::read`/`Client::write`), a
+// corrupted block just silently vanishes from the tree instead — no
+// worse than that path's existing, already-documented "nothing stops an
+// active server from tampering" baseline (module docs, above), just no
+// panic either.
+
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use zeroize::Zeroize;
+
+const ORAM_NONCE_LEN: usize = 12;
+const ORAM_ID_LEN: usize = 8;
+
+/// One AEAD-sealed block: a 12-byte nonce prefix followed by the
+/// ChaCha20-Poly1305 ciphertext of `id.to_be_bytes() || value`.
+fn seal_oram_block(
+    key: &[u8; 32],
+    nonce: [u8; ORAM_NONCE_LEN],
+    id: BlockId,
+    value: &[u8],
+) -> Vec<u8> {
+    let mut plaintext = Vec::with_capacity(ORAM_ID_LEN + value.len());
+    plaintext.extend_from_slice(&id.to_be_bytes());
+    plaintext.extend_from_slice(value);
+    let ciphertext = ChaCha20Poly1305::new(&Key::from(*key))
+        .encrypt(&Nonce::from(nonce), plaintext.as_slice())
+        .expect("ChaCha20Poly1305 encryption over a bounded plaintext cannot fail");
+    let mut out = Vec::with_capacity(ORAM_NONCE_LEN + ciphertext.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ciphertext);
+    out
+}
+
+/// Inverse of [`seal_oram_block`]. `None` on authentication failure or a
+/// malformed length — see the section doc comment above for why the
+/// caller (`EncryptingServerStorage::read_and_clear`) treats that as "drop
+/// this block" rather than panicking.
+fn open_oram_block(key: &[u8; 32], sealed: &[u8]) -> Option<(BlockId, Vec<u8>)> {
+    if sealed.len() < ORAM_NONCE_LEN {
+        return None;
+    }
+    let (nonce_bytes, ciphertext) = sealed.split_at(ORAM_NONCE_LEN);
+    let nonce: [u8; ORAM_NONCE_LEN] = nonce_bytes
+        .try_into()
+        .expect("split_at(ORAM_NONCE_LEN) already guarantees the length");
+    let plaintext = ChaCha20Poly1305::new(&Key::from(*key))
+        .decrypt(&Nonce::from(nonce), ciphertext)
+        .ok()?;
+    if plaintext.len() < ORAM_ID_LEN {
+        return None;
+    }
+    let (id_bytes, value) = plaintext.split_at(ORAM_ID_LEN);
+    let id = BlockId::from_be_bytes(
+        id_bytes
+            .try_into()
+            .expect("split_at(ORAM_ID_LEN) already guarantees the length"),
+    );
+    Some((id, value.to_vec()))
+}
+
+/// A [`ServerStorage<Vec<u8>>`] decorator that AEAD-seals every block
+/// before it reaches `inner` — see the section doc comment above for the
+/// full threat model and how this composes with [`VerifiableServerStorage`].
+pub struct EncryptingServerStorage<S> {
+    inner: S,
+    key: [u8; 32],
+    /// A strictly monotonic per-block nonce counter, not a random nonce:
+    /// one key here can seal many blocks over a long-lived deployment, and
+    /// ChaCha20-Poly1305 is catastrophic under nonce reuse, so a counter
+    /// (which *cannot* collide short of 2^64 blocks under one key) is the
+    /// safer choice over relying on a random 96-bit nonce's birthday bound.
+    nonce_counter: u64,
+}
+
+impl<S> Drop for EncryptingServerStorage<S> {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
+}
+
+impl<S> EncryptingServerStorage<S> {
+    /// `key` is a caller-provisioned 32-byte AEAD key — distributing and
+    /// rotating it is the caller's problem (module docs).
+    pub fn new(inner: S, key: [u8; 32]) -> Self {
+        EncryptingServerStorage {
+            inner,
+            key,
+            nonce_counter: 0,
+        }
+    }
+
+    fn next_nonce(&mut self) -> [u8; ORAM_NONCE_LEN] {
+        let n = self.nonce_counter;
+        self.nonce_counter = self.nonce_counter.checked_add(1).expect(
+            "EncryptingServerStorage's nonce counter exhausted (2^64 blocks written under one key) -- rotate the key",
+        );
+        let mut nonce = [0u8; ORAM_NONCE_LEN];
+        nonce[ORAM_NONCE_LEN - 8..].copy_from_slice(&n.to_be_bytes());
+        nonce
+    }
+}
+
+impl<S: ServerStorage<Vec<u8>>> ServerStorage<Vec<u8>> for EncryptingServerStorage<S> {
+    fn read_and_clear(&mut self, node: usize) -> Vec<Block<Vec<u8>>> {
+        self.inner
+            .read_and_clear(node)
+            .into_iter()
+            .filter_map(|sealed| open_oram_block(&self.key, &sealed.value))
+            .map(|(id, value)| Block { id, value })
+            .collect()
+    }
+
+    fn write(&mut self, node: usize, blocks: Vec<Block<Vec<u8>>>) {
+        let sealed = blocks
+            .into_iter()
+            .map(|b| {
+                let nonce = self.next_nonce();
+                Block {
+                    id: 0,
+                    value: seal_oram_block(&self.key, nonce, b.id, &b.value),
+                }
+            })
+            .collect();
+        self.inner.write(node, sealed);
+    }
+
+    fn bucket_capacity(&self) -> usize {
+        self.inner.bucket_capacity()
+    }
+}
+
+impl<S: VerifiableServerStorage<Vec<u8>>> VerifiableServerStorage<Vec<u8>>
+    for EncryptingServerStorage<S>
+{
+    fn node_hash(&self, node: usize) -> [u8; 32] {
+        self.inner.node_hash(node)
+    }
+
+    fn set_node_hash(&mut self, node: usize, hash: [u8; 32]) {
+        self.inner.set_node_hash(node, hash);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -873,5 +1066,118 @@ mod tests {
         client.server.inner.buckets[1] = stale_root_bucket;
 
         assert_eq!(client.verified_read(2, &mut rng), Err(IntegrityError));
+    }
+
+    fn encrypting_client(
+        capacity_leaves: u64,
+        bucket_capacity: usize,
+        key: [u8; 32],
+    ) -> Client<Vec<u8>, EncryptingServerStorage<InMemoryServer<Vec<u8>>>> {
+        let depth = depth_for_capacity(capacity_leaves);
+        let num_leaves = 1u64 << depth;
+        let inner = InMemoryServer::new((2 * num_leaves) as usize, bucket_capacity);
+        Client::with_server(depth, EncryptingServerStorage::new(inner, key))
+    }
+
+    #[test]
+    fn encrypting_storage_round_trips_values_and_never_stores_them_in_the_clear() {
+        let key = [7u8; 32];
+        let mut client = encrypting_client(64, 4, key);
+        let mut rng = ChaCha20Rng::seed_from_u64(20);
+
+        let secret_marker = b"totally-secret-rate-limit-counter".to_vec();
+        assert_eq!(client.write(1, secret_marker.clone(), &mut rng), None);
+        assert_eq!(client.read(1, &mut rng), Some(secret_marker.clone()));
+
+        // Confidentiality, checked directly rather than assumed: the
+        // marker plaintext must not appear anywhere in what the
+        // (would-be untrusted) inner server physically holds.
+        for bucket in &client.server.inner.buckets {
+            for block in bucket {
+                assert_ne!(block.value, secret_marker);
+                assert!(
+                    !block
+                        .value
+                        .windows(secret_marker.len())
+                        .any(|w| w == secret_marker.as_slice()),
+                    "plaintext leaked into server-visible storage"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn encrypting_storage_with_the_wrong_key_does_not_decrypt() {
+        let mut writer = encrypting_client(64, 4, [1u8; 32]);
+        let mut rng = ChaCha20Rng::seed_from_u64(21);
+        assert_eq!(writer.write(5, b"value".to_vec(), &mut rng), None);
+
+        // Every ciphertext physically stored, opened with the wrong key,
+        // must fail authentication rather than return garbage plaintext.
+        let mut any_ciphertext_present = false;
+        for bucket in &writer.server.inner.buckets {
+            for block in bucket {
+                any_ciphertext_present = true;
+                assert_eq!(open_oram_block(&[2u8; 32], &block.value), None);
+            }
+        }
+        assert!(
+            any_ciphertext_present,
+            "test setup expects at least one block still resident in a bucket"
+        );
+    }
+
+    fn encrypting_verified_client(
+        capacity_leaves: u64,
+        bucket_capacity: usize,
+        key: [u8; 32],
+    ) -> Client<Vec<u8>, EncryptingServerStorage<IntegrityCheckedServer<Vec<u8>>>> {
+        let depth = depth_for_capacity(capacity_leaves);
+        let num_leaves = 1u64 << depth;
+        let inner = IntegrityCheckedServer::new((2 * num_leaves) as usize, bucket_capacity);
+        let mut client = Client::with_server(depth, EncryptingServerStorage::new(inner, key));
+        client.init_empty_root();
+        client
+    }
+
+    #[test]
+    fn encrypting_storage_composes_with_integrity_checking() {
+        let mut client = encrypting_verified_client(64, 4, [9u8; 32]);
+        let mut rng = ChaCha20Rng::seed_from_u64(22);
+
+        for id in 0..20u64 {
+            assert_eq!(
+                client.verified_write(id, vec![id as u8; 3], &mut rng),
+                Ok(None)
+            );
+        }
+        for id in 0..20u64 {
+            assert_eq!(
+                client.verified_read(id, &mut rng),
+                Ok(Some(vec![id as u8; 3]))
+            );
+        }
+    }
+
+    #[test]
+    fn a_corrupted_ciphertext_is_caught_as_an_integrity_error_not_a_panic() {
+        let mut client = encrypting_verified_client(64, 4, [3u8; 32]);
+        let mut rng = ChaCha20Rng::seed_from_u64(23);
+
+        client.verified_write(1, vec![1, 2, 3], &mut rng).unwrap();
+
+        // Flip a byte inside the root bucket's ciphertext directly on the
+        // physical (would-be untrusted) storage, bypassing `Client`
+        // entirely. Every access touches the root, so the very next
+        // verified access must detect this — as `IntegrityError`, per the
+        // CONFIDENTIALITY section's doc comment, not a decrypt panic.
+        let root_bucket = &mut client.server.inner.inner.buckets[1];
+        assert!(
+            !root_bucket.is_empty(),
+            "test setup expects the root bucket to hold the block just written"
+        );
+        root_bucket[0].value[ORAM_NONCE_LEN] ^= 0xFF;
+
+        assert_eq!(client.verified_read(1, &mut rng), Err(IntegrityError));
     }
 }
