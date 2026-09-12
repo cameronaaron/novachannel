@@ -785,6 +785,21 @@ impl RatchetedSession {
         if self.pending.is_some() {
             return Err(Error::RatchetInProgress);
         }
+        // A step 1 is only ever legitimate on the *current* epoch's
+        // receive chain. `Self::open` also accepts records on the
+        // immediately-preceding epoch's chain (that's what makes records
+        // in flight across an epoch transition deliverable), and a peer
+        // who still holds that chain's keys can seal a well-formed step 1
+        // on it at a fresh sequence number. `advance_epoch(epoch)` would
+        // then derive `epoch + 1` — a number this side has *already*
+        // used — leaving two differently-keyed chains both labelled with
+        // the same epoch and a send chain the peer can no longer read.
+        // Epoch numbers have to be monotonic for the `current`/`previous`
+        // slot scheme to mean anything, so this rejects rather than
+        // silently desynchronizing the session.
+        if epoch != self.send_epoch {
+            return Err(Error::WrongState);
+        }
         let mut r = Reader::new(payload);
         let peer_x25519 = kex::x25519_public_from_bytes(r.get_fixed(32)?)?;
         let peer_ml_kem = kex::ml_kem_public_from_bytes(r.get_var()?)?;
@@ -969,8 +984,12 @@ impl RatchetedSession {
                     None => return Ok(ChunkOutcome::StillAccumulating),
                 };
 
-                let kex = self.pending.take().expect("checked Some above");
-
+                // Parse and complete the exchange *before* consuming
+                // `self.pending`: taking it first meant any failure below
+                // (a malformed reconstruction, a KEX that doesn't finish)
+                // destroyed this side's ephemeral KEX material on the way
+                // out, permanently stranding a ratchet step that a
+                // retried reply could otherwise still have completed.
                 let mut r = Reader::new(&reconstructed);
                 let peer_x25519 = kex::x25519_public_from_bytes(r.get_fixed(32)?)?;
                 let ml_kem_ct = kex::ml_kem_ciphertext_from_bytes(r.get_var()?)?;
@@ -980,6 +999,7 @@ impl RatchetedSession {
                     ));
                 }
 
+                let kex = self.pending.take().expect("checked Some above");
                 let shared_secret = kex.finish(&peer_x25519, &ml_kem_ct)?;
                 let (new_root, new_send, new_recv) =
                     derive_next_epoch(&self.root_key, &shared_secret, true);
@@ -1243,6 +1263,94 @@ mod tests {
         // The mismatched reply must not have consumed the real pending
         // ratchet — a later, correctly-tagged reply should still work.
         assert!(client.pending.is_some());
+    }
+
+    /// `Self::open` deliberately accepts records on the previous epoch's
+    /// receive chain so in-flight application records survive an epoch
+    /// transition. A peer still holding that chain's keys can therefore
+    /// seal a well-formed *ratchet step 1* on it too — and before the
+    /// fix, `advance_epoch(epoch)` then re-derived an epoch number this
+    /// side had already used, leaving two differently-keyed chains
+    /// labelled with the same epoch and a send chain the peer could no
+    /// longer read. Reached through the private `handle_step1` for the
+    /// same reason the `handle_step2` tests above are: no honest caller
+    /// of the public API ever produces this.
+    #[test]
+    fn a_step1_tagged_with_a_stale_epoch_is_rejected_and_leaves_the_epoch_untouched() {
+        let (mut client, mut server) = pair();
+
+        // One real ratchet, so the server sits at epoch 1 with a live
+        // epoch-0 chain still in its `previous` slot.
+        let step1 = client.initiate_ratchet().unwrap();
+        let reply = match server.open(&step1).unwrap() {
+            Opened::RatchetAdvanced { reply: Some(reply) } => reply,
+            _ => panic!("the server's first step 1 must produce a reply"),
+        };
+        client.open(&reply).unwrap();
+        assert_eq!(server.send_epoch, 1);
+        assert_eq!(server.recv_previous.as_ref().map(|p| p.epoch), Some(0));
+
+        let kex = InitiatorKex::generate();
+        let mut w = Writer::new();
+        w.put_fixed(kex.x25519_public().as_bytes());
+        w.put_var(&kex.ml_kem_public().to_bytes());
+
+        assert!(matches!(
+            server.handle_step1(0, &w.0),
+            Err(Error::WrongState)
+        ));
+        assert_eq!(server.send_epoch, 1, "a rejected step 1 must not advance");
+        assert_eq!(server.recv_current.epoch, 1);
+
+        // The same step 1, correctly tagged with the current epoch, is
+        // still accepted — so the check above rejects the stale epoch,
+        // not step 1 generally.
+        assert!(server.handle_step1(1, &w.0).is_ok());
+        assert_eq!(server.send_epoch, 2);
+    }
+
+    /// A reconstruction that decrypts (so it really came from the peer)
+    /// but doesn't parse must leave this side's pending KEX material
+    /// intact: consuming it on the failure path permanently stranded a
+    /// ratchet step a retried reply could still have completed.
+    #[test]
+    fn a_malformed_incremental_step2_reconstruction_leaves_the_pending_ratchet_intact() {
+        let (mut client, _server) = pair();
+        client.initiate_incremental_ratchet(2, 1).unwrap();
+        assert!(client.pending.is_some());
+
+        // Chunks sealed under the key the client itself will derive, so
+        // they authenticate — but carrying a payload that is not a valid
+        // step-2 body (32 bytes of x25519, then nothing where the ML-KEM
+        // ciphertext's length prefix must be).
+        let attempt_nonce = generate_attempt_nonce();
+        let chunk_key =
+            derive_chunk_key(&client.root_key, &attempt_nonce, LABEL_CHUNK_KEY_STEP2).unwrap();
+        let records = build_chunk_records(
+            MSG_RATCHET_STEP2_CHUNK,
+            &chunk_key,
+            &attempt_nonce,
+            &[0xAAu8; 32],
+            2,
+            1,
+        )
+        .unwrap();
+
+        // Exactly `data_shards` of them: the second is what triggers
+        // reconstruction. Feeding the third as well would only start a
+        // fresh accumulator, since a completed attempt clears the slot.
+        assert!(matches!(
+            client.open_ratchet_chunk(&records[0]),
+            Ok(ChunkOutcome::StillAccumulating)
+        ));
+        assert!(matches!(
+            client.open_ratchet_chunk(&records[1]),
+            Err(Error::Malformed(_))
+        ));
+        assert!(
+            client.pending.is_some(),
+            "a failed reconstruction must not consume the pending KEX material"
+        );
     }
 
     #[test]
