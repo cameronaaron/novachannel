@@ -69,3 +69,25 @@ fn a_record_far_outside_the_replay_window_is_rejected() {
 
     assert!(matches!(receiver.open(&stale), Err(Error::Replay)));
 }
+
+#[test]
+fn replay_window_boundaries_preserve_seen_records_and_accept_unseen_records() {
+    for jump in [1usize, 63, 64, 65, 128] {
+        let (mut sender, mut receiver) = pair();
+        let records: Vec<_> = (0..=jump)
+            .map(|_| sender.seal(b"record").unwrap())
+            .collect();
+        receiver.open(&records[0]).unwrap();
+        receiver.open(&records[jump]).unwrap();
+        assert!(
+            matches!(receiver.open(&records[0]), Err(Error::Replay)),
+            "jump {jump}"
+        );
+        for index in (1..jump).rev() {
+            if jump - index <= 64 {
+                assert_eq!(receiver.open(&records[index]).unwrap(), b"record");
+            }
+            assert!(matches!(receiver.open(&records[index]), Err(Error::Replay)));
+        }
+    }
+}

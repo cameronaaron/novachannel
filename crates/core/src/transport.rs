@@ -93,7 +93,7 @@ impl Sender {
 pub struct Receiver {
     key: DirectionalKey,
     highest_seq: Option<u64>,
-    window: u64, // bit i set => (highest_seq - i) already seen
+    window: u64, // bit i set => (highest_seq - i - 1) already seen
 }
 
 impl Receiver {
@@ -169,8 +169,12 @@ impl Receiver {
             }
             Some(highest) if seq > highest => {
                 let shift = seq - highest;
-                self.window = if shift >= REPLAY_WINDOW {
+                self.window = if shift > REPLAY_WINDOW {
                     0
+                } else if shift == REPLAY_WINDOW {
+                    // The old highest record is still inside the inclusive
+                    // window. Preserve it without shifting a u64 by 64.
+                    1 << (REPLAY_WINDOW - 1)
                 } else {
                     (self.window << shift) | (1 << (shift - 1))
                 };
