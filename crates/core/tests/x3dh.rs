@@ -378,3 +378,116 @@ fn from_bytes_rejects_garbage() {
     let result = PreKeyBundle::from_bytes(&[0u8; 4]);
     assert!(result.is_err());
 }
+
+/// A one-time prekey must survive a garbage init message that references
+/// it. It has to be *used* to derive the key that authenticates such a
+/// message, but deleting it before that authentication succeeds let an
+/// unauthenticated attacker burn a responder's entire published supply —
+/// downgrading every subsequent honest session to the no-OPK path, which
+/// is a real forward-secrecy loss (`OneTimePreKey`'s own docs on why the
+/// fourth DH term and the single-use ML-KEM leg exist).
+#[test]
+fn a_forged_init_message_does_not_burn_the_one_time_prekey_it_references() {
+    let responder_identity = Identity::generate();
+    let responder_dh = DhIdentity::generate();
+    let responder_spk = SignedPreKey::generate(&responder_identity);
+    let mut opks = OneTimePreKeyStore::new();
+    opks.add(OneTimePreKey::generate(77));
+
+    let initiator_identity = Identity::generate();
+    let initiator_dh = DhIdentity::generate();
+    let bundle = PreKeyBundle::build(
+        responder_identity.public(),
+        &responder_dh,
+        &responder_spk,
+        opks.public_keys().first().cloned(),
+    );
+
+    // A genuine init message, then corrupted: its sealed payload will not
+    // authenticate, so nothing about it is evidence the prekey was used.
+    let initiated = initiate(
+        &initiator_identity.public(),
+        &initiator_dh,
+        &bundle,
+        b"hello",
+    )
+    .unwrap();
+    let mut forged = initiated.message.bytes.clone();
+    let last = forged.len() - 1;
+    forged[last] ^= 0xFF;
+
+    assert!(matches!(
+        respond(&responder_dh, &responder_spk, &mut opks, &forged),
+        Err(Error::Decrypt)
+    ));
+    assert_eq!(
+        opks.public_keys().len(),
+        1,
+        "a message that never authenticated must not consume a one-time prekey"
+    );
+
+    // The honest message still works, and *does* consume it...
+    let responded = respond(
+        &responder_dh,
+        &responder_spk,
+        &mut opks,
+        &initiated.message.bytes,
+    )
+    .unwrap();
+    assert_eq!(responded.initial_payload, b"hello");
+    assert!(
+        opks.public_keys().is_empty(),
+        "a one-time prekey must not survive the session that used it"
+    );
+
+    // ...so replaying it fails, which is the property consuming it exists
+    // to provide.
+    assert!(matches!(
+        respond(
+            &responder_dh,
+            &responder_spk,
+            &mut opks,
+            &initiated.message.bytes
+        ),
+        Err(Error::UnknownOneTimePreKey)
+    ));
+}
+
+/// An X25519 public key of small order forces the exchange's output to a
+/// fixed, publicly-known value however secret this side's key is. RFC 7748
+/// §6.1 recommends rejecting that; `kex::checked_dh` does, at every
+/// exchange in the crate, and this is the X3DH path through it.
+#[test]
+fn a_small_order_peer_key_is_rejected_rather_than_silently_contributing_nothing() {
+    use x25519_dalek::PublicKey as X25519Public;
+
+    let responder_identity = Identity::generate();
+    let responder_dh = DhIdentity::generate();
+    let responder_spk = SignedPreKey::generate(&responder_identity);
+    let initiator_identity = Identity::generate();
+    let initiator_dh = DhIdentity::generate();
+
+    // The canonical order-1 and order-2 encodings: u = 0 and u = p - 1.
+    let mut p_minus_one = [0xFFu8; 32];
+    p_minus_one[0] = 0xEC;
+    p_minus_one[31] = 0x7F;
+    let mut one = [0u8; 32];
+    one[0] = 1;
+    for small_order in [[0u8; 32], one, p_minus_one] {
+        let mut bundle = PreKeyBundle::build(
+            responder_identity.public(),
+            &responder_dh,
+            &responder_spk,
+            None,
+        );
+        bundle.dh_identity = X25519Public::from(small_order);
+
+        assert!(
+            matches!(
+                initiate(&initiator_identity.public(), &initiator_dh, &bundle, b"hi"),
+                Err(Error::Malformed(_))
+            ),
+            "small-order key {small_order:?} was accepted"
+        );
+    }
+}

@@ -71,7 +71,7 @@ impl InitiatorKex {
         responder_x25519_public: &X25519Public,
         ml_kem_ciphertext: &MlKemCiphertext,
     ) -> Result<SharedSecret> {
-        let dh = self.x25519_secret.diffie_hellman(responder_x25519_public);
+        let dh = checked_dh(self.x25519_secret.diffie_hellman(responder_x25519_public))?;
         let ml_kem_ss = self.ml_kem_secret.decapsulate(ml_kem_ciphertext);
         let mut combined = Vec::with_capacity(64);
         combined.extend_from_slice(dh.as_bytes());
@@ -94,7 +94,7 @@ pub fn responder_exchange(
     let mut rng = csprng();
     let x25519_secret = EphemeralSecret::random_from_rng(&mut rng);
     let x25519_public = X25519Public::from(&x25519_secret);
-    let dh = x25519_secret.diffie_hellman(initiator_x25519_public);
+    let dh = checked_dh(x25519_secret.diffie_hellman(initiator_x25519_public))?;
 
     let (ml_kem_ciphertext, ml_kem_ss) = initiator_ml_kem_public.encapsulate_with_rng(&mut rng);
 
@@ -107,6 +107,39 @@ pub fn responder_exchange(
         ml_kem_ciphertext,
         shared_secret: SharedSecret(combined),
     })
+}
+
+/// Rejects an X25519 exchange whose output is the all-zero point.
+///
+/// That happens exactly when the peer's public key has small order, which
+/// forces the shared secret to a fixed, publicly-known value no matter
+/// what secret this side holds — the peer's contribution to the exchange
+/// is nothing at all. RFC 7748 §6.1 recommends checking for it; this is
+/// that check, applied at every X25519 exchange in this crate.
+///
+/// It is done by inspecting the output rather than by blacklisting the
+/// small-order public-key encodings. The blacklist is a hand-transcribed
+/// table of twelve constants (canonical and non-canonical forms alike)
+/// and a single wrong byte in it silently weakens the check it exists to
+/// perform; the output test is one comparison that cannot be transcribed
+/// wrong and catches every case the table would, by construction.
+///
+/// No attack on this crate's *current* constructions is known to turn on
+/// this — every exchange here is hybrid, so the ML-KEM leg still carries
+/// the session even when the X25519 leg contributes nothing, and in each
+/// case the party who would supply such a key is the one whose own
+/// session it degrades. It is here because "the peer contributed no
+/// entropy" is a state no protocol in this crate has a reason to accept,
+/// and accepting it silently is what turns a future composition mistake
+/// into a real one.
+pub(crate) fn checked_dh(shared: x25519_dalek::SharedSecret) -> Result<x25519_dalek::SharedSecret> {
+    if shared.was_contributory() {
+        Ok(shared)
+    } else {
+        Err(Error::Malformed(
+            "peer's X25519 public key has small order: the exchange contributed no entropy",
+        ))
+    }
 }
 
 pub fn x25519_public_from_bytes(bytes: &[u8]) -> Result<X25519Public> {

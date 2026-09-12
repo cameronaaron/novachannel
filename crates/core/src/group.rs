@@ -406,7 +406,7 @@ fn seal_to_node(target: &NodePublicKey, aad: &[u8], plaintext: &[u8]) -> Result<
     let mut rng = csprng();
     let eph_secret = EphemeralSecret::random_from_rng(&mut rng);
     let eph_dh_public = X25519Public::from(&eph_secret);
-    let dh = eph_secret.diffie_hellman(&target.dh_public);
+    let dh = kex::checked_dh(eph_secret.diffie_hellman(&target.dh_public))?;
     let (kem_ct, kem_ss) = target.kem_public.encapsulate_with_rng(&mut rng);
     let key = derive_seal_key(&dh, &kem_ss)?;
     let ciphertext = aead_seal(&key, aad, plaintext)?;
@@ -424,7 +424,7 @@ fn open_from_node(
     sealed: &SealedToNode,
 ) -> Result<Vec<u8>> {
     use kem::Decapsulate;
-    let dh = dh_secret.diffie_hellman(&sealed.eph_dh_public);
+    let dh = kex::checked_dh(dh_secret.diffie_hellman(&sealed.eph_dh_public))?;
     let kem_ss = kem_secret.decapsulate(&sealed.kem_ct);
     let key = derive_seal_key(&dh, &kem_ss)?;
     aead_seal_open(&key, aad, &sealed.ciphertext)

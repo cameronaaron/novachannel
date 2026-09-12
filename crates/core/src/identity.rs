@@ -47,9 +47,9 @@
 //!
 //! [`ENGINEERING-STANDARDS.md`]: https://github.com/cameronaaron/novachannel/blob/main/ENGINEERING-STANDARDS.md
 
-use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use ml_dsa::signature::Verifier;
 use ml_dsa::{Generate, Keypair, MlDsa87};
-use zeroize::Zeroize;
 
 use crate::error::{Error, Result};
 use crate::rng::csprng;
@@ -89,9 +89,27 @@ impl std::fmt::Debug for PublicIdentity {
 }
 
 impl PublicIdentity {
+    /// Both legs must verify; either failing is [`Error::BadSignature`].
+    ///
+    /// The Ed25519 leg uses `verify_strict`, not the permissive
+    /// `Verifier::verify`. The permissive form implements the
+    /// batch-compatible verification equation, which accepts small-order
+    /// public keys and non-canonically encoded `R` components; that admits
+    /// signatures which verify under more than one public key, and
+    /// signatures whose validity depends on which implementation checks
+    /// them. Neither is a property anything in this crate wants: a
+    /// `PublicIdentity` is pinned by the caller and is the thing being
+    /// authenticated, and several callers here
+    /// ([`crate::sealed_sender::SenderCertificate`],
+    /// [`crate::multidevice::SignedDeviceList`],
+    /// [`crate::group::LeafKeyPackage`]) treat "this signature verifies
+    /// under this identity" as a statement about *which* identity vouched
+    /// for something. `verify_strict` is the form that makes that
+    /// statement mean what it reads as, and it is what RFC 8032's own
+    /// §8.4 guidance and libsignal's usage both point at.
     pub fn verify(&self, message: &[u8], sig: &HybridSignature) -> Result<()> {
         self.ed25519
-            .verify(message, &sig.ed25519)
+            .verify_strict(message, &sig.ed25519)
             .map_err(|_| Error::BadSignature)?;
         self.ml_dsa
             .verify(message, &sig.ml_dsa)
@@ -276,20 +294,30 @@ impl Identity {
     }
 }
 
-impl Drop for Identity {
-    fn drop(&mut self) {
-        // ed25519_dalek::SigningKey and ml_dsa::SigningKey already zeroize
-        // their internal buffers on drop; this guards the one field we hold
-        // directly to the same standard in case that changes. Only the
-        // in-process case has anything here to zeroize -- a `Backend`
-        // holds no secret bytes in this process at all, which is the
-        // entire point.
-        if let Ed25519Source::InProcess(sk) = &self.ed25519 {
-            let mut ed_bytes = sk.to_bytes();
-            ed_bytes.zeroize();
-        }
-    }
-}
+// No `Drop` impl, deliberately.
+//
+// There used to be one. It called `sk.to_bytes()` — which *copies* the
+// secret out of the signing key — and then zeroized the copy, leaving the
+// key itself untouched. It cost a copy of a secret key on every drop and
+// cleared nothing, while reading as though it cleared something, which is
+// worse than not being there (`ENGINEERING-STANDARDS.md` §0.4).
+//
+// What actually zeroizes the material is the key types themselves:
+// `ed25519_dalek::SigningKey` and `ml_dsa::SigningKey` both implement
+// `ZeroizeOnDrop`, enabled here by the `zeroize` cargo features §6.19
+// turned on precisely so those impls exist, and both are dropped as
+// fields of this struct in the normal way. The static assertions below
+// are the executable form of that: if either dependency ever stops
+// zeroizing on drop, this stops compiling rather than silently starting
+// to leak.
+//
+// A `Backend`-sourced `Identity` holds no secret bytes in this process at
+// all, which is the entire point of that variant.
+const _: fn() = || {
+    fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+    assert_zeroize_on_drop::<SigningKey>();
+    assert_zeroize_on_drop::<ml_dsa::SigningKey<MlDsa87>>();
+};
 
 #[cfg(test)]
 mod tests {

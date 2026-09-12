@@ -181,7 +181,7 @@ pub fn seal(
     let mut rng = csprng();
     let ephemeral_secret = EphemeralSecret::random_from_rng(&mut rng);
     let ephemeral_public = X25519Public::from(&ephemeral_secret);
-    let dh = ephemeral_secret.diffie_hellman(&recipient.dh_public);
+    let dh = kex::checked_dh(ephemeral_secret.diffie_hellman(&recipient.dh_public))?;
     let (ml_kem_ct, ml_kem_ss) = recipient.kem_public.encapsulate_with_rng(&mut rng);
 
     let key = derive_envelope_key(&dh, &ml_kem_ss)?;
@@ -231,7 +231,7 @@ pub fn open(recipient_key: &SignedPreKey, envelope: &SealedEnvelope) -> Result<U
         return Err(Error::Malformed("trailing bytes in sealed envelope"));
     }
 
-    let dh = recipient_key.diffie_hellman(&ephemeral_public);
+    let dh = recipient_key.diffie_hellman(&ephemeral_public)?;
     let ml_kem_ss = recipient_key.decapsulate(&ml_kem_ct);
     let key = derive_envelope_key(&dh, &ml_kem_ss)?;
 

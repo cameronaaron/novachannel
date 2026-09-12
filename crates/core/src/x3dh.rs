@@ -259,13 +259,17 @@ pub fn initiate(
     let ephemeral_secret = x25519_dalek::ReusableSecret::random_from_rng(&mut rng);
     let ephemeral_public = x25519_dalek::PublicKey::from(&ephemeral_secret);
 
-    let dh1 = my_dh_identity.diffie_hellman(peer_bundle.spk_dh_public());
-    let dh2 = ephemeral_secret.diffie_hellman(&peer_bundle.dh_identity);
-    let dh3 = ephemeral_secret.diffie_hellman(peer_bundle.spk_dh_public());
+    // Every one of these is checked for a small-order peer key (see
+    // `kex::checked_dh`): a DH term that contributes nothing is never
+    // something to carry silently into the combined secret.
+    let dh1 = my_dh_identity.diffie_hellman(peer_bundle.spk_dh_public())?;
+    let dh2 = kex::checked_dh(ephemeral_secret.diffie_hellman(&peer_bundle.dh_identity))?;
+    let dh3 = kex::checked_dh(ephemeral_secret.diffie_hellman(peer_bundle.spk_dh_public()))?;
     let dh4 = peer_bundle
         .one_time_prekey
         .as_ref()
-        .map(|(_, opk_pub, _)| ephemeral_secret.diffie_hellman(opk_pub));
+        .map(|(_, opk_pub, _)| kex::checked_dh(ephemeral_secret.diffie_hellman(opk_pub)))
+        .transpose()?;
 
     let (ml_kem_ct, ml_kem_ss) = peer_bundle.spk_kem_public().encapsulate_with_rng(&mut rng);
     // Encapsulated only if the bundle carried an OPK: like DH4, this term's
@@ -381,17 +385,23 @@ pub fn respond(
         return Err(Error::Malformed("trailing bytes in x3dh init message"));
     }
 
+    // Borrowed, not yet consumed: deleting it here — before the AEAD
+    // below proves this message came from someone who could actually
+    // encrypt to this responder — would let anyone burn a responder's
+    // whole published prekey supply with garbage. See
+    // `OneTimePreKeyStore::peek`.
     let one_time_secret = opk_id_and_ct
         .as_ref()
-        .map(|(id, _)| opks.take(*id))
+        .map(|(id, _)| opks.peek(*id))
         .transpose()?;
 
-    let dh1 = my_spk.diffie_hellman(&initiator_dh_identity);
-    let dh2 = my_dh_identity.diffie_hellman(&initiator_ephemeral);
-    let dh3 = my_spk.diffie_hellman(&initiator_ephemeral);
+    let dh1 = my_spk.diffie_hellman(&initiator_dh_identity)?;
+    let dh2 = my_dh_identity.diffie_hellman(&initiator_ephemeral)?;
+    let dh3 = my_spk.diffie_hellman(&initiator_ephemeral)?;
     let dh4 = one_time_secret
         .as_ref()
-        .map(|opk| opk.diffie_hellman(&initiator_ephemeral));
+        .map(|opk| opk.diffie_hellman(&initiator_ephemeral))
+        .transpose()?;
     let ml_kem_ss = my_spk.decapsulate(&ml_kem_ct);
     let ml_kem_opk_ss = one_time_secret
         .as_ref()
@@ -416,6 +426,12 @@ pub fn respond(
     aad.extend_from_slice(PAYLOAD_AAD_CONTEXT);
     aad.extend_from_slice(header_bytes);
     let payload_plaintext = open_init_payload(&keys.init_payload_key, &aad, sealed_payload)?;
+
+    // Authenticated: the prekey has genuinely been used for a session and
+    // must never be used for another.
+    if let Some((id, _)) = &opk_id_and_ct {
+        opks.consume(*id);
+    }
 
     let mut pr = Reader::new(&payload_plaintext);
     let initiator_identity = PublicIdentity::read(&mut pr)?;

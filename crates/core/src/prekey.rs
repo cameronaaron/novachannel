@@ -58,8 +58,11 @@ impl DhIdentity {
         self.public
     }
 
-    pub(crate) fn diffie_hellman(&self, their: &X25519Public) -> x25519_dalek::SharedSecret {
-        self.secret.diffie_hellman(their)
+    pub(crate) fn diffie_hellman(
+        &self,
+        their: &X25519Public,
+    ) -> Result<x25519_dalek::SharedSecret> {
+        kex::checked_dh(self.secret.diffie_hellman(their))
     }
 }
 
@@ -103,8 +106,11 @@ impl OneTimePreKey {
         (self.id, self.public, self.kem_public.clone())
     }
 
-    pub(crate) fn diffie_hellman(&self, their: &X25519Public) -> x25519_dalek::SharedSecret {
-        self.secret.diffie_hellman(their)
+    pub(crate) fn diffie_hellman(
+        &self,
+        their: &X25519Public,
+    ) -> Result<x25519_dalek::SharedSecret> {
+        kex::checked_dh(self.secret.diffie_hellman(their))
     }
 
     pub(crate) fn decapsulate(
@@ -138,13 +144,31 @@ impl OneTimePreKeyStore {
         self.keys.iter().map(OneTimePreKey::public).collect()
     }
 
-    pub(crate) fn take(&mut self, id: u32) -> Result<OneTimePreKey> {
-        let idx = self
-            .keys
+    /// Borrows the prekey `id` names *without* consuming it — used to run
+    /// the exchange before anything has proven the init message is
+    /// genuine. Consumption is [`Self::consume`], called only once the
+    /// message's AEAD tag has verified.
+    ///
+    /// Splitting the two matters: the one-time secret is needed to derive
+    /// the key that authenticates the message, so it cannot be deferred
+    /// until after verification, but deleting it before verification let
+    /// anyone who could reach a responder burn that responder's entire
+    /// published prekey supply with garbage init messages. Each deletion
+    /// costs an honest session its fourth DH term and its single-use
+    /// ML-KEM leg (see [`OneTimePreKey`]), so that is a forward-secrecy
+    /// downgrade an unauthenticated attacker could force at will.
+    pub(crate) fn peek(&self, id: u32) -> Result<&OneTimePreKey> {
+        self.keys
             .iter()
-            .position(|k| k.id == id)
-            .ok_or(Error::UnknownOneTimePreKey)?;
-        Ok(self.keys.remove(idx))
+            .find(|k| k.id == id)
+            .ok_or(Error::UnknownOneTimePreKey)
+    }
+
+    /// Permanently removes the prekey `id` names — the *one-time* part of
+    /// a one-time prekey. Call only after the init message referencing it
+    /// has been authenticated; see [`Self::peek`].
+    pub(crate) fn consume(&mut self, id: u32) {
+        self.keys.retain(|k| k.id != id);
     }
 }
 
@@ -184,8 +208,11 @@ impl SignedPreKey {
         }
     }
 
-    pub(crate) fn diffie_hellman(&self, their: &X25519Public) -> x25519_dalek::SharedSecret {
-        self.dh_secret.diffie_hellman(their)
+    pub(crate) fn diffie_hellman(
+        &self,
+        their: &X25519Public,
+    ) -> Result<x25519_dalek::SharedSecret> {
+        kex::checked_dh(self.dh_secret.diffie_hellman(their))
     }
 
     pub(crate) fn decapsulate(
