@@ -20,7 +20,7 @@
 //!
 //! One-time prekeys ([`OneTimePreKey`]) are optional, unsigned, and meant
 //! to be consumed by at most one session each: including one in the
-//! exchange (via [`OneTimePreKeyStore::take`]) adds a fourth DH term an
+//! exchange (via `OneTimePreKeyStore::take`) adds a fourth DH term an
 //! attacker who later steals the long-term and signed-prekey secrets still
 //! can't reproduce, since the one-time secret is deleted the moment it's
 //! used (see `crate::x3dh` module docs for why that matters).
@@ -208,7 +208,7 @@ impl SignedPreKey {
     /// `crate::sealed_sender`, without the signature `crate::x3dh` checks —
     /// sealed sender authenticates via its own certificate instead (see
     /// that module's docs), so this deliberately carries less than
-    /// [`SignedPreKey::public`]'s [`PublicSignedPreKey`].
+    /// `SignedPreKey::public`'s `PublicSignedPreKey`.
     ///
     /// Applications should generate a *separate* `SignedPreKey` instance
     /// for sealed-sender receiving rather than reusing one already
@@ -353,7 +353,7 @@ impl PreKeyBundle {
     /// somewhere fetchable" step X3DH's asynchrony depends on
     /// (this module's own doc: the bundle "is published key material").
     /// [`Self::write`]/[`Self::read`] exist but take this crate's own
-    /// private [`Writer`]/[`Reader`], so nothing outside the crate could
+    /// private `Writer`/`Reader`, so nothing outside the crate could
     /// previously call them — the bundle had a documented purpose and no
     /// public way to fulfil it. Same shape as `winterfell::Proof::to_bytes`,
     /// which this workspace's own `novachannel-rln` integration already

@@ -14,7 +14,7 @@
 //! server-side state lookups.
 //!
 //! # Complexity, honestly
-//! Each [`PathOram::access`] touches `O(log n)` storage buckets, not
+//! Each `PathOram::access` touches `O(log n)` storage buckets, not
 //! `O(1)` — that's not a shortcoming of this implementation, it's a
 //! proven lower bound (Goldreich-Ostrovsky) for *any* ORAM construction:
 //! hiding the access pattern over `n` blocks with `O(1)` client storage

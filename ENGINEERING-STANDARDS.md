@@ -1715,3 +1715,36 @@ letting the "timing gap closed" headline overreach.
 
 No new dependency in either crate; `scripts/check.sh` passes clean;
 `docs/SYSTEMIZATION.md` §3.2, §5, and §9 updated accordingly.
+
+### 6.28 Production review: replay-window boundary and withdrawn DP claim
+
+The transport bitmap stores ages 1 through 64, inclusive. Advancing exactly
+64 previously cleared it, forgetting that the former highest record had
+already authenticated; replaying that ciphertext then succeeded. Preserve
+bit 63 at exactly 64, and clear only for jumps greater than 64. The regression
+`replay_window_boundaries_preserve_seen_records_and_accept_unseen_records`
+failed against the old source at jump 64 and passes with the fix; it also
+checks jumps 1, 63, 65 and 128, unseen records, and repeated delivery.
+A workspace search found no other sliding replay-window implementation.
+
+The DP assertion in §1.1 and the historical composition claims are withdrawn.
+They checked one ordered pair only. For the silence event, the reverse
+inequality is `1-exp(-epsilon) <= exp(epsilon)*0`, false at positive epsilon.
+`silence_is_a_counterexample_to_positive_epsilon_pure_dp` checks this missing
+case and witnesses silence in the actual scheduler. Existing delivery and
+probability tests remain intact: changing them to hide this defect would
+violate the prime directive. The public API docs and composition report now
+state the limitation. Zero epsilon hides only the observable presence bit
+under indistinguishable framing and an arrival-independent transmission grid.
+A positive-epsilon DP replacement needs different delivery semantics and an
+explicit adjacent-input model; the current Budget cannot certify it.
+
+The production review also found locked chacha20 0.10.1 yanked; Cargo resolved
+its compatible replacement 0.10.2. The dev-only paste warning remains.
+
+Public rustdoc was not previously part of the gate. Running it with warnings
+denied found stale module links, module-level `Self` links, and links to
+private items that readers cannot navigate. Correct the links at their
+source and retain `cargo doc --workspace --no-deps --release --locked` with
+`RUSTDOCFLAGS=-D warnings` in scripts/check.sh; do not enable private-item
+documentation or suppress warnings to hide public documentation defects.

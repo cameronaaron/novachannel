@@ -17,6 +17,10 @@ cargo fmt --check
 echo "==> cargo clippy --workspace --all-targets --release --locked -D warnings"
 cargo clippy --workspace --all-targets --release --locked -- -D warnings
 
+# Public API docs are part of the research release: reject broken/private links.
+echo "==> cargo doc --workspace --no-deps --release --locked (-D warnings)"
+RUSTDOCFLAGS="${RUSTDOCFLAGS:-} -D warnings" cargo doc --workspace --no-deps --release --locked
+
 echo "==> cargo test --workspace --release --locked --exclude novachannel-rln"
 cargo test --workspace --release --locked --exclude novachannel-rln
 

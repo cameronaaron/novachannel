@@ -233,7 +233,7 @@ fn leaf_key_package_pop_message(identity: &PublicIdentity, public_key: &NodePubl
 /// public half of their leaf's hybrid key, published so an existing member
 /// can [`Group::propose_add`] them. `pop` is a proof-of-possession
 /// signature over `identity`+`public_key` from `identity`'s own long-term
-/// signing key, checked by [`Self::read`] (and so by every deserialization
+/// signing key, checked by `Self::read` (and so by every deserialization
 /// path — [`Self::from_bytes`], a [`GroupOp::Add`] inside a received
 /// [`Commit`], and a [`Welcome`] snapshot's tree) before the package is
 /// ever trusted.
@@ -266,7 +266,7 @@ impl LeafKeyPackage {
     /// Same gap, same fix as [`Commit::to_bytes`]/[`Commit::from_bytes`]:
     /// a prospective member has to publish this to whoever will call
     /// [`Group::propose_add`] on their behalf, which needs public bytes,
-    /// not this crate's private [`Writer`]/[`Reader`]. `write`/`read`
+    /// not this crate's private `Writer`/`Reader`. `write`/`read`
     /// stay private — every other call site reaches them through a
     /// `Group` method that already holds a `LeafKeyPackage` value, not
     /// through wire bytes.
@@ -305,7 +305,7 @@ pub struct MyLeafKeyPackage {
 impl MyLeafKeyPackage {
     /// `signing_identity` must be this prospective member's own long-term
     /// [`Identity`] — its secret key signs the freshly generated leaf key
-    /// pair's proof-of-possession (see [`leaf_key_package_pop_message`]),
+    /// pair's proof-of-possession (see `leaf_key_package_pop_message`),
     /// which is what lets [`Group::propose_add`]'s caller (and every peer
     /// who later reads this package off the wire) trust that `identity`
     /// and this leaf's key material actually belong together.
@@ -687,8 +687,8 @@ impl Commit {
         })
     }
 
-    /// [`Self::write`]/[`Self::read`] take this crate's own private
-    /// [`Writer`]/[`Reader`], so nothing outside the crate could
+    /// [`Self::write`]/`Self::read` take this crate's own private
+    /// `Writer`/`Reader`, so nothing outside the crate could
     /// previously call them — a `Commit` had a documented purpose
     /// (broadcast to every other group member) and no public way to
     /// fulfil it, the same gap [`crate::prekey::PreKeyBundle`] once had.
@@ -718,7 +718,7 @@ impl Welcome {
     /// Same gap, same fix as [`Commit::to_bytes`]/[`Commit::from_bytes`]:
     /// a `Welcome` must reach the joining member over some transport
     /// (typically alongside the accompanying [`Commit`]), which needs
-    /// public bytes, not this crate's private [`Writer`]/[`Reader`].
+    /// public bytes, not this crate's private `Writer`/`Reader`.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut w = Writer::new();
         self.sealed.write(&mut w);
@@ -1545,7 +1545,7 @@ mod tests {
     }
 
     /// `seal_to_node`/`Welcome` are a one-shot, sender-anonymous envelope
-    /// (module docs on [`leaf_key_package_pop_message`]): anyone who knows
+    /// (module docs on `leaf_key_package_pop_message`): anyone who knows
     /// a victim's published `LeafKeyPackage` can encrypt an arbitrary
     /// plaintext that decrypts cleanly under the victim's own keys. A
     /// forged `capacity` of 0 used to reach `2 * (capacity as usize) - 1`

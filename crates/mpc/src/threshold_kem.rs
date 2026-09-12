@@ -23,7 +23,7 @@
 //!   round exists to prevent don't apply here either.
 //! - **Shamir secret sharing** of a per-message ephemeral master secret,
 //!   reusing this crate's own polynomial-evaluation / Lagrange-interpolation
-//!   machinery ([`crate::evaluate`]/[`crate::lagrange_coefficient_at_zero`])
+//!   machinery (`crate::evaluate`/`crate::lagrange_coefficient_at_zero`)
 //!   that [`crate::Dealer`]/[`crate::combine_partials`] already rely on.
 //!   Shamir's secrecy guarantee (fewer than `t` shares reveal nothing about
 //!   the secret) is information-theoretic and does not depend on the field

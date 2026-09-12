@@ -13,7 +13,7 @@
 //! multiple independently audited production STARK provers, e.g. Succinct's
 //! SP1 and RISC Zero), and the round structure below is a direct port of
 //! `p3-poseidon2` 0.6.3's generic algorithm, not a reinterpretation of it.
-//! [`tests::matches_official_poseidon2_goldilocks_width8_test_vector`]
+//! `tests::matches_official_poseidon2_goldilocks_width8_test_vector`
 //! checks this port against `p3-goldilocks`'s own `#[test]` vector
 //! byte-for-byte — the thing that actually matters here is that this is
 //! *the same permutation*, not merely "inspired by" one.
@@ -45,7 +45,7 @@
 //!
 //! `p3-goldilocks`/`p3-poseidon2` weren't publishable crates.io
 //! dependencies when this port was written; now that they are (0.6.3),
-//! [`tests::matches_the_real_upstream_crate_on_many_random_inputs`]
+//! `tests::matches_the_real_upstream_crate_on_many_random_inputs`
 //! cross-checks this port against the real upstream crate directly on
 //! 10,000 random inputs, not just the one fixed test vector above —
 //! meaningfully stronger evidence against a transcription error than a
@@ -123,7 +123,7 @@ fn mds4<E: FieldElement>(x: [E; 4]) -> [E; 4] {
     ]
 }
 
-/// Poseidon2's external ("light") linear layer for width 8: apply [`mds4`]
+/// Poseidon2's external ("light") linear layer for width 8: apply `mds4`
 /// to each half of the state, then mix the two halves via the circulant
 /// `[[2M4, M4], [M4, 2M4]]` block structure (`p3-poseidon2`'s
 /// `mds_light_permutation`).
@@ -323,7 +323,7 @@ const fn hex_row(vals: [u64; WIDTH]) -> [BaseElement; WIDTH] {
 
 /// The round constants used by the `Full` steps only, keyed by step index
 /// (0..[`ROUNDS`]) — zero for `LinearOnly`/`Partial` steps. Paired with
-/// [`internal_rc_lane0`] so the AIR can build one uniform per-step,
+/// `internal_rc_lane0` so the AIR can build one uniform per-step,
 /// per-lane periodic round-constant table (zero where a given step/lane
 /// combination doesn't add a constant there) without hand-tracking which
 /// step index maps to which of `EXTERNAL_INITIAL`/`INTERNAL`/

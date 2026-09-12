@@ -2,7 +2,7 @@
 //! the RLN membership set. The tree itself is public infrastructure (every
 //! member and verifier can maintain it, e.g. from an on-chain contract's
 //! event log); the privacy property comes from the STARK proof of
-//! membership in [`crate::proof`], not from the tree being secret.
+//! membership in [`crate::air`], not from the tree being secret.
 
 use winterfell::math::{fields::f64::BaseElement, FieldElement};
 

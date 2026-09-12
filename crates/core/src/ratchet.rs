@@ -39,7 +39,7 @@
 //! an **incremental, erasure-coded** alternative
 //! ([`RatchetedSession::initiate_incremental_ratchet`]) that splits that
 //! same material into several small chunks plus redundant parity chunks
-//! (via [`crate::erasure`], built on the `reed_solomon_simd` crate)
+//! (via `crate::erasure`, built on the `reed_solomon_simd` crate)
 //! so the exchange tolerates losing some of them — closer in
 //! *shape* to SPQR's chunked, loss-tolerant design, while remaining honest
 //! about how much smaller it is than the real thing:
@@ -68,7 +68,7 @@
 //! - **No formal verification of this module's own use of erasure coding**
 //!   — the coding itself is delegated to `reed_solomon_simd`, but the
 //!   chunk framing and reassembly logic here are this workspace's own;
-//!   see [`crate::erasure`]'s own module docs.
+//!   see `crate::erasure`'s own module docs.
 //!
 //! Reordering across *chunks of the same step* is fine (that's the whole
 //! point — arrival order doesn't matter, only which `data_shards` of them
@@ -78,7 +78,7 @@
 //! Both variants share every other constraint below:
 //!
 //! - **Out-of-order and lost application records are tolerated, bounded.**
-//!   Each [`RecvChain`] keeps a cache of message keys skipped while
+//!   Each `RecvChain` keeps a cache of message keys skipped while
 //!   catching up to a later sequence number — the same mechanism real
 //!   Double Ratchet implementations use: receiving `seq` ahead of
 //!   `expected_seq` derives and stashes the keys for everything in
@@ -94,8 +94,8 @@
 //!   not — the same "used once, ever" rule every other message key in
 //!   this module follows — so a second delivery of the same sequence
 //!   number (a true replay, not a legitimate late arrival) correctly
-//!   fails. This applies to ordinary [`Self::seal`]/[`Self::open`]
-//!   records; [`Self::initiate_incremental_ratchet`]'s chunks already had
+//!   fails. This applies to ordinary [`RatchetedSession::seal`]/[`RatchetedSession::open`]
+//!   records; [`RatchetedSession::initiate_incremental_ratchet`]'s chunks already had
 //!   their own, separate reordering tolerance (module docs above).
 //! - **Ratchet initiation must not race.** Both sides calling
 //!   [`RatchetedSession::initiate_ratchet`] concurrently, before either
@@ -140,7 +140,7 @@ type HmacSha256 = Hmac<Sha256>;
 /// progress. See [`RatchetedSession::incremental_ratchet_progress`].
 pub type ChunkProgress = Option<(usize, usize)>;
 
-/// The most message keys one [`RecvChain`] will cache for out-of-order
+/// The most message keys one `RecvChain` will cache for out-of-order
 /// delivery at once — module docs on why this bound exists. 1000 matches
 /// the order of magnitude Signal's own `libsignal-protocol` uses for the
 /// same purpose (`MAX_FORWARD_JUMPS`/skipped-key-store caps).
@@ -582,7 +582,7 @@ impl RatchetedSession {
     /// order**, interleaved with anything else, are enough for
     /// [`Self::open_ratchet_chunk`] to reconstruct and complete the step.
     /// `data_shards` must be at least 1 and `data_shards + parity_shards`
-    /// at most 255 (see [`crate::erasure`]).
+    /// at most 255 (see `crate::erasure`).
     ///
     /// Unlike [`Self::initiate_ratchet`]'s single record, these do
     /// **not** go through [`Self::seal`]/[`Self::open`]'s strict
