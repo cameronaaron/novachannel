@@ -367,6 +367,13 @@ impl PreKeyBundle {
     /// Inverse of [`Self::to_bytes`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes);
-        Self::read(&mut r)
+        let bundle = Self::read(&mut r)?;
+        // One bundle, exactly one byte encoding -- the same canonicality
+        // check every other deserialization entry point in this crate
+        // already made, which this one was missing.
+        if !r.finished() {
+            return Err(Error::Malformed("trailing bytes in prekey bundle"));
+        }
+        Ok(bundle)
     }
 }

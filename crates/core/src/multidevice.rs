@@ -235,7 +235,18 @@ impl SignedDeviceList {
                 .try_into()
                 .expect("get_fixed(4) already guarantees the length"),
         );
-        let mut entries = Vec::with_capacity(count as usize);
+        // Every entry costs far more than one byte on the wire (a device
+        // id, a full hybrid `PublicIdentity`, a DH key), so a count larger
+        // than the bytes left is provably unsatisfiable -- reject it
+        // before reserving for it. See `Reader::remaining`'s docs on the
+        // unbounded allocation this closes.
+        let count = count as usize;
+        if count > r.remaining() {
+            return Err(Error::Malformed(
+                "device list declares more entries than its message can hold",
+            ));
+        }
+        let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
             let device_id = DeviceId(u32::from_be_bytes(
                 r.get_fixed(4)?
@@ -256,6 +267,33 @@ impl SignedDeviceList {
             entries,
             signature,
         })
+    }
+
+    /// Serializes this list to bytes — the "fetch the account's current
+    /// device list from wherever it is published" step this module's docs
+    /// describe but had no public way to perform: [`Self::write`] /
+    /// [`Self::read`] take this crate's own private `Writer`/`Reader`, so
+    /// nothing outside the crate could call them. Same gap, same fix as
+    /// [`crate::prekey::PreKeyBundle::to_bytes`] and
+    /// [`crate::group::Commit::to_bytes`].
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        self.write(&mut w);
+        w.into_bytes()
+    }
+
+    /// Inverse of [`Self::to_bytes`]. Parsing does **not** verify the
+    /// signature — call [`Self::verify`] (or go through
+    /// [`MultiDeviceSession::sync_from_signed_device_list`]) against the
+    /// account identity you actually trust, exactly as for a list obtained
+    /// any other way.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes);
+        let list = Self::read(&mut r)?;
+        if !r.finished() {
+            return Err(Error::Malformed("trailing bytes in signed device list"));
+        }
+        Ok(list)
     }
 }
 

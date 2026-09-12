@@ -583,6 +583,14 @@ impl UpdatePathNode {
                 .try_into()
                 .expect("get_fixed(4) already guarantees the length"),
         ) as usize;
+        // A `SealedToNode` is never zero bytes on the wire, so a count
+        // larger than the bytes left is provably unsatisfiable -- reject
+        // it before reserving for it. See `Reader::remaining`'s docs.
+        if count > r.remaining() {
+            return Err(Error::Malformed(
+                "update path node declares more ciphertexts than its message can hold",
+            ));
+        }
         let mut ciphertexts = Vec::with_capacity(count);
         for _ in 0..count {
             ciphertexts.push(SealedToNode::read(r)?);
@@ -667,6 +675,13 @@ impl Commit {
                 .try_into()
                 .expect("get_fixed(4) already guarantees the length"),
         ) as usize;
+        // Same bound, same reason as `UpdatePathNode::read` above: an
+        // `UpdatePathNode` always costs at least one wire byte.
+        if path_len > sr.remaining() {
+            return Err(Error::Malformed(
+                "commit declares a longer update path than its message can hold",
+            ));
+        }
         let mut path = Vec::with_capacity(path_len);
         for _ in 0..path_len {
             path.push(UpdatePathNode::read(&mut sr)?);
@@ -701,7 +716,17 @@ impl Commit {
     /// Inverse of [`Self::to_bytes`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes);
-        Self::read(&mut r)
+        let commit = Self::read(&mut r)?;
+        // `Commit::read` already rejects trailing bytes inside the signed
+        // section; this rejects them *after* the signature, so one commit
+        // has exactly one byte encoding. Without it, appending arbitrary
+        // bytes produces a distinct wire message that parses to the same
+        // `Commit` -- a malleability a caller deduplicating or pinning
+        // commits by their bytes would be wrong to rely on.
+        if !r.finished() {
+            return Err(Error::Malformed("trailing bytes in commit"));
+        }
+        Ok(commit)
     }
 }
 
