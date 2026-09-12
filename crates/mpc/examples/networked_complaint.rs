@@ -30,7 +30,9 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
+use curve25519_dalek::{
+    constants::RISTRETTO_BASEPOINT_POINT, ristretto::RistrettoPoint, scalar::Scalar,
+};
 use novachannel_mpc::{resolve_complaint, Complaint, ComplaintVerdict, Dealer, ParticipantId};
 
 const OP_COMPLAINT: u8 = 0;
@@ -145,15 +147,20 @@ fn main() {
         dealer_commitments.push(d.reveal().0);
     }
 
-    // Simulate the faulty dealer's share to `accuser` being corrupted in
-    // transit -- same fault this crate's own in-process test
-    // (`complaint_resolution_agrees_with_the_batch_identify_faulty_dealers_path`)
-    // uses, so the expected verdict below is directly comparable.
-    let honest_share = dealers[faulty_dealer_index]
+    // The fault has to be one every participant can decide from public
+    // values alone: a dealing inconsistent with the commitments this
+    // dealer itself broadcast. Tampering with a *delivered share* instead
+    // would only ever be the accuser's unverifiable word against the
+    // dealer's, which `resolve_complaint` deliberately refuses to blame
+    // anyone for -- see `ComplaintVerdict`'s own docs. Same fault, and so
+    // the same verdict, as this crate's in-process
+    // `complaint_resolution_agrees_with_the_batch_identify_faulty_dealers_path`.
+    dealer_commitments[faulty_dealer_index][1] += RISTRETTO_BASEPOINT_POINT;
+    let received_share = dealers[faulty_dealer_index]
         .as_ref()
         .unwrap()
-        .share_for(accuser);
-    let corrupted_share = honest_share + Scalar::ONE;
+        .share_for(accuser)
+        .expect("the accuser is a real participant of this DKG");
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind the relay's local port");
     let addr = listener.local_addr().unwrap();
@@ -191,7 +198,7 @@ fn main() {
                     let complaint = Complaint {
                         accuser,
                         dealer_index: faulty_dealer_index,
-                        received_share: corrupted_share,
+                        received_share,
                     };
                     write_frame(&mut stream, &encode_complaint(&complaint))
                         .expect("broadcast the complaint");
@@ -206,12 +213,23 @@ fn main() {
                             // Only the accused dealer's own thread holds
                             // `own_dealer` -- everyone else's is `None`.
                             if let Some(dealer) = &own_dealer {
-                                let disclosed = dealer.share_for(c.accuser);
-                                write_frame(
-                                    &mut stream,
-                                    &encode_disclosure(faulty_dealer_index as u32, c.accuser, &disclosed),
-                                )
-                                .expect("broadcast the dealer's disclosure");
+                                // `None` means the complaint named an id
+                                // this dealer never dealt to (including
+                                // zero, where the polynomial evaluates to
+                                // the dealer's secret itself) -- the
+                                // documented response is to publish
+                                // nothing at all.
+                                if let Some(disclosed) = dealer.share_for(c.accuser) {
+                                    write_frame(
+                                        &mut stream,
+                                        &encode_disclosure(
+                                            faulty_dealer_index as u32,
+                                            c.accuser,
+                                            &disclosed,
+                                        ),
+                                    )
+                                    .expect("broadcast the dealer's disclosure");
+                                }
                             }
                         }
                         Message::Disclosure {

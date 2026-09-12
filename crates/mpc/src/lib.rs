@@ -53,13 +53,28 @@
 //!   ([`Dealer::share_for`]) and broadcasting it; [`resolve_complaint`]
 //!   takes the dealer's (already-public, from the commit/reveal round)
 //!   commitments, the complaint, and that disclosure, and reaches a
-//!   [`ComplaintVerdict`] — faulty dealer, or unfounded complaint — that
-//!   every other participant can recompute independently from the same
-//!   three public values, without trusting either party's word alone.
-//!   This is the standard complaint/accusation resolution from Gennaro et
-//!   al.'s malicious-secure DKG; the decision procedure lives in this
-//!   crate, and `examples/networked_complaint.rs` (see "does not do
-//!   networking" below) demonstrates a real broadcast transport driving it
+//!   [`ComplaintVerdict`] every other participant can recompute
+//!   independently from the same three public values.
+//!
+//!   **A dealer is disqualified on exactly one condition: the share they
+//!   broadcast in response fails [`verify_share`] against their own
+//!   already-published commitments.** That is Gennaro et al.'s rule, and
+//!   the reason for it is that it is the only judgement derivable from
+//!   values the dealer themselves published. A complaint's
+//!   `received_share` is an unauthenticated claim about a point-to-point
+//!   message nobody else witnessed, so "the dealer sent me the wrong
+//!   share" and "I am lying about what I was sent" are indistinguishable
+//!   to every other participant; treating that case as a faulty dealer
+//!   (as this crate did before) lets one malicious participant disqualify
+//!   every honest dealer and be left alone determining the group key. It
+//!   is now [`ComplaintVerdict::DisclosureIsValidButContradictsTheAccusersClaim`],
+//!   which is not faulty — see that variant's docs for what a caller
+//!   should do with it, and what authenticated delivery would be needed
+//!   to attribute it.
+//!
+//!   The decision procedure lives in this crate, and
+//!   `examples/networked_complaint.rs` (see "does not do networking"
+//!   below) demonstrates a real broadcast transport driving it
 //!   end-to-end, though a production deployment will likely reach for its
 //!   own transport instead of that example's relay.
 //!
@@ -121,7 +136,32 @@ pub(crate) fn csprng() -> UnwrapErr<SysRng> {
     UnwrapErr(SysRng)
 }
 
+/// Whether `id` may be used as a Shamir evaluation point at all.
+///
+/// **Zero is not a participant id.** Every secret in this crate is the
+/// constant term of a polynomial — `f(0)` *is* the secret, both for a
+/// [`Dealer`]'s own contribution and for
+/// [`threshold_kem::encrypt_to_group`]'s master secret. Handing out or
+/// evaluating at zero therefore does not produce a share of the secret,
+/// it produces the secret. RFC 9591 draws the same line for FROST
+/// identifiers, and for the same reason.
+///
+/// That mattered concretely: [`Dealer::share_for`] is the *network-facing*
+/// disclosure a dealer publishes in response to a [`Complaint`], and the
+/// complaint carries the accuser's id. Before this check existed, any
+/// participant could broadcast `Complaint { accuser: 0, .. }` and an
+/// honest dealer following the documented protocol would answer by
+/// broadcasting `f(0)` — its entire secret contribution to the group key.
+/// Repeated against every dealer, that reconstructs the group secret.
+pub const fn is_valid_participant_id(id: ParticipantId) -> bool {
+    id != 0
+}
+
 pub(crate) fn scalar_from_id(id: ParticipantId) -> Scalar {
+    debug_assert!(
+        is_valid_participant_id(id),
+        "participant id 0 is the secret's own evaluation point, never a share's"
+    );
     Scalar::from(id as u64)
 }
 
@@ -212,8 +252,20 @@ impl Dealer {
     /// `commitments` lets every other participant run [`resolve_complaint`]
     /// and reach the same verdict independently, rather than trusting
     /// either the accuser's claim or the dealer's say-so alone.
-    pub fn share_for(&self, participant_id: ParticipantId) -> Scalar {
-        evaluate(&self.coefficients, scalar_from_id(participant_id))
+    ///
+    /// Returns `None` — rather than a share — for any `participant_id`
+    /// this dealer never dealt to, which includes `0`. `participant_id`
+    /// arrives inside an attacker-supplied [`Complaint`], and evaluating
+    /// this dealer's polynomial at zero would disclose its entire secret
+    /// contribution rather than a share of it; see
+    /// [`is_valid_participant_id`] for the full attack this refusal
+    /// closes. A `None` here means the complaint itself was malformed, and
+    /// the dealer should publish nothing at all in response.
+    pub fn share_for(&self, participant_id: ParticipantId) -> Option<Scalar> {
+        if !is_valid_participant_id(participant_id) || participant_id > self.num_participants {
+            return None;
+        }
+        Some(evaluate(&self.coefficients, scalar_from_id(participant_id)))
     }
 }
 
@@ -238,16 +290,45 @@ pub struct Complaint {
 /// resolution and not just one party's word against another's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComplaintVerdict {
+    /// The complaint is not answerable as posed — its `accuser` is not a
+    /// valid participant id (see [`is_valid_participant_id`]), so no
+    /// dealer could produce a share for it and the accused dealer must
+    /// publish nothing in response. Not a fault on the dealer's part:
+    /// reaching this verdict means the *accuser* sent something malformed.
+    MalformedComplaint,
     /// The dealer's disclosed share doesn't even verify against their own
     /// commitments — whatever polynomial they actually used when dealing
     /// doesn't match what they committed to. Faulty, regardless of what
-    /// the accuser claims to have received.
+    /// the accuser claims to have received. **This is the only verdict
+    /// that disqualifies a dealer**, and it is the only one that can: it
+    /// is the only one decided purely from values the dealer themselves
+    /// published.
     DealerCannotProduceAValidShare,
-    /// The dealer's disclosed share verifies fine, but doesn't match what
-    /// the accuser says they actually received — the dealer sent (or the
-    /// transport delivered) something other than the dealer's own valid
-    /// share. Faulty.
-    DealersDisclosureContradictsWhatWasSent,
+    /// The dealer's disclosed share verifies against their own
+    /// commitments, but differs from what the accuser claims to have
+    /// received.
+    ///
+    /// **Not a fault on either party's part, because it cannot be
+    /// attributed to one.** `Complaint::received_share` is an
+    /// unauthenticated assertion by the accuser about a message nobody
+    /// else witnessed: "the dealer sent me something wrong" and "I am
+    /// lying about what I was sent" produce byte-identical evidence.
+    /// Reporting this as a faulty dealer — as this crate used to — meant
+    /// any single participant could disqualify any honest dealer at will,
+    /// and a participant who disqualified *every* honest dealer would be
+    /// left alone determining the group key. Gennaro et al.'s DKG has no
+    /// such rule either; its resolution is exactly the one above,
+    /// "disqualify iff the broadcast share fails verification."
+    ///
+    /// The useful outcome here is repair, not blame: the dealer's
+    /// disclosure is public and verified, so the accuser adopts it as
+    /// their share and the run continues. Attributing this case would
+    /// need an authenticated point-to-point record of the original
+    /// delivery (a dealer signature over each share, or shares encrypted
+    /// to each recipient's published key and broadcast for resolution),
+    /// which this crate does not provide because it does no networking at
+    /// all (module docs).
+    DisclosureIsValidButContradictsTheAccusersClaim,
     /// The dealer's disclosure verifies and matches exactly what the
     /// accuser claims to have received — which, being equal, also
     /// verifies. The complaint was mistaken or malicious; the dealer is
@@ -256,11 +337,13 @@ pub enum ComplaintVerdict {
 }
 
 impl ComplaintVerdict {
-    /// `true` for either faulty verdict — the outcome
+    /// `true` only for [`Self::DealerCannotProduceAValidShare`] — the one
+    /// verdict decided entirely from the dealer's own published values,
+    /// and therefore the only one a dealer can be excluded on. The outcome
     /// [`finalize_key_share_excluding_faulty`] needs, without the caller
-    /// having to match on both variants that mean "exclude this dealer."
+    /// having to reason about which variants mean "exclude this dealer."
     pub fn is_faulty(&self) -> bool {
-        !matches!(self, ComplaintVerdict::ComplaintWasUnfounded)
+        matches!(self, ComplaintVerdict::DealerCannotProduceAValidShare)
     }
 }
 
@@ -276,11 +359,19 @@ pub fn resolve_complaint(
     complaint: &Complaint,
     disclosed_share: &Scalar,
 ) -> ComplaintVerdict {
+    // Checked before anything else, so a complaint naming an impossible
+    // accuser can never be scored as a fault against the dealer: the
+    // dealer correctly refuses to disclose anything for it
+    // ([`Dealer::share_for`] returns `None`), and that refusal must not
+    // read as "could not produce a valid share."
+    if !is_valid_participant_id(complaint.accuser) {
+        return ComplaintVerdict::MalformedComplaint;
+    }
     if !verify_share(dealer_commitments, complaint.accuser, disclosed_share) {
         return ComplaintVerdict::DealerCannotProduceAValidShare;
     }
     if disclosed_share != &complaint.received_share {
-        return ComplaintVerdict::DealersDisclosureContradictsWhatWasSent;
+        return ComplaintVerdict::DisclosureIsValidButContradictsTheAccusersClaim;
     }
     ComplaintVerdict::ComplaintWasUnfounded
 }
@@ -303,6 +394,13 @@ pub fn verify_share(
     participant_id: ParticipantId,
     share: &Scalar,
 ) -> bool {
+    // Not a participant id, so not a share to verify — see
+    // [`is_valid_participant_id`]. Callers that need to tell "invalid id"
+    // apart from "invalid share" (only [`resolve_complaint`] does) check
+    // the id themselves first.
+    if !is_valid_participant_id(participant_id) {
+        return false;
+    }
     let expected = evaluate_commitment(commitments, scalar_from_id(participant_id));
     share * RISTRETTO_BASEPOINT_POINT == expected
 }
@@ -324,11 +422,24 @@ impl Drop for KeyShare {
 /// Combines every dealer's contribution (verified shares for this
 /// participant, and every dealer's `C_0` commitment) into this
 /// participant's final [`KeyShare`].
+/// # Panics
+/// Panics if `participant_id` is not a valid participant id (see
+/// [`is_valid_participant_id`]). A `KeyShare` is the only value that
+/// carries a participant id onward into [`frost`] signing and
+/// [`combine_partials`], so refusing to mint one here is what keeps the
+/// id-zero case out of every Lagrange interpolation downstream. This is a
+/// caller-side configuration error — `participant_id` is this
+/// participant's own identity in a DKG they ran, never something an
+/// adversary supplies.
 pub fn finalize_key_share(
     participant_id: ParticipantId,
     verified_shares_from_each_dealer: &[Scalar],
     each_dealers_c0: &[RistrettoPoint],
 ) -> KeyShare {
+    assert!(
+        is_valid_participant_id(participant_id),
+        "participant id 0 is the group secret's own evaluation point, not a participant"
+    );
     let secret_share = verified_shares_from_each_dealer
         .iter()
         .fold(Scalar::ZERO, |acc, s| acc + s);
@@ -625,7 +736,7 @@ mod tests {
             dealer_index: 0,
             received_share: shares[&4],
         };
-        let disclosed = dealer.share_for(4);
+        let disclosed = dealer.share_for(4).unwrap();
         assert_eq!(
             resolve_complaint(&commitments, &complaint, &disclosed),
             ComplaintVerdict::ComplaintWasUnfounded
@@ -633,32 +744,96 @@ mod tests {
         assert!(!resolve_complaint(&commitments, &complaint, &disclosed).is_faulty());
     }
 
+    /// The accuser's `received_share` is an unauthenticated claim about a
+    /// message nobody else witnessed, so a disagreement between it and the
+    /// dealer's verified disclosure is reported, but never blamed on the
+    /// dealer. This crate previously returned a *faulty* verdict here,
+    /// which is the eviction attack the next test spells out.
     #[test]
-    fn a_share_corrupted_in_transit_is_caught_even_though_the_dealer_computed_it_honestly() {
+    fn a_disagreement_the_evidence_cannot_attribute_is_reported_without_blaming_the_dealer() {
         let dealer = Dealer::new(3, 5);
         let (commitments, shares) = dealer.reveal();
-        // The accuser claims to have received something other than what
-        // the dealer's polynomial actually evaluates to for them —
-        // standing in for corruption between `Dealer::reveal` and however
-        // the caller's transport delivered it (this crate does no
-        // networking — module docs).
-        let mut corrupted = shares[&4];
-        corrupted += Scalar::ONE;
+        let mut claimed = shares[&4];
+        claimed += Scalar::ONE;
         let complaint = Complaint {
             accuser: 4,
             dealer_index: 0,
-            received_share: corrupted,
+            received_share: claimed,
         };
+
         // The dealer, confronted, recomputes and discloses the *real*
         // share — which verifies fine against their own commitments, but
         // doesn't match what the accuser claims to have received.
-        let disclosed = dealer.share_for(4);
+        let disclosed = dealer.share_for(4).unwrap();
         let verdict = resolve_complaint(&commitments, &complaint, &disclosed);
         assert_eq!(
             verdict,
-            ComplaintVerdict::DealersDisclosureContradictsWhatWasSent
+            ComplaintVerdict::DisclosureIsValidButContradictsTheAccusersClaim
         );
-        assert!(verdict.is_faulty());
+        assert!(
+            !verdict.is_faulty(),
+            "an honest dealer must not be excludable on an unverifiable claim"
+        );
+        // ...and the disclosure is a usable repair: it verifies, so the
+        // accuser can simply adopt it and the run continues.
+        assert!(verify_share(&commitments, 4, &disclosed));
+    }
+
+    /// The attack the rule above closes, stated as a property: a single
+    /// malicious participant fabricating complaints must not be able to
+    /// exclude every honest dealer, which would leave them alone
+    /// determining the group key.
+    #[test]
+    fn a_lying_accuser_cannot_disqualify_a_single_honest_dealer_let_alone_all_of_them() {
+        let dealers: Vec<Dealer> = (0..5).map(|_| Dealer::new(3, 5)).collect();
+        let liar: ParticipantId = 2;
+
+        for (index, dealer) in dealers.iter().enumerate() {
+            let (commitments, _) = dealer.reveal();
+            let complaint = Complaint {
+                accuser: liar,
+                dealer_index: index,
+                // Pure fabrication: never anything this dealer dealt.
+                received_share: Scalar::from(999_999u64),
+            };
+            let disclosed = dealer
+                .share_for(liar)
+                .expect("a real participant id always has a share");
+            assert!(
+                !resolve_complaint(&commitments, &complaint, &disclosed).is_faulty(),
+                "dealer {index} was excluded on a fabricated complaint"
+            );
+        }
+    }
+
+    /// Participant 0 is the evaluation point at which the dealer's secret
+    /// itself lives, so answering a complaint that names it would publish
+    /// that secret rather than a share of it. The dealer must refuse, and
+    /// the refusal must not be scored against the dealer.
+    #[test]
+    fn a_complaint_naming_participant_zero_neither_discloses_a_secret_nor_blames_the_dealer() {
+        let dealer = Dealer::new(3, 5);
+        let (commitments, _) = dealer.reveal();
+
+        assert_eq!(
+            dealer.share_for(0),
+            None,
+            "evaluating the dealing polynomial at zero returns the secret, not a share"
+        );
+        assert_eq!(
+            dealer.share_for(6),
+            None,
+            "no share was ever dealt to a participant outside the group"
+        );
+
+        let complaint = Complaint {
+            accuser: 0,
+            dealer_index: 0,
+            received_share: Scalar::ZERO,
+        };
+        let verdict = resolve_complaint(&commitments, &complaint, &Scalar::ZERO);
+        assert_eq!(verdict, ComplaintVerdict::MalformedComplaint);
+        assert!(!verdict.is_faulty());
     }
 
     #[test]
@@ -677,7 +852,7 @@ mod tests {
         let dealer_a = Dealer::new(3, 5);
         let dealer_b = Dealer::new(3, 5);
         let (commitments_a, _) = dealer_a.reveal();
-        let mismatched_disclosure = dealer_b.share_for(4);
+        let mismatched_disclosure = dealer_b.share_for(4).unwrap();
 
         let complaint = Complaint {
             accuser: 4,
@@ -707,8 +882,16 @@ mod tests {
             dealer_shares.push(s);
         }
 
+        // The fault has to be one *both* paths can decide from public
+        // values: a dealing inconsistent with the commitments this dealer
+        // itself broadcast. (Corrupting a delivered share instead would
+        // only be visible to the batch path, which is given the dealer's
+        // authentic output directly — the complaint path sees the
+        // accuser's unverifiable claim about it, and correctly refuses to
+        // blame the dealer for that. See
+        // `a_disagreement_the_evidence_cannot_attribute_is_reported_without_blaming_the_dealer`.)
         let faulty_dealer = 2usize;
-        *dealer_shares[faulty_dealer].get_mut(&4).unwrap() += Scalar::ONE;
+        dealer_commitments[faulty_dealer][1] += RISTRETTO_BASEPOINT_POINT;
 
         let batch_excluded = identify_faulty_dealers(&dealer_commitments, &dealer_shares);
         assert_eq!(batch_excluded, vec![faulty_dealer]);
@@ -727,8 +910,11 @@ mod tests {
             dealer_index: faulty_dealer,
             received_share: received,
         };
-        let disclosed = dealers[faulty_dealer].share_for(4);
+        let disclosed = dealers[faulty_dealer]
+            .share_for(4)
+            .expect("a real participant id always has a share");
         let verdict = resolve_complaint(&dealer_commitments[faulty_dealer], &complaint, &disclosed);
+        assert_eq!(verdict, ComplaintVerdict::DealerCannotProduceAValidShare);
         assert!(verdict.is_faulty());
     }
 }

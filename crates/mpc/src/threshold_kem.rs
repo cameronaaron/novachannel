@@ -95,7 +95,18 @@ pub struct OperatorKeyPair {
 }
 
 impl OperatorKeyPair {
+    /// # Panics
+    /// Panics if `id` is not a valid participant id (see
+    /// [`crate::is_valid_participant_id`]): the master secret
+    /// [`encrypt_to_group`] shares out is the constant term of its
+    /// polynomial, so an operator at evaluation point zero would receive
+    /// that secret whole rather than a share of it, and could decrypt
+    /// alone regardless of the threshold.
     pub fn generate(id: ParticipantId) -> Self {
+        assert!(
+            crate::is_valid_participant_id(id),
+            "operator id 0 would receive the master secret itself, not a share of it"
+        );
         let mut rng = csprng();
         let (secret, public) = MlKem1024::generate_keypair_from_rng(&mut rng);
         OperatorKeyPair { id, public, secret }
@@ -176,6 +187,16 @@ pub fn encrypt_to_group(
     plaintext: &[u8],
 ) -> GroupCiphertext {
     assert!(threshold >= 1 && (threshold as usize) <= operators.len());
+    // `operators` is a caller-assembled map, so the id invariant
+    // `OperatorKeyPair::generate` enforces at key-generation time has to
+    // be re-checked here: an entry at evaluation point zero would be
+    // handed the master secret itself.
+    assert!(
+        operators
+            .keys()
+            .all(|&id| crate::is_valid_participant_id(id)),
+        "operator id 0 would receive the master secret itself, not a share of it"
+    );
 
     let mut rng = csprng();
     let mut master_secret = Scalar::random(&mut rng);
