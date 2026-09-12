@@ -1168,9 +1168,19 @@ impl Group {
                 leaf_index,
                 key_package,
             } => {
+                // Bounds first, then index: `leaf_to_node` is
+                // `capacity - 1 + leaf`, which for an attacker-chosen
+                // `u32::MAX` overflows `usize` on a 32-bit target and
+                // panics under this workspace's `overflow-checks = true`.
+                // Computing it before the range check left that one
+                // reordering away from a remote panic.
+                if *leaf_index as usize >= self.capacity {
+                    return Err(Error::Malformed(
+                        "add targets a non-blank or out-of-range leaf",
+                    ));
+                }
                 let node = leaf_to_node(self.capacity, *leaf_index as usize);
-                if *leaf_index as usize >= self.capacity || !matches!(nodes[node], TreeNode::Blank)
-                {
+                if !matches!(nodes[node], TreeNode::Blank) {
                     return Err(Error::Malformed(
                         "add targets a non-blank or out-of-range leaf",
                     ));

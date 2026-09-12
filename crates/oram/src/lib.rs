@@ -145,9 +145,37 @@ impl<V> ServerStorage<V> for InMemoryServer<V> {
     }
 }
 
+/// The largest tree depth this crate will build.
+///
+/// `2^40` leaves is already an absurd ORAM — the bucket array alone would
+/// be `2^41` entries — but the bound exists for a sharper reason than
+/// taste: [`depth_for_capacity`] can return up to 64, and `1u64 << 64` is
+/// a shift overflow that panics under this workspace's
+/// `overflow-checks = true` release profile, while `2 * num_leaves` would
+/// wrap. Without a stated maximum, `PathOram::new(u64::MAX, 4)` failed
+/// with an opaque arithmetic panic from deep inside the constructor
+/// instead of saying what was wrong.
+pub const MAX_DEPTH: u32 = 40;
+
 /// Rounds a desired leaf capacity up to the tree depth that provides it.
+///
+/// Computed in integer arithmetic rather than via `f64::log2().ceil()`.
+/// The float form is exact for the powers of two it is usually handed,
+/// but a `u64` above `2^53` does not round-trip through `f64`, so
+/// capacities near the top of the range could round to a depth one too
+/// small — silently building a tree that does not hold what the caller
+/// asked for. `next_power_of_two().ilog2()` has no such range.
+///
+/// # Panics
+/// Panics if `capacity_leaves` needs a depth beyond [`MAX_DEPTH`].
 pub fn depth_for_capacity(capacity_leaves: u64) -> u32 {
-    (capacity_leaves.max(1) as f64).log2().ceil() as u32
+    // Checked before `next_power_of_two`, which itself overflows near the
+    // top of the `u64` range rather than saturating.
+    assert!(
+        capacity_leaves <= 1u64 << MAX_DEPTH,
+        "capacity_leaves is beyond this crate's MAX_DEPTH of {MAX_DEPTH}"
+    );
+    capacity_leaves.max(1).next_power_of_two().ilog2()
 }
 
 /// The oblivious client: owns exactly the secret state that makes Path
@@ -1344,6 +1372,36 @@ mod tests {
     /// A dummy must be unrecoverable as a block even by someone holding
     /// the key: the tag that distinguishes it lives inside the AEAD, so
     /// `open_oram_block` is where it is dropped.
+    /// `depth_for_capacity` used `(n as f64).log2().ceil()`, which is
+    /// exact for small powers of two but not across the whole `u64`
+    /// range: values above `2^53` do not round-trip through `f64`, so a
+    /// capacity could round down to a depth that does not hold it. The
+    /// integer form has no such range, and an absurd capacity now fails
+    /// with a message rather than a shift-overflow panic from inside the
+    /// constructor.
+    #[test]
+    fn depth_for_capacity_is_exact_across_the_whole_supported_range() {
+        assert_eq!(depth_for_capacity(1), 0);
+        assert_eq!(depth_for_capacity(2), 1);
+        assert_eq!(depth_for_capacity(3), 2);
+        assert_eq!(depth_for_capacity(4), 2);
+        assert_eq!(depth_for_capacity(5), 3);
+
+        for d in 0..=MAX_DEPTH {
+            let exact = 1u64 << d;
+            assert_eq!(depth_for_capacity(exact), d, "2^{d} exactly");
+            if d < MAX_DEPTH {
+                assert_eq!(depth_for_capacity(exact + 1), d + 1, "2^{d} + 1");
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "beyond this crate's MAX_DEPTH")]
+    fn a_capacity_beyond_the_supported_depth_says_so_rather_than_overflowing() {
+        depth_for_capacity(u64::MAX);
+    }
+
     #[test]
     fn a_dummy_block_is_authenticated_but_never_returned_as_a_block() {
         let key = [5u8; 32];
