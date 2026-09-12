@@ -93,6 +93,7 @@ const COMMIT_SIGNATURE_CONTEXT: &[u8] = b"novachannel group v1 commit";
 const LEAF_KEY_PACKAGE_POP_CONTEXT: &[u8] = b"novachannel group v1 leaf key package";
 const PATH_SECRET_AAD_CONTEXT: &[u8] = b"novachannel group v1 path secret";
 const WELCOME_AAD_CONTEXT: &[u8] = b"novachannel group v1 welcome";
+const WELCOME_SIGNATURE_CONTEXT: &[u8] = b"novachannel group v1 welcome snapshot";
 
 // ---------------------------------------------------------------------
 // Tree indexing over a fixed-capacity, array-based complete binary tree.
@@ -636,6 +637,28 @@ fn commit_signed_bytes(
     w.into_bytes()
 }
 
+/// What a [`Welcome`]'s signature covers: the serialized
+/// [`WelcomeSnapshot`], domain-separated from every other signature in
+/// this crate.
+///
+/// A `Welcome` reaches its recipient through [`seal_to_node`], which is a
+/// one-shot *sender-anonymous* envelope — anyone holding the joining
+/// member's published [`LeafKeyPackage`] can produce one that decrypts
+/// cleanly under that member's own keys, carrying arbitrary contents.
+/// Without this signature the snapshot's tree, epoch and epoch secret
+/// were therefore unauthenticated, and [`Group::join`] would build a
+/// group out of whatever they said. Signing it, and checking that
+/// signature against the identity the accompanying [`Commit`] names as
+/// its committer, is what makes a `Welcome` attributable to the member
+/// who actually committed — the property real MLS gets from signing its
+/// `GroupInfo`.
+fn welcome_signed_bytes(snapshot_bytes: &[u8]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.put_fixed(WELCOME_SIGNATURE_CONTEXT);
+    w.put_var(snapshot_bytes);
+    w.into_bytes()
+}
+
 impl Commit {
     pub fn write(&self, w: &mut Writer) {
         let signed = commit_signed_bytes(
@@ -1036,6 +1059,25 @@ impl Group {
         self.my_leaf
     }
 
+    /// The identity occupying `leaf`, or `None` if that leaf is blank or
+    /// out of range.
+    ///
+    /// This is what makes [`Self::open`]'s `(leaf_index, plaintext)`
+    /// return attributable: without it a caller could tell *which leaf* a
+    /// group message came from but had no way to ask whose leaf that is.
+    /// It is also how a member who just called [`Self::join`] learns who
+    /// committed them into the group, which is the identity they should be
+    /// pinning against whoever they expected an invitation from.
+    pub fn member_identity(&self, leaf: usize) -> Option<&PublicIdentity> {
+        if leaf >= self.capacity {
+            return None;
+        }
+        match &self.nodes[leaf_to_node(self.capacity, leaf)] {
+            TreeNode::Leaf(lp) => Some(&lp.identity),
+            _ => None,
+        }
+    }
+
     pub fn is_member(&self, leaf: usize) -> bool {
         leaf < self.capacity
             && matches!(
@@ -1073,8 +1115,14 @@ impl Group {
             nodes: self.nodes.clone(),
             target_leaf: target_leaf as u32,
         };
+        let mut sw = Writer::new();
+        snapshot.write(&mut sw);
+        let snapshot_bytes = sw.into_bytes();
+        let snapshot_signature = signer.try_sign(&welcome_signed_bytes(&snapshot_bytes))?;
+
         let mut w = Writer::new();
-        snapshot.write(&mut w);
+        w.put_var(&snapshot_bytes);
+        snapshot_signature.write(&mut w);
         let sealed = seal_to_node(&new_member.public_key, WELCOME_AAD_CONTEXT, &w.into_bytes())?;
         let welcome = Welcome { sealed };
 
@@ -1470,10 +1518,68 @@ impl Group {
             &welcome.sealed,
         )?;
         let mut r = Reader::new(&plaintext);
-        let mut snapshot = WelcomeSnapshot::read(&mut r)?;
+        let snapshot_bytes = r.get_var()?;
+        let snapshot_signature = HybridSignature::read(&mut r)?;
         if !r.finished() {
+            return Err(Error::Malformed("trailing bytes in welcome"));
+        }
+        let mut sr = Reader::new(snapshot_bytes);
+        let mut snapshot = WelcomeSnapshot::read(&mut sr)?;
+        if !sr.finished() {
             return Err(Error::Malformed("trailing bytes in welcome snapshot"));
         }
+
+        // The snapshot arrives through a sender-anonymous envelope, so on
+        // its own it is just bytes someone who knows this member's
+        // published key package chose. These four checks are what tie it
+        // to the `Commit` beside it, and that commit to a real member:
+        // same group, same epoch, and a commit that actually adds *this*
+        // member at *this* snapshot's target leaf. Without them a snapshot
+        // could name any leaf, any epoch, and any tree.
+        if commit.group_id != snapshot.group_id {
+            return Err(Error::Malformed(
+                "welcome and its commit are for different groups",
+            ));
+        }
+        if commit.from_epoch != snapshot.epoch {
+            return Err(Error::WrongState);
+        }
+        let my_public_key = NodePublicKey {
+            dh_public: my_key_package.dh_public,
+            kem_public: my_key_package.kem_public.clone(),
+        };
+        match &commit.op {
+            GroupOp::Add {
+                leaf_index,
+                key_package,
+            } if *leaf_index == snapshot.target_leaf
+                && key_package.public_key == my_public_key
+                && key_package.identity == my_key_package.identity => {}
+            _ => {
+                return Err(Error::Malformed(
+                    "commit does not add this member at the welcome's target leaf",
+                ))
+            }
+        }
+
+        // ...and the snapshot itself must be signed by whoever the commit
+        // names as its committer. `apply_commit` below checks the commit's
+        // own signature against the identity at this same leaf, so the two
+        // agree by construction: one identity vouched for both halves.
+        // Which identity that is, and whether it is one to accept a group
+        // invitation from, is the caller's to decide — read it back with
+        // [`Self::member_identity`] and pin it, the same way
+        // `crate::handshake` leaves peer-identity pinning to its caller.
+        let capacity = snapshot.capacity as usize;
+        let committer_leaf = commit.sender_leaf as usize;
+        if committer_leaf >= capacity {
+            return Err(Error::NotAGroupMember);
+        }
+        let committer_identity = match &snapshot.nodes[leaf_to_node(capacity, committer_leaf)] {
+            TreeNode::Leaf(lp) => lp.identity.clone(),
+            _ => return Err(Error::NotAGroupMember),
+        };
+        committer_identity.verify(&welcome_signed_bytes(snapshot_bytes), &snapshot_signature)?;
 
         let application_secret = derive_application_secret(&snapshot.epoch_secret)?;
         let mut group = Group {
@@ -1523,6 +1629,95 @@ mod tests {
             .unwrap();
         let bob = Group::join(bob_key_package, &welcome, &commit).unwrap();
         (alice, bob, alice_id, bob_id)
+    }
+
+    /// A `Welcome` travels inside a sender-anonymous envelope, so its
+    /// snapshot is only as trustworthy as its signature. Substituting one
+    /// group's welcome for another's — the shape a party who can inject
+    /// toward a joiner has available, since the commit itself is
+    /// broadcast in the clear — must be rejected, not joined.
+    #[test]
+    fn a_welcome_from_a_different_group_than_its_commit_is_rejected() {
+        let alice_id = Identity::generate();
+        let mallory_id = Identity::generate();
+        let bob_id = Identity::generate();
+        let bob_kp = MyLeafKeyPackage::generate(&bob_id);
+
+        let mut alice = Group::create(&alice_id, 4).unwrap();
+        let (alice_commit, _alice_welcome) = alice.propose_add(&alice_id, bob_kp.public()).unwrap();
+
+        // Mallory, in no group of Alice's, builds her own and "adds" Bob
+        // using only his published key package.
+        let mut mallory = Group::create(&mallory_id, 4).unwrap();
+        let (_mallory_commit, mallory_welcome) =
+            mallory.propose_add(&mallory_id, bob_kp.public()).unwrap();
+
+        assert!(matches!(
+            Group::join(bob_kp, &mallory_welcome, &alice_commit),
+            Err(Error::Malformed(_))
+        ));
+    }
+
+    /// The signature is what the binding rests on: a snapshot re-sealed by
+    /// someone who is not the committer must not be accepted, even when
+    /// every other field lines up with the genuine commit.
+    #[test]
+    fn a_welcome_snapshot_signed_by_anyone_but_the_committer_is_rejected() {
+        let alice_id = Identity::generate();
+        let mallory_id = Identity::generate();
+        let bob_id = Identity::generate();
+        let bob_kp = MyLeafKeyPackage::generate(&bob_id);
+
+        let mut alice = Group::create(&alice_id, 4).unwrap();
+        let bob_public = bob_kp.public();
+        let (alice_commit, alice_welcome) =
+            alice.propose_add(&alice_id, bob_public.clone()).unwrap();
+
+        // Recover the genuine snapshot bytes (only Bob can, which is the
+        // point: this models a party who has Bob's keys, or equivalently
+        // any tampering that preserves the snapshot exactly) and re-sign
+        // them as Mallory.
+        let plaintext = open_from_node(
+            &bob_kp.dh_secret,
+            &bob_kp.kem_secret,
+            WELCOME_AAD_CONTEXT,
+            &alice_welcome.sealed,
+        )
+        .unwrap();
+        let mut r = Reader::new(&plaintext);
+        let snapshot_bytes = r.get_var().unwrap().to_vec();
+
+        let forged_signature = mallory_id.sign(&welcome_signed_bytes(&snapshot_bytes));
+        let mut w = Writer::new();
+        w.put_var(&snapshot_bytes);
+        forged_signature.write(&mut w);
+        let forged = Welcome {
+            sealed: seal_to_node(&bob_public.public_key, WELCOME_AAD_CONTEXT, &w.into_bytes())
+                .unwrap(),
+        };
+
+        assert!(matches!(
+            Group::join(bob_kp, &forged, &alice_commit),
+            Err(Error::BadSignature)
+        ));
+    }
+
+    /// A joiner must be able to find out who committed them in, which is
+    /// the identity they are meant to pin. Before `member_identity`
+    /// existed there was no way to ask.
+    #[test]
+    fn a_joiner_can_read_back_the_identity_that_committed_them_in() {
+        let (alice, bob, alice_id, bob_id) = two_member_group();
+
+        assert_eq!(bob.member_identity(0), Some(&alice_id.public()));
+        assert_eq!(bob.member_identity(1), Some(&bob_id.public()));
+        assert_eq!(bob.member_identity(2), None, "blank leaf");
+        assert_eq!(bob.member_identity(99), None, "out of range");
+
+        // Both sides agree on the roster, which is what makes
+        // `Group::open`'s leaf index attributable at all.
+        assert_eq!(alice.member_identity(0), bob.member_identity(0));
+        assert_eq!(alice.member_identity(1), bob.member_identity(1));
     }
 
     #[test]
