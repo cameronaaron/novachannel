@@ -112,7 +112,18 @@ impl DummyScheduler {
     /// if a passive observer can tell real and dummy packets apart by any
     /// other signal (size, timing jitter, ...).
     pub fn decide(&self, has_real_message: bool, rng: &mut impl Rng) -> bool {
-        has_real_message || rng.random_bool(self.dummy_probability)
+        // The draw happens unconditionally, and is discarded when a real
+        // message is queued. Writing this as
+        // `has_real_message || rng.random_bool(..)` is equivalent in
+        // return value but short-circuits, so the number of random values
+        // consumed would depend on the very bit this scheduler exists to
+        // hide. That matters whenever the caller's `rng` is observable in
+        // any way the presence bit is not — shared across users or
+        // streams, seeded and replayed, or reasoned about for its
+        // consumption count — and it costs one discarded sample per slot
+        // to remove the question entirely.
+        let dummy = rng.random_bool(self.dummy_probability);
+        has_real_message || dummy
     }
 }
 
@@ -440,6 +451,54 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
+
+    /// Randomness consumption must not depend on the presence bit. A
+    /// short-circuiting `decide` drew a sample only in empty slots, which
+    /// makes an `rng` shared or replayed across slots a side channel for
+    /// exactly the value this scheduler is calibrated to hide. Two
+    /// identically-seeded generators driven through opposite ground-truth
+    /// sequences must end up in the same state.
+    #[test]
+    fn the_scheduler_consumes_the_same_randomness_whether_or_not_a_message_is_queued() {
+        let scheduler = DummyScheduler::new(0.5);
+        let mut all_real = ChaCha20Rng::seed_from_u64(4242);
+        let mut none_real = ChaCha20Rng::seed_from_u64(4242);
+
+        for _ in 0..100 {
+            assert!(scheduler.decide(true, &mut all_real));
+            let _ = scheduler.decide(false, &mut none_real);
+        }
+
+        // Same seed, same number of draws: the next value each yields is
+        // the same one. It would not be if the busy run had skipped its
+        // draws.
+        assert_eq!(
+            all_real.random_range(0..u64::MAX),
+            none_real.random_range(0..u64::MAX),
+            "the two runs consumed different amounts of randomness"
+        );
+    }
+
+    /// The same property through `GridScheduler::tick`, which is the API a
+    /// caller actually drives once per slot.
+    #[test]
+    fn the_grid_scheduler_consumes_the_same_randomness_whether_or_not_a_message_is_queued() {
+        let mut busy: GridScheduler<u32> = GridScheduler::new(0.5);
+        let mut idle: GridScheduler<u32> = GridScheduler::new(0.5);
+        let mut busy_rng = ChaCha20Rng::seed_from_u64(7);
+        let mut idle_rng = ChaCha20Rng::seed_from_u64(7);
+
+        for i in 0..100u32 {
+            busy.enqueue(i);
+            let _ = busy.tick(&mut busy_rng);
+            let _ = idle.tick(&mut idle_rng);
+        }
+
+        assert_eq!(
+            busy_rng.random_range(0..u64::MAX),
+            idle_rng.random_range(0..u64::MAX)
+        );
+    }
 
     #[test]
     fn grid_scheduler_never_transmits_a_real_message_the_same_tick_it_was_enqueued_unless_ticked() {
