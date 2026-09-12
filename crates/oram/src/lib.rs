@@ -45,6 +45,13 @@
 //! opaque `Vec<u8>` values, e.g. serialized rate-limit counters or
 //! nullifier-set entries, the module docs' own motivating example — as an
 //! opt-in [`ServerStorage`] decorator requiring no change to [`Client`].
+//! That decorator is also what makes the obliviousness claim at the top of
+//! this document true against a server that watches *sizes* and not just
+//! indices: it writes every bucket back holding exactly `Z` equal-length
+//! ciphertexts, padding with encrypted dummies, so neither a bucket's real
+//! occupancy nor a block's real value length reaches the server. Without
+//! it — storing plaintext `V` through a bare [`InMemoryServer`] — both are
+//! visible, along with the values themselves.
 //! What it does not do: manage or distribute the AEAD key it's
 //! constructed with, the same "key provisioning is the caller's problem"
 //! boundary `novachannel::handshake`'s peer-identity pinning already draws
@@ -674,6 +681,35 @@ impl<V: Clone + AsRef<[u8]>, S: VerifiableServerStorage<V>> Client<V, S> {
 // changed" across accesses, a real leak independent of which physical
 // bucket it landed in.
 //
+// Encrypting each block is necessary but not sufficient, and this layer
+// used to stop there. Two things about a bucket stayed visible to the
+// server through the ciphertext:
+//
+//   - **How many blocks it holds.** `Client::evict_path` writes back
+//     however many stash blocks were eligible for that bucket, between 0
+//     and `Z`, and the server saw that count directly. Standard Path ORAM
+//     (Stefanov et al. §3.2) writes back exactly `Z` slots on every
+//     bucket of the path, padding with encrypted dummies, precisely
+//     because per-bucket load is correlated with the access pattern the
+//     scheme exists to hide.
+//   - **How long each block's value is.** `V = Vec<u8>` is caller-shaped
+//     and was sealed at whatever length it happened to have, so one
+//     900-byte block among 40-byte ones is as good as a label. Path ORAM
+//     is defined over fixed-size blocks for the same reason.
+//
+// Both are closed here rather than documented as caveats, because a
+// storage layer whose ciphertext lengths track the access pattern does
+// not provide the property this crate's own module docs open by
+// claiming. [`EncryptingServerStorage::new`] takes a fixed
+// `block_value_len`; every sealed block carries `tag || id || length ||
+// value` padded to that length, so every block ciphertext is the same
+// size whatever it holds, and every bucket is written back holding
+// exactly `bucket_capacity` of them, dummies making up the difference.
+// What the server sees on a write is `Z` indistinguishable ciphertexts
+// of identical length, for every bucket on the path, on every access.
+// Dummies are dropped on the way back, so `Client` — and therefore the
+// Merkle hashing below — sees exactly the blocks it wrote.
+//
 // Composing with [`VerifiableServerStorage`] (`Client<Vec<u8>,
 // EncryptingServerStorage<IntegrityCheckedServer<Vec<u8>>>>`) needs no
 // third implementation either, and gets both properties at once: `Client`
@@ -704,31 +740,62 @@ use zeroize::Zeroize;
 
 const ORAM_NONCE_LEN: usize = 12;
 const ORAM_ID_LEN: usize = 8;
+const ORAM_TAG_LEN: usize = 1;
+const ORAM_VALUE_LEN_LEN: usize = 4;
+/// Marks a sealed block as carrying a real `(id, value)` rather than
+/// padding. Inside the AEAD, so the server cannot tell the two apart.
+const ORAM_TAG_REAL: u8 = 1;
+const ORAM_TAG_DUMMY: u8 = 0;
 
 /// One AEAD-sealed block: a 12-byte nonce prefix followed by the
-/// ChaCha20-Poly1305 ciphertext of `id.to_be_bytes() || value`.
+/// ChaCha20-Poly1305 ciphertext of
+/// `tag || id.to_be_bytes() || value_len.to_be_bytes() || value`,
+/// zero-padded so the plaintext is always exactly
+/// `ORAM_TAG_LEN + ORAM_ID_LEN + ORAM_VALUE_LEN_LEN + block_value_len`
+/// bytes — and therefore every sealed block on the wire is the same
+/// length, whatever it actually holds. See the section doc comment on why
+/// that, and the dummy padding `tag` enables, are part of the
+/// obliviousness property rather than tidiness.
+///
+/// # Panics
+/// Panics if `value` is longer than `block_value_len`; callers check this
+/// first and surface it as their own error.
 fn seal_oram_block(
     key: &[u8; 32],
     nonce: [u8; ORAM_NONCE_LEN],
+    tag: u8,
     id: BlockId,
     value: &[u8],
+    block_value_len: usize,
 ) -> Vec<u8> {
-    let mut plaintext = Vec::with_capacity(ORAM_ID_LEN + value.len());
+    assert!(
+        value.len() <= block_value_len,
+        "block value exceeds this EncryptingServerStorage's fixed block size"
+    );
+    let mut plaintext =
+        Vec::with_capacity(ORAM_TAG_LEN + ORAM_ID_LEN + ORAM_VALUE_LEN_LEN + block_value_len);
+    plaintext.push(tag);
     plaintext.extend_from_slice(&id.to_be_bytes());
+    plaintext.extend_from_slice(&(value.len() as u32).to_be_bytes());
     plaintext.extend_from_slice(value);
+    plaintext.resize(
+        ORAM_TAG_LEN + ORAM_ID_LEN + ORAM_VALUE_LEN_LEN + block_value_len,
+        0u8,
+    );
     let ciphertext = ChaCha20Poly1305::new(&Key::from(*key))
         .encrypt(&Nonce::from(nonce), plaintext.as_slice())
         .expect("ChaCha20Poly1305 encryption over a bounded plaintext cannot fail");
+    plaintext.zeroize();
     let mut out = Vec::with_capacity(ORAM_NONCE_LEN + ciphertext.len());
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&ciphertext);
     out
 }
 
-/// Inverse of [`seal_oram_block`]. `None` on authentication failure or a
-/// malformed length — see the section doc comment above for why the
-/// caller (`EncryptingServerStorage::read_and_clear`) treats that as "drop
-/// this block" rather than panicking.
+/// Inverse of [`seal_oram_block`]. `None` on authentication failure, a
+/// malformed length, or a dummy — see the section doc comment above for
+/// why the caller (`EncryptingServerStorage::read_and_clear`) treats all
+/// three as "this is not a block to return" rather than panicking.
 fn open_oram_block(key: &[u8; 32], sealed: &[u8]) -> Option<(BlockId, Vec<u8>)> {
     if sealed.len() < ORAM_NONCE_LEN {
         return None;
@@ -737,19 +804,31 @@ fn open_oram_block(key: &[u8; 32], sealed: &[u8]) -> Option<(BlockId, Vec<u8>)> 
     let nonce: [u8; ORAM_NONCE_LEN] = nonce_bytes
         .try_into()
         .expect("split_at(ORAM_NONCE_LEN) already guarantees the length");
-    let plaintext = ChaCha20Poly1305::new(&Key::from(*key))
+    let mut plaintext = ChaCha20Poly1305::new(&Key::from(*key))
         .decrypt(&Nonce::from(nonce), ciphertext)
         .ok()?;
-    if plaintext.len() < ORAM_ID_LEN {
+    let header = ORAM_TAG_LEN + ORAM_ID_LEN + ORAM_VALUE_LEN_LEN;
+    if plaintext.len() < header || plaintext[0] != ORAM_TAG_REAL {
+        plaintext.zeroize();
         return None;
     }
-    let (id_bytes, value) = plaintext.split_at(ORAM_ID_LEN);
     let id = BlockId::from_be_bytes(
-        id_bytes
+        plaintext[ORAM_TAG_LEN..ORAM_TAG_LEN + ORAM_ID_LEN]
             .try_into()
-            .expect("split_at(ORAM_ID_LEN) already guarantees the length"),
+            .expect("slice of exactly ORAM_ID_LEN bytes"),
     );
-    Some((id, value.to_vec()))
+    let value_len = u32::from_be_bytes(
+        plaintext[ORAM_TAG_LEN + ORAM_ID_LEN..header]
+            .try_into()
+            .expect("slice of exactly ORAM_VALUE_LEN_LEN bytes"),
+    ) as usize;
+    if header + value_len > plaintext.len() {
+        plaintext.zeroize();
+        return None;
+    }
+    let value = plaintext[header..header + value_len].to_vec();
+    plaintext.zeroize();
+    Some((id, value))
 }
 
 /// A [`ServerStorage<Vec<u8>>`] decorator that AEAD-seals every block
@@ -758,6 +837,10 @@ fn open_oram_block(key: &[u8; 32], sealed: &[u8]) -> Option<(BlockId, Vec<u8>)> 
 pub struct EncryptingServerStorage<S> {
     inner: S,
     key: [u8; 32],
+    /// The fixed plaintext size every block is padded to before sealing,
+    /// so that ciphertext length carries no information about what a
+    /// block holds. See the section doc comment.
+    block_value_len: usize,
     /// A strictly monotonic per-block nonce counter, not a random nonce:
     /// one key here can seal many blocks over a long-lived deployment, and
     /// ChaCha20-Poly1305 is catastrophic under nonce reuse, so a counter
@@ -775,12 +858,36 @@ impl<S> Drop for EncryptingServerStorage<S> {
 impl<S> EncryptingServerStorage<S> {
     /// `key` is a caller-provisioned 32-byte AEAD key — distributing and
     /// rotating it is the caller's problem (module docs).
-    pub fn new(inner: S, key: [u8; 32]) -> Self {
+    ///
+    /// `block_value_len` is the fixed size every stored value is padded to
+    /// before sealing. Path ORAM is defined over fixed-size blocks, and
+    /// this is where that becomes true rather than assumed: a value's real
+    /// length is recorded inside the AEAD and restored on read, but every
+    /// block ciphertext the server ever sees is identical in length. Pick
+    /// the largest value the application stores; writing a longer one
+    /// panics (see [`ServerStorage::write`]'s impl), and the only cost of
+    /// picking it too large is bandwidth.
+    ///
+    /// # Panics
+    /// Panics if `block_value_len` is zero — a block store that cannot
+    /// hold a byte is a configuration error, not a degenerate case worth
+    /// supporting.
+    pub fn new(inner: S, key: [u8; 32], block_value_len: usize) -> Self {
+        assert!(
+            block_value_len > 0,
+            "block_value_len must be at least 1 byte"
+        );
         EncryptingServerStorage {
             inner,
             key,
+            block_value_len,
             nonce_counter: 0,
         }
+    }
+
+    /// The fixed per-block value size this layer pads to.
+    pub fn block_value_len(&self) -> usize {
+        self.block_value_len
     }
 
     fn next_nonce(&mut self) -> [u8; ORAM_NONCE_LEN] {
@@ -795,6 +902,11 @@ impl<S> EncryptingServerStorage<S> {
 }
 
 impl<S: ServerStorage<Vec<u8>>> ServerStorage<Vec<u8>> for EncryptingServerStorage<S> {
+    /// Unseals the bucket, dropping the dummies [`Self::write`] padded it
+    /// with (and anything that fails authentication — see the section doc
+    /// comment). `Client` therefore sees exactly the blocks it wrote, and
+    /// the Merkle hashing above is computed over those, unchanged by the
+    /// padding.
     fn read_and_clear(&mut self, node: usize) -> Vec<Block<Vec<u8>>> {
         self.inner
             .read_and_clear(node)
@@ -804,17 +916,54 @@ impl<S: ServerStorage<Vec<u8>>> ServerStorage<Vec<u8>> for EncryptingServerStora
             .collect()
     }
 
+    /// Seals every block and pads the bucket out to `bucket_capacity`
+    /// with dummies, so the server always observes exactly
+    /// `bucket_capacity` ciphertexts of identical length per bucket
+    /// whatever the eviction actually placed there. The physical block id
+    /// handed to `inner` is always `0`: the real id lives inside the
+    /// ciphertext.
+    ///
+    /// # Panics
+    /// Panics if `blocks` holds more than `bucket_capacity` entries, or
+    /// any value longer than this storage's `block_value_len`. Both are
+    /// caller-side configuration errors — [`Client`] never exceeds the
+    /// bucket capacity it reads from this same trait, and block size is
+    /// chosen once at construction.
     fn write(&mut self, node: usize, blocks: Vec<Block<Vec<u8>>>) {
-        let sealed = blocks
-            .into_iter()
-            .map(|b| {
-                let nonce = self.next_nonce();
-                Block {
-                    id: 0,
-                    value: seal_oram_block(&self.key, nonce, b.id, &b.value),
-                }
-            })
-            .collect();
+        let capacity = self.inner.bucket_capacity();
+        assert!(
+            blocks.len() <= capacity,
+            "cannot write more blocks into a bucket than its capacity"
+        );
+        let block_value_len = self.block_value_len;
+        let dummies = capacity - blocks.len();
+
+        let mut sealed = Vec::with_capacity(capacity);
+        for b in blocks {
+            assert!(
+                b.value.len() <= block_value_len,
+                "block value exceeds this EncryptingServerStorage's fixed block size"
+            );
+            let nonce = self.next_nonce();
+            sealed.push(Block {
+                id: 0,
+                value: seal_oram_block(
+                    &self.key,
+                    nonce,
+                    ORAM_TAG_REAL,
+                    b.id,
+                    &b.value,
+                    block_value_len,
+                ),
+            });
+        }
+        for _ in 0..dummies {
+            let nonce = self.next_nonce();
+            sealed.push(Block {
+                id: 0,
+                value: seal_oram_block(&self.key, nonce, ORAM_TAG_DUMMY, 0, &[], block_value_len),
+            });
+        }
         self.inner.write(node, sealed);
     }
 
@@ -840,6 +989,11 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
+
+    /// Fixed block size for the `EncryptingServerStorage` tests below.
+    /// Comfortably larger than every value they store, which is the
+    /// point: the padding must be invisible to `Client`.
+    const TEST_BLOCK_LEN: usize = 48;
 
     /// A second, independent `ServerStorage` — wraps [`InMemoryServer`] but
     /// counts bucket touches, standing in for "a real networked server
@@ -1081,7 +1235,10 @@ mod tests {
         let depth = depth_for_capacity(capacity_leaves);
         let num_leaves = 1u64 << depth;
         let inner = InMemoryServer::new((2 * num_leaves) as usize, bucket_capacity);
-        Client::with_server(depth, EncryptingServerStorage::new(inner, key))
+        Client::with_server(
+            depth,
+            EncryptingServerStorage::new(inner, key, TEST_BLOCK_LEN),
+        )
     }
 
     #[test]
@@ -1109,6 +1266,97 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The property the encrypting layer exists to provide, asserted
+    /// against what the untrusted server physically holds rather than
+    /// against `Client`'s own view: after any access, every bucket the
+    /// server has ever been written is indistinguishable from every
+    /// other — same number of blocks, same ciphertext length for each —
+    /// regardless of how many real blocks the eviction actually placed
+    /// there or how long their values were.
+    ///
+    /// Before the dummy padding and fixed block size, neither held: a
+    /// bucket's block count was exactly its real occupancy (0..=Z), and
+    /// each ciphertext's length tracked its value's, so a server watching
+    /// storage could read both off directly.
+    #[test]
+    fn every_written_bucket_looks_identical_to_the_server_whatever_it_holds() {
+        let key = [3u8; 32];
+        let mut client = encrypting_client(64, 4, key);
+        let mut rng = ChaCha20Rng::seed_from_u64(99);
+
+        // Deliberately lopsided: wildly different value lengths, and
+        // enough writes that some buckets fill while others stay nearly
+        // empty.
+        for id in 0..40u64 {
+            let len = (id as usize * 7) % (TEST_BLOCK_LEN + 1);
+            client.write(id, vec![id as u8; len], &mut rng);
+        }
+        for id in 0..40u64 {
+            client.read(id, &mut rng);
+        }
+
+        let capacity = client.server.inner.bucket_capacity();
+        let mut expected_ciphertext_len = None;
+        let mut written_buckets = 0usize;
+        for bucket in &client.server.inner.buckets {
+            if bucket.is_empty() {
+                // Never written at all: the server already learns which
+                // nodes an access touches, so "untouched" is not new
+                // information. What must not vary is anything about a
+                // bucket that *has* been written.
+                continue;
+            }
+            written_buckets += 1;
+            assert_eq!(
+                bucket.len(),
+                capacity,
+                "a written bucket must always hold exactly Z blocks"
+            );
+            for block in bucket {
+                assert_eq!(block.id, 0, "the real id belongs inside the ciphertext");
+                let len = *expected_ciphertext_len.get_or_insert(block.value.len());
+                assert_eq!(
+                    block.value.len(),
+                    len,
+                    "every sealed block must be the same length"
+                );
+            }
+        }
+        assert!(
+            written_buckets > 1,
+            "instrument check: the workload must actually have written several buckets"
+        );
+
+        // ...and the padding is invisible above the storage layer: every
+        // value still round-trips at its own real length.
+        for id in 0..40u64 {
+            let len = (id as usize * 7) % (TEST_BLOCK_LEN + 1);
+            assert_eq!(
+                client.read(id, &mut rng),
+                Some(vec![id as u8; len]),
+                "id {id}"
+            );
+        }
+    }
+
+    /// A dummy must be unrecoverable as a block even by someone holding
+    /// the key: the tag that distinguishes it lives inside the AEAD, so
+    /// `open_oram_block` is where it is dropped.
+    #[test]
+    fn a_dummy_block_is_authenticated_but_never_returned_as_a_block() {
+        let key = [5u8; 32];
+        let dummy = seal_oram_block(&key, [0u8; ORAM_NONCE_LEN], ORAM_TAG_DUMMY, 0, &[], 16);
+        let real = seal_oram_block(&key, [1u8; ORAM_NONCE_LEN], ORAM_TAG_REAL, 42, b"hi", 16);
+
+        assert_eq!(
+            dummy.len(),
+            real.len(),
+            "a dummy must not be distinguishable by length"
+        );
+        assert_eq!(open_oram_block(&key, &dummy), None);
+        assert_eq!(open_oram_block(&key, &real), Some((42, b"hi".to_vec())));
     }
 
     #[test]
@@ -1140,7 +1388,10 @@ mod tests {
         let depth = depth_for_capacity(capacity_leaves);
         let num_leaves = 1u64 << depth;
         let inner = IntegrityCheckedServer::new((2 * num_leaves) as usize, bucket_capacity);
-        let mut client = Client::with_server(depth, EncryptingServerStorage::new(inner, key));
+        let mut client = Client::with_server(
+            depth,
+            EncryptingServerStorage::new(inner, key, TEST_BLOCK_LEN),
+        );
         client.init_empty_root();
         client
     }
