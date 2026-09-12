@@ -6,14 +6,18 @@
 //!     cargo run -p novachannel-rln --release --example proof_size
 //!
 //! # Reading the numbers
-//! FRI's conjectured soundness for this query/blowup/grinding combination
-//! is roughly `num_queries * log2(blowup_factor) + grinding_factor` bits
-//! (winterfell's own `ProofOptions` docs give this exact formula) — this
-//! example prints that alongside the actual measured proof size for each
-//! configuration, so the size/soundness tradeoff `ProofOptions` controls
-//! is visible directly rather than asserted. It doesn't fold in
-//! `FieldExtension`'s separate effect on soundness (see `air.rs`'s
-//! `default_proof_options` doc comment for that caveat).
+//! The security column is winterfell's own
+//! `Proof::conjectured_security`, read off each proof after it is
+//! generated — not the `num_queries * log2(blowup_factor) +
+//! grinding_factor` approximation this example used to print. That
+//! approximation is only the *query* term of winterfell's formula, which
+//! actually computes `min(field_security, query_security) - 1`, capped by
+//! the hash's collision resistance. Printing the query term alone
+//! overstated this crate's default by 21 bits (148 claimed, 127 real),
+//! because a 64-bit field under a quadratic extension caps
+//! `field_security` at 128 no matter how many queries are added. Reporting
+//! what the library computes, rather than a formula that disagrees with
+//! it, is the whole point of measuring.
 //!
 //! For comparison: a Groth16 proof is 2 G1 + 1 G2 elements — on BN254,
 //! that's 128 bytes compressed, independent of circuit size or the
@@ -26,6 +30,8 @@ use novachannel_rln::air::{self, Witness};
 use novachannel_rln::merkle::MerkleTree;
 use novachannel_rln::permutation::{compress2, Params};
 use novachannel_rln::{bytes_to_field, epoch_field, Identity};
+use winterfell::crypto::hashers::Blake3_256;
+use winterfell::math::fields::f64::BaseElement;
 use winterfell::{BatchingMethod, FieldExtension, ProofOptions, Prover};
 
 struct Config {
@@ -48,32 +54,39 @@ fn main() {
     // it, isolating that one relationship instead of conflating two dials.
     let configs = [
         Config {
-            label: "fewer queries, weaker",
+            label: "16 queries, no field extension",
             num_queries: 16,
             blowup_factor: 16,
             grinding_factor: 0,
             field_extension: FieldExtension::None,
         },
         Config {
-            label: "old default before the 128-bit hardening pass (~96-bit)",
+            label: "the default before the 128-bit hardening pass",
             num_queries: 24,
             blowup_factor: 16,
             grinding_factor: 0,
             field_extension: FieldExtension::None,
         },
         Config {
-            label: "this crate's default (~148-bit conjectured, see air.rs)",
+            label: "previous default: quadratic extension (field-capped)",
             num_queries: 32,
             blowup_factor: 16,
             grinding_factor: 20,
             field_extension: FieldExtension::Quadratic,
         },
         Config {
-            label: "more queries, stronger (~192-bit conjectured)",
+            label: "this crate's default (see air.rs)",
+            num_queries: 32,
+            blowup_factor: 16,
+            grinding_factor: 20,
+            field_extension: FieldExtension::Cubic,
+        },
+        Config {
+            label: "more queries, same cap: queries are not the binding term",
             num_queries: 48,
             blowup_factor: 16,
-            grinding_factor: 0,
-            field_extension: FieldExtension::None,
+            grinding_factor: 20,
+            field_extension: FieldExtension::Cubic,
         },
     ];
 
@@ -93,8 +106,8 @@ fn main() {
     let y = identity.sk + a1 * x;
 
     println!(
-        "{:<45} {:>10} {:>10} {:>18} {:>14}",
-        "config", "queries", "blowup", "~conjectured bits", "proof size"
+        "{:<55} {:>8} {:>8} {:>11} {:>17} {:>14}",
+        "config", "queries", "blowup", "extension", "conjectured bits", "proof size"
     );
     for c in &configs {
         let options = ProofOptions::new(
@@ -122,13 +135,16 @@ fn main() {
         let proof = prover.prove(trace).expect("proof generation failed");
         let bytes = proof.to_bytes();
 
-        let conjectured_bits =
-            (c.num_queries as f64) * (c.blowup_factor as f64).log2() + c.grinding_factor as f64;
+        // Winterfell's own computation, not a re-derivation of it.
+        let conjectured_bits = proof
+            .conjectured_security::<Blake3_256<BaseElement>>()
+            .bits();
         println!(
-            "{:<45} {:>10} {:>10} {:>18.0} {:>10} bytes",
+            "{:<55} {:>8} {:>8} {:>11} {:>17} {:>8} bytes",
             c.label,
             c.num_queries,
             c.blowup_factor,
+            format!("{:?}", c.field_extension),
             conjectured_bits,
             bytes.len()
         );
@@ -136,5 +152,12 @@ fn main() {
 
     println!(
         "\nGroth16 comparison point: 128 bytes compressed (BN254), independent of circuit size."
+    );
+    println!(
+        "Note the first two rows: with no field extension a 64-bit base field caps conjectured\n\
+         security at 63 bits however many queries are added, which is why the extension degree --\n\
+         not the query count -- is the dial that matters here. The last row shows the other end of\n\
+         the same story: past a cubic extension the cap is Blake3_256's 128-bit collision\n\
+         resistance, so extra queries buy proof size and nothing else."
     );
 }

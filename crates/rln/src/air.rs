@@ -642,20 +642,52 @@ impl Prover for RlnProver {
     }
 }
 
-/// Proof options targeting 128+ bits of conjectured security.
+/// Proof options giving 127 bits of conjectured security — the maximum
+/// this field and extension degree admit. Measured, not derived: run
+/// `cargo run -p novachannel-rln --release --example proof_size`, which
+/// reads the number off winterfell's own `Proof::conjectured_security`.
 ///
-/// Winterfell's own `ProofOptions` docs give the formula this is built
-/// from: conjectured soundness is bounded by `num_queries *
-/// log2(blowup_factor) + grinding_factor`, i.e. `32 * log2(16) + 20 =
-/// 32*4 + 20 = 148` bits here — comfortably past 128 with margin, not
-/// pinned exactly to the line. `FieldExtension::Quadratic` (bumped from
-/// `None`) addresses the separate caveat those same docs raise: even a
-/// ~128-bit base field can fall short of ~100+ bits of *field-related*
-/// soundness (as opposed to query-based soundness) without an extension,
-/// since that margin depends on the field size relative to the evaluation
-/// domain, not on `num_queries`/`blowup_factor` at all -- and now matters
-/// more than before, since the base field itself shrank from f128 to the
-/// 64-bit Goldilocks field.
+/// # Why 127 and not 148
+/// This doc comment previously claimed 148 bits, from winterfell's
+/// `num_queries * log2(blowup_factor) + grinding_factor = 32*4 + 20`.
+/// That is only the *query* term. Winterfell's actual computation
+/// (`winter-air`'s `ConjecturedSecurity::compute`) is
+///
+/// ```text
+/// min(min(field_security, query_security) - 1, hash_collision_resistance)
+/// ```
+///
+/// where `field_security = base_field_bits * field_extension_degree`.
+/// For Goldilocks under a quadratic extension that is `64 * 2 = 128`, so
+/// the result is `min(min(128, 148) - 1, 128) = 127`: the field, not the
+/// query count, is the binding term, and always was. The claimed 148 was
+/// never achievable at any query count. §6.20's own audit-trail entry
+/// inherited the same arithmetic and is corrected in
+/// `ENGINEERING-STANDARDS.md` alongside this.
+///
+/// The same correction applies downward: the pre-hardening default
+/// (24 queries, `FieldExtension::None`) was described as ~96-bit and
+/// actually gave `min(64, 96) - 1 = 63` bits. The hardening pass was
+/// therefore worth far more than it claimed — 63 to 127, not 96 to 148.
+///
+/// # Why not spend a cubic extension to reach 128
+/// Tried and rejected on measurement. `FieldExtension::Cubic` does reach
+/// exactly 128 (`min(min(192, 148) - 1, 128)`, now capped by
+/// `Blake3_256`'s collision resistance), and every test in this crate
+/// passes under it. It costs, on the machine that ran
+/// `examples/proving_time`, **5.6x the proving time** (5.4ms median to
+/// 29.8ms) and 18% more proof size (27.0KB to 31.8KB) — for one bit. A
+/// rate-limited action pays that per message, and per the crate docs a
+/// constrained mobile prover pays a multiple of it again. One bit of
+/// conjectured security is not worth a 5.6x latency regression on the
+/// operation this crate exists to perform; naming the real number is.
+/// Recorded here rather than silently retried later
+/// (`ENGINEERING-STANDARDS.md` §0.3).
+///
+/// Raising the query count past 32 buys nothing at all now: with the
+/// field term binding at 128 and the hash term at 128, `query_security`
+/// is already slack at 148. `examples/proof_size`'s last row shows that
+/// directly — 48 queries, same 128-bit cap, 41% more proof bytes.
 pub fn default_proof_options() -> ProofOptions {
     ProofOptions::new(
         32,
@@ -728,8 +760,34 @@ pub fn prove(
 /// applies to verification itself). `catch_unwind` turns any such panic
 /// into an `Err` so a caller verifying attacker-supplied proofs degrades
 /// gracefully instead of crashing.
+/// The conjectured-security floor a proof must clear to be accepted.
+///
+/// This is a *verifier*-side parameter and it is the one that matters: a
+/// proof carries the [`ProofOptions`] it was generated under, so a prover
+/// — including a malicious one — picks its own security level, and this
+/// floor is the only thing that rejects a deliberately weak one.
+///
+/// It was 95, while `ENGINEERING-STANDARDS.md` §6.20 described this
+/// crate's parameters as raised to match the rest of the workspace's
+/// 128-bit bar. A prover could therefore have had a 96-bit proof accepted
+/// by a verifier the workspace documented as 128-bit — a 32-bit gap
+/// between the stated bar and the enforced one.
+///
+/// It is now 127, which is exactly what [`default_proof_options`]
+/// produces and, per that function's docs, the ceiling for Goldilocks
+/// under a quadratic extension. Pinning it there makes the floor tight:
+/// it admits the default and rejects everything weaker, including the
+/// 63-bit no-extension configurations `examples/proof_size` measures.
+/// Setting it to a round 128 instead would reject this crate's own
+/// proofs unless the default paid a measured 5.6x proving-time
+/// regression for the one remaining bit — see
+/// [`default_proof_options`] for that measurement and why it was not
+/// taken.
+pub const MIN_CONJECTURED_SECURITY_BITS: u32 = 127;
+
 pub fn verify(proof: Proof, pub_inputs: PublicInputs) -> Result<(), String> {
-    let min_opts = winterfell::AcceptableOptions::MinConjecturedSecurity(95);
+    let min_opts =
+        winterfell::AcceptableOptions::MinConjecturedSecurity(MIN_CONJECTURED_SECURITY_BITS);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         winterfell::verify::<
             RlnAir,

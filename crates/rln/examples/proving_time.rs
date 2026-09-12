@@ -45,36 +45,45 @@ fn median(durations: &mut [Duration]) -> Duration {
 }
 
 fn main() {
-    // Same four configurations `proof_size.rs` measures -- see that
-    // example's own comment for why blowup is held fixed at 16.
+    // Same configurations `proof_size.rs` measures -- see that example's
+    // own comments for why blowup is held fixed at 16, and for why the
+    // security column there is read off winterfell rather than
+    // re-derived from the query count.
     let configs = [
         Config {
-            label: "fewer queries, weaker",
+            label: "16 queries, no field extension",
             num_queries: 16,
             blowup_factor: 16,
             grinding_factor: 0,
             field_extension: FieldExtension::None,
         },
         Config {
-            label: "old default before the 128-bit hardening pass (~96-bit)",
+            label: "the default before the 128-bit hardening pass",
             num_queries: 24,
             blowup_factor: 16,
             grinding_factor: 0,
             field_extension: FieldExtension::None,
         },
         Config {
-            label: "this crate's default (~148-bit conjectured, see air.rs)",
+            label: "previous default: quadratic extension (field-capped)",
             num_queries: 32,
             blowup_factor: 16,
             grinding_factor: 20,
             field_extension: FieldExtension::Quadratic,
         },
         Config {
-            label: "more queries, stronger (~192-bit conjectured)",
+            label: "this crate's default (see air.rs)",
+            num_queries: 32,
+            blowup_factor: 16,
+            grinding_factor: 20,
+            field_extension: FieldExtension::Cubic,
+        },
+        Config {
+            label: "more queries, same cap: queries are not the binding term",
             num_queries: 48,
             blowup_factor: 16,
-            grinding_factor: 0,
-            field_extension: FieldExtension::None,
+            grinding_factor: 20,
+            field_extension: FieldExtension::Cubic,
         },
     ];
 
@@ -94,8 +103,8 @@ fn main() {
     let y = identity.sk + a1 * x;
 
     println!(
-        "{:<45} {:>10} {:>12} {:>12} {:>12} {:>12}",
-        "config", "queries", "prove min", "prove med", "prove max", "verify med"
+        "{:<55} {:>8} {:>11} {:>12} {:>12} {:>12} {:>12}",
+        "config", "queries", "extension", "prove min", "prove med", "prove max", "verify med"
     );
     for c in &configs {
         let options = ProofOptions::new(
@@ -136,7 +145,7 @@ fn main() {
         }
 
         // Verifying against `AcceptableOptions::OptionSet(vec![options])`
-        // rather than `air::verify`'s hardcoded 95-bit floor: the point
+        // rather than `air::verify`'s production security floor: the point
         // here is timing verification at whatever security level this
         // configuration actually provides, including the deliberately
         // weaker ones, not enforcing the production minimum.
@@ -160,8 +169,14 @@ fn main() {
         let verify_med = median(&mut verify_times);
 
         println!(
-            "{:<45} {:>10} {:>12?} {:>12?} {:>12?} {:>12?}",
-            c.label, c.num_queries, min, med, max, verify_med
+            "{:<55} {:>8} {:>11} {:>12?} {:>12?} {:>12?} {:>12?}",
+            c.label,
+            c.num_queries,
+            format!("{:?}", c.field_extension),
+            min,
+            med,
+            max,
+            verify_med
         );
     }
 

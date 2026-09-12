@@ -3,8 +3,9 @@ use novachannel_rln::merkle::MerkleTree;
 use novachannel_rln::permutation::Params;
 use novachannel_rln::share::recover_secret;
 use novachannel_rln::{bytes_to_field, epoch_field, prove_message, verify_message, Identity};
+use winterfell::crypto::hashers::Blake3_256;
 use winterfell::math::{fields::f64::BaseElement, FieldElement};
-use winterfell::Prover;
+use winterfell::{BatchingMethod, FieldExtension, ProofOptions, Prover};
 
 fn build_group(n: usize) -> (MerkleTree, Vec<Identity>) {
     build_group_at_depth(n, DEPTH)
@@ -334,4 +335,156 @@ fn corrupting_an_interior_trace_cell_never_produces_a_verifying_proof() {
             );
         }
     }
+}
+
+/// Two distinct messages must not collide in the rate-limit share's
+/// message-binding `x`, because RLN extracts a member's key only from two
+/// shares that *differ* in `x` — so a collision buys a second message in
+/// an epoch for free, which is the one thing this scheme exists to
+/// prevent. Both collision families below were findable by hand in the
+/// previous construction, with no cryptanalysis of the permutation at
+/// all; see `bytes_to_field`'s own docs.
+#[test]
+fn distinct_messages_do_not_collide_in_the_rate_limit_binding_value() {
+    // Family 1: the final chunk's zero padding was indistinguishable from
+    // trailing zero bytes in the message itself.
+    let padding_pairs: [(&[u8], &[u8]); 4] = [
+        (b"a", b"a\0"),
+        (b"hello", b"hello\0\0\0"),
+        (b"", b"\0"),
+        (b"transfer 10", b"transfer 10\0\0"),
+    ];
+    for (left, right) in padding_pairs {
+        assert_ne!(
+            bytes_to_field(left),
+            bytes_to_field(right),
+            "{left:?} and {right:?} bind to the same share"
+        );
+    }
+
+    // Family 2: a full 8-byte chunk was read as a u64 and reduced mod the
+    // Goldilocks prime, so `v` and `v + p` landed on the same element.
+    const GOLDILOCKS_P: u64 = 0xFFFF_FFFF_0000_0001;
+    for v in [0u64, 1, 12_345, 0xFFFF_FFFE] {
+        let left = v.to_le_bytes();
+        let right = v.wrapping_add(GOLDILOCKS_P).to_le_bytes();
+        assert_ne!(left, right, "test inputs must actually differ");
+        assert_ne!(
+            bytes_to_field(&left),
+            bytes_to_field(&right),
+            "chunks {v} and {v}+p bind to the same share"
+        );
+    }
+}
+
+/// The end-to-end consequence of the property above, stated as the
+/// rate-limit rule itself: a member who sends two *different* messages in
+/// one epoch has their key recovered. Under the previous
+/// `bytes_to_field`, the two messages below produced an identical `x`,
+/// so `recover_secret` returned `None` and the member kept their key.
+#[test]
+fn a_second_message_in_an_epoch_still_leaks_the_key_when_it_differs_only_by_a_trailing_zero() {
+    let params = Params::new();
+    let identity = Identity::generate();
+    let leaves = vec![identity.commitment(&params)];
+    let tree = MerkleTree::new(air::DEPTH, &leaves);
+    let epoch = epoch_field(7);
+
+    let first =
+        novachannel_rln::prove_message(&tree, 0, &identity, epoch, bytes_to_field(b"pay alice"))
+            .expect("first proof");
+    let second =
+        novachannel_rln::prove_message(&tree, 0, &identity, epoch, bytes_to_field(b"pay alice\0"))
+            .expect("second proof");
+
+    let root = tree.root();
+    let share_a = novachannel_rln::verify_message(root, first).expect("first verifies");
+    let share_b = novachannel_rln::verify_message(root, second).expect("second verifies");
+
+    assert_eq!(
+        share_a.nullifier, share_b.nullifier,
+        "same member, same epoch: the nullifier must match"
+    );
+    assert_ne!(
+        share_a.x, share_b.x,
+        "two distinct messages must be two distinct points on the line"
+    );
+    assert_eq!(
+        novachannel_rln::share::recover_secret(&share_a, &share_b),
+        Some(identity.sk),
+        "two messages in one epoch must leak the key"
+    );
+}
+
+/// The verifier's floor is the only thing standing between a caller and a
+/// deliberately weak proof, since a prover chooses its own
+/// `ProofOptions`. It must reject a proof generated below the bar, and
+/// accept this crate's own default — which sits exactly at it.
+#[test]
+fn a_proof_generated_below_the_security_floor_is_rejected() {
+    let params = Params::new();
+    let identity = Identity::generate();
+    let leaves = vec![identity.commitment(&params)];
+    let tree = MerkleTree::new(air::DEPTH, &leaves);
+    let epoch = epoch_field(1);
+    let x = bytes_to_field(b"security floor");
+    let a1 = novachannel_rln::permutation::compress2(&params, identity.sk, epoch);
+    let y = identity.sk + a1 * x;
+
+    let witness = air::Witness {
+        sk: identity.sk,
+        path: tree.path(0),
+    };
+    let trace = air::build_trace(&params, &witness, epoch, x);
+    let root = trace.get(0, air::root_row(air::DEPTH));
+    let pub_inputs = air::PublicInputs {
+        root,
+        epoch,
+        x,
+        y,
+        nullifier: a1,
+    };
+
+    // 24 queries with no field extension: what this crate shipped as its
+    // default before the hardening pass, and what the old 95-bit floor
+    // would still have accepted. It is worth 63 bits, not the ~96 it was
+    // once labelled — `FieldExtension::None` caps a 64-bit base field's
+    // contribution at 64, and the formula subtracts one.
+    let weak = ProofOptions::new(
+        24,
+        16,
+        0,
+        FieldExtension::None,
+        8,
+        31,
+        BatchingMethod::Linear,
+        BatchingMethod::Linear,
+    );
+    let weak_proof = air::RlnProver::new(weak, pub_inputs.clone())
+        .prove(air::build_trace(&params, &witness, epoch, x))
+        .expect("a weak proof still generates");
+    assert!(
+        weak_proof
+            .conjectured_security::<Blake3_256<BaseElement>>()
+            .bits()
+            < air::MIN_CONJECTURED_SECURITY_BITS,
+        "instrument check: the 'weak' options must actually be below the floor"
+    );
+    assert!(
+        air::verify(weak_proof, pub_inputs.clone()).is_err(),
+        "a proof below the security floor must not verify"
+    );
+
+    // ...and the default, which sits exactly at the floor, still does.
+    let good_proof = air::RlnProver::new(air::default_proof_options(), pub_inputs.clone())
+        .prove(trace)
+        .expect("the default options prove");
+    assert_eq!(
+        good_proof
+            .conjectured_security::<Blake3_256<BaseElement>>()
+            .bits(),
+        air::MIN_CONJECTURED_SECURITY_BITS,
+        "the floor is meant to sit exactly at what the default achieves"
+    );
+    air::verify(good_proof, pub_inputs).expect("the default options must verify");
 }

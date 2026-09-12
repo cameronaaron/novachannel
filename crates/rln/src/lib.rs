@@ -109,16 +109,55 @@ impl Drop for Identity {
     }
 }
 
-/// Reduces arbitrary bytes into a field element by absorbing 8-byte chunks
-/// through the same in-crate permutation used everywhere else (no separate
-/// hash dependency needed just for domain mapping). This is a convenience
-/// for turning message bytes / epoch counters into the field elements the
-/// AIR operates over — it is *not* meant to be collision-resistant on its
-/// own merit beyond what the underlying permutation provides.
+/// Bytes packed per field element by [`bytes_to_field`]. Seven, not eight:
+/// a 7-byte little-endian value is at most `2^56 - 1`, comfortably below
+/// the Goldilocks modulus `2^64 - 2^32 + 1`, so the byte-to-element map is
+/// injective. Packing a full 8 bytes was not — see [`bytes_to_field`].
+pub const BYTES_PER_ELEMENT: usize = 7;
+
+/// Absorbs arbitrary bytes into a field element through the same in-crate
+/// permutation used everywhere else (no separate hash dependency needed
+/// just for domain mapping). This is how message bytes and epoch counters
+/// become the field elements the AIR operates over — in particular the
+/// message-binding `x` of a [`share::Share`], which makes it
+/// collision-resistance-critical, not a convenience.
+///
+/// # Two collision classes this used to have, and why they mattered
+/// The previous construction absorbed 8-byte chunks, zero-padding the last
+/// one, seeded from `ZERO`. Both halves of that were collision-prone in
+/// ways an attacker could exploit by hand, with no cryptanalysis of the
+/// permutation required:
+///
+/// - **No length separation.** The final chunk's zero padding is
+///   indistinguishable from trailing zero bytes in the message itself, so
+///   `b"a"` and `b"a\0"` absorbed identically.
+/// - **Non-injective packing.** An 8-byte chunk was read as a full `u64`
+///   and reduced mod `p`, so any `v` and `v + p` (there are `2^32 - 1`
+///   such pairs) mapped to the same element — e.g. the chunks `0` and
+///   `0xFFFFFFFF00000001`.
+///
+/// Either one breaks the rate limit this crate exists to enforce. RLN
+/// extracts a member's key only from two shares on the same nullifier with
+/// *different* `x`; two distinct messages colliding in `x` produce two
+/// identical shares, from which [`share::recover_secret`] recovers nothing.
+/// A member could therefore send a second message in an epoch — the exact
+/// thing the scheme is named for preventing — at the cost of appending a
+/// zero byte.
+///
+/// The construction now absorbs the byte length first and packs
+/// [`BYTES_PER_ELEMENT`] bytes per element, which makes the whole
+/// input-to-element-sequence map injective; collision resistance then rests
+/// on the permutation alone, which is where it belongs. This changes every
+/// value this function produces, so nullifiers, `x` values and identity
+/// commitments all differ from previous versions — a breaking change to
+/// the proof format, stated as such.
 pub fn bytes_to_field(bytes: &[u8]) -> BaseElement {
     let params = Params::new();
-    let mut acc = BaseElement::ZERO;
-    for chunk in bytes.chunks(8) {
+    // Seeding with the length, rather than `ZERO`, is what separates
+    // `b"a"` from `b"a\0"`: no input can produce another's absorbed
+    // sequence, because they disagree in the very first element.
+    let mut acc = BaseElement::new(bytes.len() as u64);
+    for chunk in bytes.chunks(BYTES_PER_ELEMENT) {
         let mut buf = [0u8; 8];
         buf[..chunk.len()].copy_from_slice(chunk);
         let v = BaseElement::new(u64::from_le_bytes(buf));

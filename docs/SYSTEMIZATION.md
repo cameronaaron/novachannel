@@ -164,17 +164,38 @@ circuit, the query count, and the blowup factor chosen for soundness.
 same tiny RLN circuit (§3.4), re-measured after the Poseidon2/Goldilocks
 port:
 
-| queries | blowup | grinding | conjectured bits | measured proof size |
-| --- | --- | --- | --- | --- |
-| 16 | 16 | 0 | ~64 | ~13.3 KB |
-| 24 | 16 | 0 (pre-hardening default) | ~96 | ~19.9 KB |
-| 32 | 16 | 20 (**this crate's default**) | ~148 | ~30.0 KB |
-| 48 | 16 | 0 | ~192 | ~32.7 KB |
+| queries | blowup | grinding | field extension | conjectured bits | measured proof size |
+| --- | --- | --- | --- | --- | --- |
+| 16 | 16 | 0 | none | 63 | ~13.8 KB |
+| 24 | 16 | 0 (pre-hardening default) | none | 63 | ~18.3 KB |
+| 32 | 16 | 20 (**this crate's default**) | quadratic | 127 | ~27.0 KB |
+| 32 | 16 | 20 | cubic | 128 | ~31.8 KB |
+| 48 | 16 | 20 | cubic | 128 | ~45.0 KB |
 
 (run the example to reproduce; exact bytes vary a little run to run from
-the circuit's own randomized witness data.) At the current default, proof
-size is roughly **230x** Groth16's constant 128 bytes, for a genuinely
-tiny circuit — the gap would only widen for a production-sized membership
+the circuit's own randomized witness data.)
+
+**The security column is now winterfell's own `Proof::conjectured_security`,
+read off each generated proof, and it corrects numbers this document
+previously got wrong in both directions.** Earlier revisions printed the
+`num_queries * log2(blowup_factor) + grinding_factor` approximation, which
+is only the *query* term of winterfell's actual formula
+`min(min(field_security, query_security) - 1, hash_collision_resistance)`,
+where `field_security = base_field_bits * field_extension_degree`. Over
+64-bit Goldilocks the field term binds, not the query term: the
+pre-hardening default was worth **63** bits, not the ~96 claimed, and the
+current default is worth **127**, not the ~148 claimed. The hardening pass
+of §6.20 was therefore worth considerably more than it said (63 to 127),
+while the resulting figure is one bit under the workspace's 128-bit bar
+rather than 20 over it. A cubic extension does reach exactly 128 — capped
+there by Blake3_256's collision resistance — and was rejected on
+measurement: 5.6x the proving time (5.4ms median to 29.8ms) and 18% more
+proof size, for one bit. The last row shows the corresponding dead end at
+the other dial: past a cubic extension, extra queries change the proof
+size and not the security.
+
+At the current default, proof size is roughly **210x** Groth16's constant
+128 bytes, for a genuinely tiny circuit — the gap would only widen for a production-sized membership
 set. If per-message bandwidth matters more than avoiding a trusted setup
 and PQ-hardening the proof system for a given deployment, that's a real
 reason to prefer Groth16 instead; this project's choice optimizes for the
@@ -185,12 +206,11 @@ Proving *time* — the CPU cost of generating one of these proofs — is now
 measured too: `crates/rln/examples/proving_time.rs` times `Prover::prove`
 (and verification) across the same four configurations, 5 runs each,
 reporting min/median/max. On the machine this was last measured on, the
-weaker/stronger configurations prove in ~2.7-2.9ms median, while this
-crate's own default (32 queries, grinding 20, `FieldExtension::Quadratic`)
-takes tens of milliseconds — grinding (a proof-of-work step) and the
-quadratic field extension both add real CPU cost the query count alone
-doesn't capture. Verification is consistently sub-millisecond across all
-four. These numbers are from whatever machine ran the example, not a
+no-extension configurations prove in ~3.0-3.5ms median, this crate's own
+default (32 queries, grinding 20, `FieldExtension::Quadratic`) in ~5.4ms,
+and the rejected cubic-extension variant in ~29.8ms — the extension degree,
+not the query count, is what dominates. Verification is consistently
+sub-millisecond across all of them. These numbers are from whatever machine ran the example, not a
 mobile device — no claim is made about mobile-CPU-specific numbers, since
 none ran this; the point is a real number to scale from instead of none.
 STARK proving is CPU-bound work proportional to the circuit's trace
