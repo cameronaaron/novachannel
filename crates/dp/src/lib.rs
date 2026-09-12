@@ -1,4 +1,4 @@
-//! Formal differential privacy for the "did this user send anything?"
+//! Cover traffic for the "did this user send anything?"
 //! metadata signal, via calibrated dummy traffic.
 //!
 //! # The guarantee, precisely
@@ -14,32 +14,23 @@
 //! - if `b = 0`: transmit a dummy packet independently with probability
 //!   `q = e^{-ε}`, so `o = 1` with probability `q`.
 //!
-//! This is randomized response, and it gives **exact ε-differential
-//! privacy** for the single-slot presence bit — not an approximation:
+//! # Security limitation: this is not epsilon-DP for positive epsilon
+//! The send event has likelihood ratio `1/q = exp(epsilon)`, but
+//! differential privacy requires the inequality in BOTH directions for
+//! EVERY event. Silence has probability `1-q` for an empty slot and zero
+//! for a real slot. Thus `1-q <= exp(epsilon) * 0` fails whenever `q < 1`.
+//! Silence reveals that no real message was queued. The existing empirical
+//! send-event test does not establish differential privacy.
 //!
-//! ```text
-//! Pr[o=1 | b=1] / Pr[o=1 | b=0] = 1 / q = e^ε
-//! Pr[o=0 | b=1] / Pr[o=0 | b=0] = 0 / (1-q) = 0 ≤ e^ε
-//! ```
+//! `epsilon = 0` sends in every slot and hides the presence bit, provided
+//! real and dummy packets have indistinguishable sizes, framing and timing.
+//! Positive epsilon only tunes cover bandwidth; it is NOT a DP budget.
+//! [`sequential_epsilon`], [`advanced_composition_epsilon`] and [`Budget`]
+//! are calculators for mechanisms independently established to be DP;
+//! they do not certify this scheduler or its queued variant.
 //!
-//! Both ratios are bounded by `e^ε`, which is the definition of
-//! ε-differential privacy for this binary mechanism. An adversary who sees
-//! one slot's transmit/silent bit and tries to guess whether it was
-//! triggered by a real message gains, at most, likelihood ratio `e^ε` —
-//! matching the guarantee in the module-level claim: *"an adversary
-//! monitoring the channel has bounded statistical advantage in
-//! distinguishing a real send from cover traffic."*
-//!
-//! # Composing across many slots
-//! Watching one slot bounds an adversary by `e^ε`; watching `k`
-//! independent slots (e.g. an entire session) composes. [`sequential_epsilon`]
-//! gives the simple (loose, exact, no failure probability) bound; for
-//! anything beyond a handful of slots, [`advanced_composition_epsilon`]
-//! gives the standard tighter Dwork-Rothblum-Vadhan bound at the cost of
-//! an explicit `delta` failure probability. [`Budget`] wraps this into a
-//! stateful "how many more slots can I spend before crossing my target
-//! total ε" tracker (a privacy odometer), so callers don't have to
-//! re-derive the composition math at every call site.
+//! See Dwork and Roth, Definition 2.4:
+//! <https://www.cis.upenn.edu/~aaroth/Papers/privacybook.pdf>.
 //!
 //! # What this doesn't cover
 //! - **Broader queueing/request-response timing.** [`GridScheduler`]
@@ -51,10 +42,8 @@
 //!   crate actually makes. Closing *that* would mean auditing the whole
 //!   pipeline the caller builds around this scheduler, not something this
 //!   crate's own scope can establish.
-//! - **Non-independent slots.** The composition bounds assume the
-//!   dummy-injection coin flips are drawn independently per slot with a
-//!   fresh CSPRNG draw each time; reusing randomness across slots breaks
-//!   the guarantee.
+//! - **Composition.** No pure-DP composition bound applies to positive-
+//!   epsilon scheduling, even with independent random draws.
 //!
 //! [`SizeBucketer`] closes the other side channel this module used to
 //! leave open: padding a message's *content* to one of a fixed set of
@@ -80,7 +69,8 @@
 
 use rand::{Rng, RngExt};
 
-/// Per-slot dummy-traffic scheduler calibrated to a target epsilon.
+/// Per-slot cover-traffic scheduler. Positive epsilon is NOT a DP guarantee;
+/// see the module security limitation.
 #[derive(Clone, Copy, Debug)]
 pub struct DummyScheduler {
     epsilon: f64,
@@ -118,7 +108,7 @@ impl DummyScheduler {
     /// [`Self::dummy_probability`]. The caller is responsible for actually
     /// constructing an indistinguishable dummy packet (same size/framing as
     /// a real one) when this returns `true` and `has_real_message` was
-    /// `false` — the DP guarantee is about the *decision bit*, and is void
+    /// `false`. Even the zero-epsilon presence-hiding guarantee is void
     /// if a passive observer can tell real and dummy packets apart by any
     /// other signal (size, timing jitter, ...).
     pub fn decide(&self, has_real_message: bool, rng: &mut impl Rng) -> bool {
@@ -160,8 +150,8 @@ pub enum SlotOutput<M> {
 ///
 /// If more than one message is enqueued within a single slot, only the
 /// oldest goes out on the next tick — the rest wait for subsequent ticks,
-/// each still indistinguishable from a dummy-only slot to an outside
-/// observer. That queueing delay is the real, honest cost of closing this
+/// with the same positive-epsilon silence leakage documented above.
+/// That queueing delay is the real, honest cost of closing this
 /// side channel: hiding *when* a message was ready costs latency, the same
 /// way hiding *whether* one exists costs bandwidth (module docs' dummy
 /// traffic). A caller who can't tolerate that latency for some messages
@@ -252,6 +242,8 @@ pub fn advanced_composition_epsilon(
     (2.0 * k * (1.0 / delta_prime).ln()).sqrt() * eps + k * eps * (eps.exp() - 1.0)
 }
 
+/// For independently established DP mechanisms only, not positive-epsilon
+/// [`DummyScheduler`] or [`GridScheduler`].
 /// A stateful privacy odometer: tracks how much of a total epsilon budget
 /// has been spent across slots via [`sequential_epsilon`], and reports how
 /// many more slots can be spent before the budget is exhausted.
@@ -526,6 +518,23 @@ mod tests {
             (p_send - expected).abs() < 0.01,
             "empirical dummy-send rate {p_send} too far from expected {expected}"
         );
+    }
+
+    #[test]
+    fn silence_is_a_counterexample_to_positive_epsilon_pure_dp() {
+        let scheduler = DummyScheduler::new(1.0);
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
+        let mut witnessed_silence = false;
+        for _ in 0..1000 {
+            let mut real_rng = rng.clone();
+            assert!(scheduler.decide(true, &mut real_rng));
+            witnessed_silence |= !scheduler.decide(false, &mut rng);
+        }
+        assert!(witnessed_silence);
+        // Test the missing ordered pair and event from the former proof.
+        let silence_given_empty = 1.0 - scheduler.dummy_probability();
+        let silence_given_real = 0.0;
+        assert!(silence_given_empty > scheduler.epsilon().exp() * silence_given_real);
     }
 
     #[test]

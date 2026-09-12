@@ -1,5 +1,11 @@
 # A Hybrid Post-Quantum Messaging Stack: Engineering Report
 
+> **Production blocker (2026-09-11):** the positive-epsilon cover scheduler
+> does not satisfy pure differential privacy. Earlier DP and composition
+> claims below are superseded by [the corrected analysis](RLN_DP_COMPOSITION.md).
+> This workspace remains unaudited and is not approved for production use.
+
+
 **Status: engineering report, not a research paper.** This document
 describes what was built in the `novachannel` workspace, why each design
 choice was made, what was verified and how, and — explicitly — which parts
@@ -15,7 +21,7 @@ X3DH session establishment, sealed sender, Sesame-style multi-device
 fan-out, a one-shot or incremental/erasure-coded ratchet, and an
 `O(log n)` TreeKEM-inspired group ratchet), zero-knowledge
 rate-limiting nullifiers over a hash-based STARK
-(`novachannel-rln`), differential-privacy-calibrated cover traffic
+(`novachannel-rln`), probabilistic cover traffic
 (`novachannel-dp`), oblivious server-side storage
 (`novachannel-oram`), and threshold key generation, decryption, and
 signing (`novachannel-mpc`, including FROST). Every non-trivial primitive
@@ -479,65 +485,30 @@ anyone who merely knows a victim's published `LeafKeyPackage` rather than
 by an actual group member, are recorded in
 `ENGINEERING-STANDARDS.md` §6.23.
 
-## 5. `novachannel-dp`: formal differential privacy on the presence bit
+## 5. `novachannel-dp`: cover traffic and a withdrawn privacy claim
 
-The specific engineering claim — "an observer watching the channel has
-bounded statistical advantage in distinguishing a real send from cover
-traffic" — is given an exact mechanism and an exact proof, not just
-asserted: randomized response. A real message is always sent immediately;
-an empty slot sends a dummy independently with probability `q = e^{-ε}`.
-This gives *exact* `ε`-differential privacy for the single-slot presence
-bit (not an approximation, and not requiring a `δ` slack term):
+A real slot always sends; an empty slot sends with probability `q = exp(-epsilon)`.
+This is not pure epsilon-DP for positive epsilon. Silence has probability
+`1-q` for an empty slot and zero for a real slot, violating the reverse
+DP inequality. The original argument checked only one ordered pair.
+`empirical_likelihood_ratio_matches_bound` measures the send-event ratio;
+it does not prove DP. The regression
+`silence_is_a_counterexample_to_positive_epsilon_pure_dp` checks the
+omitted event and witnesses it in the implementation.
 
-```
-Pr[send | real message]  / Pr[send | no message]  = 1/q = e^ε
-Pr[silent | real message] / Pr[silent | no message] = 0/(1-q) = 0 ≤ e^ε
-```
+Sequential and advanced DP composition therefore do not apply to this
+scheduler. The former RLN composition claim is withdrawn in
+[`RLN_DP_COMPOSITION.md`](RLN_DP_COMPOSITION.md). The calculators remain
+available for mechanisms whose DP premise is independently established.
 
-both directions bounded by `e^ε`, which is the definition being satisfied.
-Composition across many slots uses the two standard textbook bounds
-(sequential, and the tighter Dwork-Rothblum-Vadhan advanced composition) —
-foundational results from the differential privacy literature, not new
-ones. `empirical_likelihood_ratio_matches_bound` checks the *measured*
-ratio from 200,000 simulated trials against the theoretical `e^ε`, rather
-than asserting a property that would pass under a broken calibration.
-
-`docs/RLN_DP_COMPOSITION.md` works out, from first principles, whether
-composing this with `novachannel-rln`'s rate limit — which gives a user a
-real incentive to correlate their true send pattern within an epoch —
-costs any additional privacy budget. Short answer: no, and the reason is
-structural (DP composition theorems are proved over the mechanism's own
-randomness, never assuming anything about how the underlying secret bits
-are correlated), not a new argument specific to this pairing — but the
-same document is precise about what that argument does *not* cover
-(cross-epoch traffic-pattern fingerprinting), which is a real, different,
-still-open gap.
-
-The guarantee above is scoped to an observer who already sees the
-channel: it bounds their ability to tell a real send from a dummy one, at
-the granularity of a slot this mechanism controls. It says nothing about
-who can see the channel in the first place. Network-layer metadata —
-source/destination IP addresses, TCP/TLS connection timing, the fact that
-a connection to the server exists at all — sits below this mechanism and
-is fully visible to a network-level observer regardless of the DP
-calibration on top of it. Defending against a global passive adversary at
-that layer needs an anonymizing transport underneath this stack (Tor, a
-mixnet); `novachannel-dp` calibrates *when a given channel sends*, not
-*whether the channel's endpoints or existence are hidden*, and does not
-attempt the latter. See §9.
-
-Randomized response also isn't free at runtime: hiding the presence bit
-requires the client to independently decide, and potentially send, a
-dummy message on *every* empty slot — constant background network
-activity by construction of the mechanism, not an implementation detail
-that could be optimized away. Neither this crate nor this document
-quantifies what that costs in battery or metered data on a mobile
-device; the crate itself has no networking code and doesn't assume any
-particular transport (WebSocket or otherwise) — that choice, and its
-resource cost, is the caller's. See §9.
+At epsilon zero every slot sends, hiding the presence bit only under
+indistinguishable real/dummy framing and arrival-independent transmission
+timing. Positive epsilon trades cover bandwidth for observable silence;
+it is not a privacy budget. Neither mode hides network endpoints or proves
+end-to-end anonymity. Mobile battery and bandwidth costs remain unmeasured.
 
 `DummyScheduler::decide` alone still lets a real message go out the
-instant it's ready — "sent immediately," per the guarantee above — which
+instant it's ready, which
 means an observer with finer-grained timing than the slot boundary learns
 exactly when within a slot the message arrived, strictly more than the
 presence-bit guarantee promises to hide. `GridScheduler` closes that:

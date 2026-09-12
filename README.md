@@ -1,5 +1,11 @@
 # novachannel
 
+> **Production blocker (2026-09-11):** the positive-epsilon cover scheduler
+> does not satisfy pure differential privacy. Earlier DP and composition
+> claims below are superseded by [the corrected analysis](docs/RLN_DP_COMPOSITION.md).
+> This workspace remains unaudited and is not approved for production use.
+
+
 [![CI](https://github.com/cameronaaron/novachannel/actions/workflows/ci.yml/badge.svg)](https://github.com/cameronaaron/novachannel/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
@@ -7,7 +13,7 @@ A five-crate Rust workspace implementing a hybrid classical/post-quantum
 secure messaging stack: an authenticated channel with async/deniable X3DH
 session establishment, sealed sender, Sesame-style multi-device fan-out, and
 a forward-secret ratchet; zero-knowledge rate-limiting nullifiers over a
-hash-based STARK; differential-privacy-calibrated cover traffic; oblivious
+hash-based STARK; probabilistic cover traffic; oblivious
 server-side storage; and threshold key generation, decryption, and signing
 (including FROST).
 
@@ -31,7 +37,7 @@ before assuming any component's security properties.
 ```
 crates/core   novachannel          hybrid PQ/classical authenticated channel, ratchet, X3DH, sealed sender, multi-device
 crates/rln    novachannel-rln      zero-knowledge rate-limiting nullifiers (STARK-proved Merkle membership)
-crates/dp     novachannel-dp       differential-privacy-calibrated cover traffic scheduling
+crates/dp     novachannel-dp       probabilistic cover traffic scheduling
 crates/oram   novachannel-oram     Path ORAM: oblivious server-side storage
 crates/mpc    novachannel-mpc      threshold DKG, decryption, and FROST (RFC 9591) signing
 ```
@@ -67,6 +73,11 @@ section of the engineering report for the complete list.
 - [`docs/LIBSIGNAL_COMPARISON.md`](docs/LIBSIGNAL_COMPARISON.md) — how the design choices here compare to libsignal's.
 - [`ENGINEERING-STANDARDS.md`](ENGINEERING-STANDARDS.md) — the standing engineering bar (what `scripts/check.sh` enforces) and the audit trail of defects found and fixed.
 - [`SECURITY.md`](SECURITY.md) — how to report a vulnerability.
+
+## Research release validation
+
+See [`docs/RESEARCH_RELEASE.md`](docs/RESEARCH_RELEASE.md) for the tested
+environment, reproduction commands, and unverified boundaries.
 
 ## Status
 
