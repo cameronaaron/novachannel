@@ -727,7 +727,7 @@ replacement.
 
 ## 8. What was actually verified, and how
 
-237 tests across the workspace (up from 200), plus 8 `cargo-fuzz` targets,
+241 tests across the workspace (up from 200), plus 8 `cargo-fuzz` targets,
 now run continuously via [ClusterFuzzLite](https://google.github.io/clusterfuzzlite/)
 (`ENGINEERING-STANDARDS.md` §6.25) rather than a once-a-day smoke run,
 covering every crate with an untrusted-input parsing

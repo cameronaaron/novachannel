@@ -25,7 +25,7 @@ limitation. This release does not claim debug-mode compatibility.
 
 ## Verified in this review
 
-- 237 tests pass across the five crates, including every regression test
+- 241 tests pass across the five crates, including every regression test
   added for the defects listed below. Each of those was run against the
   pre-fix source and observed to fail there.
 - All eight `cargo-fuzz` targets re-run against the fixed code with no new
