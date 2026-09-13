@@ -68,14 +68,14 @@ fn main() {
             field_extension: FieldExtension::None,
         },
         Config {
-            label: "previous default: quadratic extension (field-capped)",
+            label: "this crate's default (see air.rs)",
             num_queries: 32,
             blowup_factor: 16,
             grinding_factor: 20,
             field_extension: FieldExtension::Quadratic,
         },
         Config {
-            label: "this crate's default (see air.rs)",
+            label: "cubic: reaches 128 bits, rejected on cost (see air.rs)",
             num_queries: 32,
             blowup_factor: 16,
             grinding_factor: 20,
