@@ -441,7 +441,11 @@ fn build_chunk_records(
     parity_shards: usize,
 ) -> Result<Vec<Vec<u8>>> {
     let checksum = truncated_checksum(payload);
-    let original_len = payload.len() as u32;
+    // The payload here is always this module's own KEX material (~1.6KB),
+    // never caller data, but the length goes on the wire as a `u32` and a
+    // silent truncation is the one failure mode a reader could not
+    // detect — so it is a refusal, not an assumption.
+    let original_len = u32::try_from(payload.len()).map_err(|_| Error::TooLarge)?;
     let (shards, _shard_len) = crate::erasure::encode(payload, data_shards, parity_shards)?;
 
     let mut out = Vec::with_capacity(shards.len());

@@ -268,3 +268,54 @@ fn trailing_bytes_are_rejected_at_every_public_deserialization_entry_point() {
     assert!(SignedDeviceList::from_bytes(&list.to_bytes()).is_ok());
     assert!(LeafKeyPackage::from_bytes(&joiner_kp.public().to_bytes()).is_ok());
 }
+
+/// Every remaining fixed-width count in a wire format is bounded at the
+/// point values enter it, so none of them can silently truncate the way
+/// the `u16` length prefix did. Each of these is a caller-side
+/// configuration error rather than an attacker's input, which is why they
+/// are refusals rather than parse errors — but they are checked, not
+/// assumed.
+#[test]
+fn counts_that_go_on_the_wire_as_fixed_width_are_bounded_where_they_enter() {
+    use novachannel::group::MAX_CAPACITY;
+    use novachannel::multidevice::MAX_DEVICES;
+
+    let founder = Identity::generate();
+
+    // A group capacity larger than any joiner would accept a welcome for
+    // must not be creatable either — the two ends used to disagree.
+    assert!(Group::create(&founder, MAX_CAPACITY * 2).is_err());
+    assert!(Group::create(&founder, MAX_CAPACITY.next_power_of_two()).is_ok());
+
+    // And the device-list count, whose `u32` appears both in the signed
+    // bytes and on the wire.
+    let dh = DhIdentity::generate();
+    let entry = DeviceListEntry {
+        device_id: DeviceId(1),
+        identity: founder.public(),
+        dh_identity: dh.public(),
+    };
+    let at_limit = vec![entry; MAX_DEVICES];
+    let list = SignedDeviceList::issue(&founder, 1, at_limit);
+    assert_eq!(list.entries().len(), MAX_DEVICES);
+    let parsed = SignedDeviceList::from_bytes(&list.to_bytes()).unwrap();
+    assert_eq!(parsed.entries().len(), MAX_DEVICES);
+    parsed.verify(&founder.public()).unwrap();
+}
+
+/// The other half of the bound above: issuing past it refuses rather than
+/// truncating the `u32` count that goes into both the signed bytes and
+/// the wire format.
+#[test]
+#[should_panic(expected = "may name at most")]
+fn issuing_a_device_list_past_the_bound_refuses_rather_than_truncating() {
+    use novachannel::multidevice::MAX_DEVICES;
+    let account = Identity::generate();
+    let dh = DhIdentity::generate();
+    let entry = DeviceListEntry {
+        device_id: DeviceId(1),
+        identity: account.public(),
+        dh_identity: dh.public(),
+    };
+    SignedDeviceList::issue(&account, 1, vec![entry; MAX_DEVICES + 1]);
+}

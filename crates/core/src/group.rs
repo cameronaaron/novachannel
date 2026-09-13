@@ -93,6 +93,16 @@ const COMMIT_SIGNATURE_CONTEXT: &[u8] = b"novachannel group v1 commit";
 const LEAF_KEY_PACKAGE_POP_CONTEXT: &[u8] = b"novachannel group v1 leaf key package";
 const PATH_SECRET_AAD_CONTEXT: &[u8] = b"novachannel group v1 path secret";
 const WELCOME_AAD_CONTEXT: &[u8] = b"novachannel group v1 welcome";
+
+/// The largest leaf capacity this module will build or accept.
+///
+/// A million leaves is already far past what the fixed-capacity,
+/// no-resizing design in the module docs is meant for; the bound exists so
+/// that every derived count stays provably in range (an
+/// `UpdatePathNode`'s `u32` ciphertext count, a `WelcomeSnapshot`'s
+/// `2 * capacity - 1` node array) rather than depending on a caller's
+/// restraint.
+pub const MAX_CAPACITY: usize = 1 << 20;
 const WELCOME_SIGNATURE_CONTEXT: &[u8] = b"novachannel group v1 welcome snapshot";
 
 // ---------------------------------------------------------------------
@@ -867,7 +877,7 @@ impl WelcomeSnapshot {
                 "welcome snapshot capacity must be a power of two of at least 2",
             ));
         }
-        if capacity > (1 << 20) {
+        if capacity as usize > MAX_CAPACITY {
             return Err(Error::Malformed(
                 "welcome snapshot capacity exceeds this implementation's sanity bound",
             ));
@@ -1015,6 +1025,17 @@ impl Group {
         if capacity < 2 || !capacity.is_power_of_two() {
             return Err(Error::Malformed(
                 "group capacity must be a power of two of at least 2",
+            ));
+        }
+        // The same ceiling `WelcomeSnapshot::read` already enforces on a
+        // received snapshot. Without it here the two were asymmetric: a
+        // founder could build a group no joiner would ever accept a
+        // welcome for. It also keeps `UpdatePathNode`'s `u32` ciphertext
+        // count provably in range, since a resolution can never hold more
+        // entries than the tree has leaves.
+        if capacity > MAX_CAPACITY {
+            return Err(Error::Malformed(
+                "group capacity exceeds this implementation's sanity bound",
             ));
         }
         let my_key_package = MyLeafKeyPackage::generate(my_identity);

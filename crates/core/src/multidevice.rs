@@ -187,8 +187,25 @@ pub struct SignedDeviceList {
     signature: HybridSignature,
 }
 
+/// The largest device list this module will issue.
+///
+/// An account with more than this many devices is not a case this design
+/// contemplates (Signal's own Sesame deployment runs to single digits),
+/// and the bound is what keeps the `u32` entry count that goes into both
+/// the signed bytes and [`SignedDeviceList::write`] from being a silent
+/// truncation for a caller who hands over an absurd `Vec`.
+pub const MAX_DEVICES: usize = 1024;
+
 impl SignedDeviceList {
+    /// # Panics
+    /// Panics if `entries` holds more than [`MAX_DEVICES`] devices — a
+    /// caller-side configuration error (this is an account describing its
+    /// own devices, not anything an adversary supplies).
     pub fn issue(account_identity: &Identity, version: u64, entries: Vec<DeviceListEntry>) -> Self {
+        assert!(
+            entries.len() <= MAX_DEVICES,
+            "a device list may name at most {MAX_DEVICES} devices"
+        );
         let signature = account_identity.sign(&device_list_signed_bytes(version, &entries));
         SignedDeviceList {
             version,

@@ -397,11 +397,14 @@ const EMPTY_CHILD: [u8; 32] = [0u8; 32];
 fn hash_bucket<V: AsRef<[u8]>>(blocks: &[Block<V>]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"novachannel-oram bucket v1");
-    hasher.update((blocks.len() as u32).to_be_bytes());
+    // u64, not u32: a length that truncates would let two different
+    // bucket contents hash identically, which is exactly what this hash
+    // exists to rule out.
+    hasher.update((blocks.len() as u64).to_be_bytes());
     for b in blocks {
         hasher.update(b.id.to_be_bytes());
         let bytes = b.value.as_ref();
-        hasher.update((bytes.len() as u32).to_be_bytes());
+        hasher.update((bytes.len() as u64).to_be_bytes());
         hasher.update(bytes);
     }
     hasher.finalize().into()
@@ -904,6 +907,12 @@ impl<S> EncryptingServerStorage<S> {
         assert!(
             block_value_len > 0,
             "block_value_len must be at least 1 byte"
+        );
+        // `seal_oram_block` records a value's real length in a `u32`, so
+        // anything past that would truncate rather than fail.
+        assert!(
+            block_value_len <= u32::MAX as usize,
+            "block_value_len must fit in a u32"
         );
         EncryptingServerStorage {
             inner,
