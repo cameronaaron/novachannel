@@ -28,14 +28,10 @@ limitation. This release does not claim debug-mode compatibility.
 - 237 tests pass across the five crates, including every regression test
   added for the defects listed below. Each of those was run against the
   pre-fix source and observed to fail there.
-- All eight `cargo-fuzz` targets re-run for 75 seconds each against the
-  fixed code with no new crashes: `prekey_bundle` 11.4M executions,
-  `group_commit` 1.9M, `mpc_frost_verify` 39K, `handshake_messages` 28K,
-  `x3dh_respond` 1.8K, `sealed_sender_open` 1.6K, `ratchet_open` 644.
-  `rln_verify` surfaced one further input into winterfell's proof
-  deserializer, handled by the existing `catch_unwind` guard and verified
-  against a normal unwind-enabled build (see `crates/core/fuzz/README.md`
-  on why the fuzz binary always reports these regardless).
+- All eight `cargo-fuzz` targets re-run against the fixed code with no new
+  crashes. **Six of them had to be rewritten first, because they were not
+  testing what their execution counts suggested** — see "Corrected
+  results" below and `ENGINEERING-STANDARDS.md` §6.31-§6.32.
 - Public documentation builds with warnings denied; CI uses the same gate.
 - Workspace and fuzz dependency audits report no vulnerabilities. The
   workspace retains the disclosed unmaintained, dev-only `paste` warning.
@@ -101,6 +97,48 @@ prekeys burnable by an unauthenticated party; RNG consumption in
 `novachannel-dp` tracking the presence bit it exists to hide; and two
 overflow-before-bounds-check reorderings.
 
+**Six of the eight fuzz targets were not testing what they appeared to
+be.** `rln_verify` embedded a genuine proof specifically so it could get
+past the deserializer and then never used it; its whole corpus was
+two-to-four byte inputs, so it had never once run the verifier it is named
+for. `prekey_bundle` and `group_commit` reached 185 and 69 covered edges
+after 11.4 million and 1.9 million executions, bouncing off a length check
+and a signature check in their first field. `handshake_messages`,
+`x3dh_respond`, `sealed_sender_open` and `ratchet_open` generated fresh
+ML-DSA-87 identities every iteration, which both throttled them —
+`ratchet_open` managed eight executions per second — and inflated their
+coverage with key-generation edges that light up whatever the input is.
+
+All six now cache their expensive immutable setup (rebuilding only state
+the code under test mutates) and splice each input into a genuine message.
+`ratchet_open` went from 644 executions to 2,541,083; `group_commit` from
+69 covered edges to 3735. Within seconds of the `rln_verify` fix it found
+two defects: a five-byte input that aborted the process under
+`panic = "abort"` (fixed — `air::verify` now validates the declared trace
+shape as a `Result` rather than relying on `catch_unwind` over
+`RlnAir::new`'s asserts), and one that cannot be fixed here, below.
+
+**An unfixable remote denial of service in a dependency.** `winterfell`
+0.13.1's `BatchMerkleProof::read_from` passes an attacker-controlled count
+straight to `Vec::with_capacity`. A six-byte mutation of a genuine proof
+makes a normal release build request 2520802182910816 bytes and die with
+SIGABRT. It is the same defect class fixed three times in this
+workspace's own parsers, sitting in a dependency — and unlike the
+deserializer panic this crate already routes around, `catch_unwind` cannot
+contain it, because an allocation failure aborts rather than unwinds. The
+parse happens inside `winterfell::verify`, downstream of every guard here,
+and 0.13.1 is the latest published version. It is documented at
+`air::verify` and pinned by a subprocess test that will fail if upstream
+ever fixes it. **Any caller of `novachannel_rln::air::verify` can be
+killed by whoever supplies the proof bytes; a deployment that must not be
+has to isolate that call.**
+
+Two further compatibility notes for anyone upgrading: `novachannel-oram`'s
+Merkle bucket hash now mixes lengths as `u64` rather than `u32`, so stored
+roots from an earlier version will not match; and `depth_for_capacity` is
+now exact integer arithmetic with an explicit `MAX_DEPTH`, so an absurd
+capacity is a clear panic rather than a silently-too-small tree.
+
 Earlier corrections from the 2026-09-11 review stand unchanged: the
 replay-window boundary at exactly 64 sequence numbers, and the withdrawal
 of the positive-epsilon differential-privacy claim (silence is possible
@@ -112,10 +150,13 @@ See [the corrected analysis](RLN_DP_COMPOSITION.md).
 No independent cryptographic audit, new formal verification run, sustained
 fuzzing campaign, cross-platform test matrix, mobile benchmark, or end-to-end
 anonymity analysis was performed in this review. The fuzzing above is a
-75-second-per-target smoke run, and `group_commit`'s 36 million cumulative
-executions have never parsed past a signature-gated field — coverage-guided
-fuzzing structurally cannot reach those, which is why three of this
-review's findings came from reading instead.
+smoke run of a few minutes per target — enough to show the rewritten
+targets now reach their parsers, not enough to call any of them explored.
+
+Coverage-guided fuzzing also structurally cannot reach anything behind a
+signature check, which is why three of this review's findings came from
+reading instead; splicing into a genuine message works around that for the
+cases here, but only for the shapes the seed message happens to have.
 
 The proof-size and proving-time figures in SYSTEMIZATION §3.2 were
 re-measured in this review on the machine described above; every other

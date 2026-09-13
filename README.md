@@ -98,6 +98,16 @@ library, and the real numbers are 127 bits for the current default (not
 [`ENGINEERING-STANDARDS.md`](ENGINEERING-STANDARDS.md) §6.29-§6.30 and
 [`docs/RESEARCH_RELEASE.md`](docs/RESEARCH_RELEASE.md).
 
+The same review found that six of the eight fuzz targets were not testing
+what their execution counts suggested — one had never reached the code it
+is named for, two were bouncing off a length or signature check, and three
+were mostly measuring key generation. All six were rewritten; the numbers
+are in [`crates/core/fuzz/README.md`](crates/core/fuzz/README.md). Within
+seconds, the fixed targets found a process abort this crate could fix and
+a remote denial of service in `winterfell` it cannot: **a malformed proof
+can kill any caller of `novachannel_rln::air::verify`**, documented at
+that function and pinned by a test.
+
 **Both the wire format and the RLN proof format changed in that review**
 and are not compatible with any earlier version. `novachannel-rln`'s in-circuit hash is now a
 verified port of Poseidon2-over-Goldilocks (`p3-goldilocks`/`p3-poseidon2`,
