@@ -82,7 +82,24 @@ environment, reproduction commands, and unverified boundaries.
 ## Status
 
 This is a reference implementation and engineering exercise, not an audited
-or production-hardened product. `novachannel-rln`'s in-circuit hash is now a
+or production-hardened product.
+
+A second full review of all five crates (2026-09-13) found and fixed nine
+defects, including two that made components unusable or unsafe as shipped:
+a `debug_assert!`-guarded `u16` length prefix that silently truncated any
+wire field over 64KiB — which made `crates/core`'s group module produce
+unparseable commits for any group past ~16 members, in release builds only
+— and an unauthenticated group `Welcome` whose snapshot a joiner built
+their entire group state from. It also corrected this project's own
+long-standing claim about `novachannel-rln`'s proof security: the figure
+was derived from one term of winterfell's formula rather than read off the
+library, and the real numbers are 127 bits for the current default (not
+~148) and 63 for the pre-hardening one (not ~96). Full detail in
+[`ENGINEERING-STANDARDS.md`](ENGINEERING-STANDARDS.md) §6.29-§6.30 and
+[`docs/RESEARCH_RELEASE.md`](docs/RESEARCH_RELEASE.md).
+
+**Both the wire format and the RLN proof format changed in that review**
+and are not compatible with any earlier version. `novachannel-rln`'s in-circuit hash is now a
 verified port of Poseidon2-over-Goldilocks (`p3-goldilocks`/`p3-poseidon2`,
 checked against its published test vector byte-for-byte) rather than a
 from-scratch construction, and the incremental ratchet's erasure coding is

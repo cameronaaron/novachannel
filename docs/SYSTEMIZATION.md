@@ -505,6 +505,27 @@ anyone who merely knows a victim's published `LeafKeyPackage` rather than
 by an actual group member, are recorded in
 `ENGINEERING-STANDARDS.md` §6.23.
 
+That reasoning was correct and stopped one step short of its own
+conclusion. A `Welcome` travels in a sender-*anonymous* envelope, so if
+anyone holding a victim's published `LeafKeyPackage` can construct one
+with arbitrary contents, then *every* field of the snapshot is
+attacker-chosen, not just the two that drive an allocation — including the
+tree, the epoch and the epoch secret a joiner builds their entire group
+state from, bound to the accompanying `Commit` by nothing at all. The
+snapshot is now signed by the committer, and `join` checks four bindings
+before believing any of it: same group id as the commit, same epoch, a
+commit whose op actually adds *this* member at *this* target leaf, and a
+snapshot signature verifying under the identity the commit names as its
+committer — the same leaf `apply_commit` already checks the commit's own
+signature against, so one identity vouches for both halves. This is what
+real MLS gets from signing its `GroupInfo`.
+
+Which identity that is remains the caller's to judge, per the pinning
+stance §4 takes throughout — and until the same review there was no way to
+ask: `Group::open` returned a leaf index with no API mapping it to a
+member, so a received group message was unattributable. `Group::member_identity`
+closes that. See `ENGINEERING-STANDARDS.md` §6.29.
+
 ## 5. `novachannel-dp`: cover traffic and a withdrawn privacy claim
 
 A real slot always sends; an empty slot sends with probability `q = exp(-epsilon)`.
@@ -585,6 +606,25 @@ valid at an earlier point is exactly what a "does this look well-formed"
 check would miss, and only a root comparison against the client's own
 history catches it.
 
+A later review found that encrypting each block was not, on its own,
+enough to make the opening claim of this section true.
+`EncryptingServerStorage` sealed the contents and stopped there, leaving
+two things about a bucket visible: how many blocks it held (eviction
+writes back however many stash blocks were eligible, 0 to Z) and how long
+each value was (`V = Vec<u8>`, sealed at whatever length it happened to
+have). Both correlate with the access pattern this section says a server
+learns nothing about, and standard Path ORAM writes exactly Z encrypted
+slots per bucket over fixed-size blocks for precisely that reason. The
+layer now takes a fixed `block_value_len`, pads every sealed block to it,
+and writes every bucket back holding exactly `bucket_capacity`
+ciphertexts with encrypted dummies making up the difference —
+`every_written_bucket_looks_identical_to_the_server_whatever_it_holds`
+asserts that against what the untrusted server physically stores rather
+than against the client's own view. `Client` and the Merkle layer above it
+needed no change, which is the composability property this section already
+claimed for the `ServerStorage` split, this time exercised rather than
+asserted. See `ENGINEERING-STANDARDS.md` §6.29.
+
 ## 7. `novachannel-mpc`: threshold trust for relay operators
 
 A conventional mix-network relay has one operator holding one decryption
@@ -597,6 +637,39 @@ compromising the relay requires compromising `t` operators simultaneously,
 not one. A single faulty dealer is identified and excluded
 (`identify_faulty_dealers`) rather than aborting the whole key-generation
 run for everyone.
+
+The complaint protocol that does this on a real network — where no single
+party sees every share — carried two defects until a later review, both
+triggerable by one malicious participant, and both worth stating plainly
+because either one breaks the threshold property this section opens by
+claiming.
+
+First, `Dealer::share_for` evaluated the dealing polynomial at whatever
+participant id the complaint named, and zero is the evaluation point at
+which that polynomial *is* the dealer's secret contribution. Broadcasting
+a complaint naming participant 0 made an honest dealer, following the
+documented protocol, publish its own secret; repeated against every dealer
+it reconstructs the group key. Participant 0 is now rejected at every
+point an id enters the crate.
+
+Second, and less obvious: `resolve_complaint` disqualified a dealer
+whenever their verified disclosure differed from what the accuser
+*claimed* to have received. That claim is an unauthenticated assertion
+about a point-to-point message nobody else witnessed, so "the dealer sent
+me the wrong share" and "I am lying about what I was sent" produce
+byte-identical evidence — any single participant could disqualify any
+honest dealer, and one who disqualified every honest dealer would be left
+alone determining the group key. Gennaro et al.'s DKG, which this section
+and the crate's own docs claimed to implement, has no such rule: it
+disqualifies iff the broadcast share fails verification against the
+dealer's own commitments, because that is the only judgement derivable
+from values the dealer themselves published. That is now the only faulty
+verdict; the unattributable case is reported as such, with the repair
+(adopt the verified disclosure) and the authenticated delivery that would
+be needed to attribute it both documented at the API. See
+`ENGINEERING-STANDARDS.md` §6.29 — and note that this is a case where the
+prose claim ("the standard resolution from Gennaro et al.") was the thing
+that should have been checked against the actual paper, per §6.9.
 
 FROST (Flexible Round-Optimized Schnorr Threshold signatures, RFC 9591,
 2024) reuses the same DKG output to let the same operator quorum jointly
@@ -654,7 +727,7 @@ replacement.
 
 ## 8. What was actually verified, and how
 
-200 tests across the workspace (up from 132), plus 8 `cargo-fuzz` targets,
+237 tests across the workspace (up from 200), plus 8 `cargo-fuzz` targets,
 now run continuously via [ClusterFuzzLite](https://google.github.io/clusterfuzzlite/)
 (`ENGINEERING-STANDARDS.md` §6.25) rather than a once-a-day smoke run,
 covering every crate with an untrusted-input parsing
@@ -668,7 +741,24 @@ found two more defects of the identical class in this workspace's own
 code — a forgeable zero-capacity panic and a missing proof-of-possession
 binding on `LeafKeyPackage` — recorded and fixed in
 `ENGINEERING-STANDARDS.md` §6.23, with further hardening (self-removal,
-cross-group, and path-key-consistency cases) in §6.25. All adversarial
+cross-group, and path-key-consistency cases) in §6.25.
+
+A second full review of all five crates (§6.29, §6.30) found nine more,
+and is worth reading for two results that are not "a bug was fixed."
+First, a negative one about this section's own tooling: `group_commit`
+has run 36 million executions without ever parsing past a
+`LeafKeyPackage`, because reaching the fields behind it requires a
+proof-of-possession signature that verifies — which random mutation will
+not produce. Three of the defects that review found sat behind exactly
+that gate, and were found by reading. Everything behind a signature check
+in a parser is a structural blind spot for coverage-guided fuzzing, and
+counting fuzz targets does not cover it. Second, a correction to this
+document: the conjectured-security figures quoted for `novachannel-rln`
+in §3.2 were wrong in both directions, because they came from a formula
+that is only one term of the one winterfell actually computes (§6.30).
+Both numbers are now read off the library rather than re-derived.
+
+All adversarial
 where the claim
 is adversarial (not merely "does the happy path run"): tamper, replay,
 wrong-key, wrong-message, below-threshold-quorum,
@@ -708,8 +798,8 @@ At a glance, the gaps not yet closed anywhere else in this document:
 | Area | Current state | Gap |
 | --- | --- | --- |
 | Classical threshold signing | `novachannel-mpc::frost` is bound to Ristretto255. | Threshold signing remains vulnerable to quantum adversaries (only threshold *decryption* is post-quantum, via `threshold_kem` — §7, §6.22). No production-ready post-quantum threshold-signature scheme exists to swap it for (checked directly, not assumed — §7); building one from scratch here would mean shipping an uncryptanalyzed primitive, which §1's own standard refuses to do. Still open, by design, not by omission. |
-| MPC DKG complaint protocol | `identify_faulty_dealers` needed every dealer's shares visible to one process. | Closed (`ENGINEERING-STANDARDS.md` §6.24, §6.26): `Complaint`/`Dealer::share_for`/`resolve_complaint` give the real per-accusation building block — an accuser exhibits the bad share they received, the accused dealer discloses what their polynomial actually evaluates to, and every other participant recomputes the same `ComplaintVerdict` independently. `crates/mpc/examples/networked_complaint.rs` now demonstrates a real broadcast transport driving this end-to-end over actual TCP sockets between independent OS threads — not just reference-implementation-only. A production deployment will likely reach for its own transport (e.g. over `novachannel` sessions) rather than that example's relay, but "no networked implementation exists at all" is closed. |
-| ORAM payload confidentiality | `Block` carried `id` and `value` in the clear even in `InMemoryServer`. | Closed (`ENGINEERING-STANDARDS.md` §6.24): `EncryptingServerStorage` is an opt-in `ServerStorage` decorator that AEAD-seals `id` and `value` together before either reaches the inner storage, composing with `VerifiableServerStorage` (§6) so a server that corrupts, drops, or replays a block still surfaces as `IntegrityError`, not a panic or silently missing data. Key distribution remains the caller's problem, the same boundary `novachannel::handshake`'s identity pinning already draws. `crates/oram/examples/networked_server.rs` (`ENGINEERING-STANDARDS.md` §6.26) now demonstrates a real `ServerStorage` over an actual TCP socket, closing the "reference-implementation only" gap for the client/server split itself (orthogonal to payload confidentiality, which was already closed). |
+| MPC DKG complaint protocol | `identify_faulty_dealers` needed every dealer's shares visible to one process. | Closed (`ENGINEERING-STANDARDS.md` §6.24, §6.26): `Complaint`/`Dealer::share_for`/`resolve_complaint` give the real per-accusation building block — an accuser exhibits the bad share they received, the accused dealer discloses what their polynomial actually evaluates to, and every other participant recomputes the same `ComplaintVerdict` independently. §6.29 corrected two defects in that verdict: participant 0 is the evaluation point at which a dealer's polynomial *is* its secret, so a complaint naming it made an honest dealer publish that secret; and disqualifying a dealer on the accuser's unverifiable claim about what they received let one malicious participant evict every honest dealer. A dealer is now disqualified only on Gennaro et al.'s actual rule — the broadcast share failing verification against the dealer's own commitments. `crates/mpc/examples/networked_complaint.rs` now demonstrates a real broadcast transport driving this end-to-end over actual TCP sockets between independent OS threads — not just reference-implementation-only. A production deployment will likely reach for its own transport (e.g. over `novachannel` sessions) rather than that example's relay, but "no networked implementation exists at all" is closed. |
+| ORAM payload confidentiality | `Block` carried `id` and `value` in the clear even in `InMemoryServer`. | Closed (`ENGINEERING-STANDARDS.md` §6.24, extended in §6.29): `EncryptingServerStorage` is an opt-in `ServerStorage` decorator that AEAD-seals `id` and `value` together before either reaches the inner storage, composing with `VerifiableServerStorage` (§6) so a server that corrupts, drops, or replays a block still surfaces as `IntegrityError`, not a panic or silently missing data. §6.29 closed what sealing the contents alone had left visible — a bucket's block count and each value's length, both correlated with the access pattern — by padding to a fixed block size and writing every bucket back holding exactly `bucket_capacity` ciphertexts. Key distribution remains the caller's problem, the same boundary `novachannel::handshake`'s identity pinning already draws. `crates/oram/examples/networked_server.rs` (`ENGINEERING-STANDARDS.md` §6.26) now demonstrates a real `ServerStorage` over an actual TCP socket, closing the "reference-implementation only" gap for the client/server split itself (orthogonal to payload confidentiality, which was already closed). |
 | DP size-correlation side channel | DP was strictly scoped to the presence bit; message size was unaddressed. | Closed *at the application layer* (`ENGINEERING-STANDARDS.md` §6.24): `SizeBucketer` pads plaintext up to one of a fixed set of byte-length buckets before encryption, so ciphertext length reveals only which bucket a message fell into, not its exact size. That bucket boundary itself is not closed end-to-end: AEAD ciphertext length is a deterministic function of plaintext length, so a network-layer observer (see the row below) sees the same bucket-granularity size classes directly in packet/frame sizes, unless something below this crate pads to a uniform cell size the way Tor does. |
 | DP within-slot timing correlation | A real message used to be "sent immediately" the instant it was ready — an observer with finer-grained timing than the slot boundary could learn exactly when within a slot it arrived, strictly more than the presence-bit guarantee promises to hide. | Closed for within-slot arrival jitter (`ENGINEERING-STANDARDS.md` §6.27): `GridScheduler` buffers real messages in a FIFO queue and only ever transmits on `tick()`, called once per fixed-duration grid boundary by the caller's own clock — a message's observable send time is always exactly on a grid boundary regardless of when within the preceding slot it was enqueued. Broader queueing/request-response timing correlation elsewhere in a caller's system remains entirely out of this crate's scope — see §5's "what this doesn't cover." The real cost of closing this: added latency (a message enqueued mid-slot waits for the next tick, and more than one enqueued in one slot queue further still), the same way the presence-bit guarantee itself costs bandwidth. |
 | PKI/directory-service distribution | Account PKI and `SignedDeviceList` distribution have no built-in transport. | Still open, and not really fixable *inside this library*: a directory service is a network service with its own trust and availability model, the same "trust/transport provisioning is the caller's problem" boundary every other module in this workspace already draws (`crate::handshake`'s peer-identity pinning, §4.2, §4.4). |
