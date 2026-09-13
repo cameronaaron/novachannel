@@ -24,6 +24,19 @@ RUSTDOCFLAGS="${RUSTDOCFLAGS:-} -D warnings" cargo doc --workspace --no-deps --r
 echo "==> cargo test --workspace --release --locked --exclude novachannel-rln"
 cargo test --workspace --release --locked --exclude novachannel-rln
 
+# Debug mode, for everything but novachannel-rln (see below). The release
+# run above is what the workspace ships and what the RLN caveat is about,
+# but running *only* release is how a `debug_assert!` becomes load-bearing
+# and useless at the same time: `wire::Writer::put_var` guarded its length
+# prefix with one, nothing ever ran it, and release silently truncated any
+# field over 64KiB for months (ENGINEERING-STANDARDS.md §6.29). Debug mode
+# is also where `debug_assert!`s that encode real internal invariants
+# (novachannel-mpc's participant-id check, novachannel-rln's trace row
+# indices) actually get checked. Cheap: the crates involved build and run
+# in well under a minute.
+echo "==> cargo test --workspace --locked --exclude novachannel-rln (debug)"
+cargo test --workspace --locked --exclude novachannel-rln
+
 # novachannel-rln is run separately, in --release only: winterfell's
 # debug-mode transition-degree assertion is witness-dependent for this AIR's
 # sparse boundary columns even though the declared degrees are safe upper

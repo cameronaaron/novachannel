@@ -1884,6 +1884,16 @@ ed25519-dalek's `verify_strict`; two missing canonicality checks
 bytes); and `SignedDeviceList` gained the public `to_bytes`/`from_bytes`
 its own module docs described but had no way to perform.
 
+**The gate now runs debug mode too.** Running only `--release` is how a
+`debug_assert!` gets to be load-bearing and useless at the same time:
+nothing ever executed `put_var`'s guard, so the truncation above shipped
+unchecked. `scripts/check.sh` now runs the test suite in debug as well as
+release for every crate but `novachannel-rln` (whose debug-mode caveat
+§0.4 explains), which is also where the `debug_assert!`s that encode real
+internal invariants — `novachannel-mpc`'s participant-id check,
+`novachannel-rln`'s trace row indices — actually get checked. The whole
+gate still finishes in about 26 seconds.
+
 `Identity`'s `Drop` impl was **deleted**, not repaired. It called
 `sk.to_bytes()` — which copies the secret out — and zeroized the copy,
 clearing nothing while reading as though it cleared something, at the cost
