@@ -174,14 +174,28 @@ No, and the specific reasons (not a hedge):
   its signer remain the caller's problem (`docs/SYSTEMIZATION.md` §4.4,
   §9). `RemoteAccount::new`/`add_device` also remain available fully
   unauthenticated, so using the signed path is opt-in, not enforced.
-- 8 `cargo-fuzz` targets now run continuously via ClusterFuzzLite
+- 8 `cargo-fuzz` targets run continuously via ClusterFuzzLite
   (`ENGINEERING-STANDARDS.md` §6.25) — 10 min/target on every PR, 1hr/target
   every 6 hours — covering every crate with an untrusted-input parsing
-  boundary, and already found a real remote-DoS panic in a dependency's
-  proof deserializer (`docs/SYSTEMIZATION.md` §8). Real, but far short of
-  Signal's own fuzzing investment: 8 targets against `libsignal-protocol`'s
-  broader and longer-running corpus, with no comparable per-target time
-  budget claimed here.
+  boundary. **Six of the eight were rewritten in September 2026 because
+  they were not testing what their execution counts suggested**
+  (§6.31-§6.32): one had never reached the code it is named for, two were
+  bouncing off a length or signature check in their first field, and three
+  were mostly measuring key generation. That is worth stating here rather
+  than only in the audit trail, because the previous version of this
+  bullet counted targets as if counting them meant something. Far short of
+  Signal's own investment either way: 8 targets against
+  `libsignal-protocol`'s broader and longer-running corpus, with no
+  comparable per-target time budget claimed here.
+- **A malformed RLN proof can abort the calling process.** `winterfell`
+  0.13.1 passes an attacker-controlled count straight to
+  `Vec::with_capacity` while parsing a proof's query section, inside
+  `verify` — downstream of every guard this workspace has, uncontainable
+  by `catch_unwind` because an allocation failure aborts rather than
+  unwinds, and with no fixed upstream release to take. Documented at
+  `novachannel_rln::air::verify` and pinned by a test (§6.31). Anything
+  calling that function needs to be isolated from whoever supplies the
+  proof bytes. This is the sharpest single reason on this list.
 - No external security audit of anything in this workspace.
 - The DKG's complaint mechanism (`novachannel-mpc`) and `ServerStorage`
   (`novachannel-oram`) each now have a real networked implementation
@@ -194,9 +208,10 @@ No, and the specific reasons (not a hedge):
   reuse `novachannel`'s own sessions for) an authenticated transport on
   top; what's closed is "no networked implementation exists to show this
   is deployable at all."
-- RLN proofs run 85–230x larger than a Groth16 equivalent for the same
-  relation (§3.2) — a real bandwidth cost nobody has yet decided is
-  acceptable for a specific deployment.
+- RLN proofs run roughly 110–350x larger than a Groth16 equivalent for the
+  same relation, and 211x at this crate's default (re-measured September
+  2026; `docs/SYSTEMIZATION.md` §3.2) — a real bandwidth cost nobody has
+  yet decided is acceptable for a specific deployment.
 
 None of that is a reason not to have built this — a correct, tested,
 honestly-scoped reference implementation of a real system is a legitimate

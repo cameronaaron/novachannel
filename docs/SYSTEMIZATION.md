@@ -194,7 +194,7 @@ proof size, for one bit. The last row shows the corresponding dead end at
 the other dial: past a cubic extension, extra queries change the proof
 size and not the security.
 
-At the current default, proof size is roughly **210x** Groth16's constant
+At the current default, proof size is roughly **211x** Groth16's constant
 128 bytes, for a genuinely tiny circuit — the gap would only widen for a production-sized membership
 set. If per-message bandwidth matters more than avoiding a trusted setup
 and PQ-hardening the proof system for a given deployment, that's a real
