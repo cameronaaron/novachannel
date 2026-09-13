@@ -16,17 +16,26 @@ use novachannel::prekey::{DhIdentity, OneTimePreKeyStore, PreKeyBundle, SignedPr
 use novachannel::sealed_sender::{self, SenderCertificate};
 use novachannel::x3dh;
 
-/// A group large enough that its commits exceed 65535 bytes. Measured, not
-/// guessed: a 32-leaf group's commits run to roughly 73KB once every leaf
-/// is occupied, because the committer's path update has to carry one
-/// hybrid ciphertext per blank-subtree resolution and those resolutions
-/// grow with the tree.
+/// A group large enough that its messages exceed 65535 bytes. Measured,
+/// not guessed — largest message once every leaf is occupied:
 ///
-/// Before the fix, `Commit::to_bytes` here silently emitted bytes whose
-/// length prefix had wrapped modulo 2^16, and `Commit::from_bytes`
-/// rejected its own crate's output — with no error at serialization time
-/// to say so. The group module was simply unusable past ~16 members, in
-/// release builds only.
+/// | leaves | commit | welcome |
+/// | --- | --- | --- |
+/// | 4 | 21.9 KB | 36.5 KB |
+/// | 16 | 45.1 KB | 147.0 KB |
+/// | 32 | 73.4 KB | 291.6 KB |
+/// | 64 | 128.2 KB | 579.4 KB |
+///
+/// A commit grows because the committer's path update carries one hybrid
+/// ciphertext per blank-subtree resolution, and those resolutions grow
+/// with the tree; a welcome grows faster still, because its snapshot
+/// serializes the whole ratchet tree.
+///
+/// So the old `u16` length prefix broke **welcomes at 16 leaves and
+/// commits at 32** — `to_bytes` silently emitted bytes whose prefix had
+/// wrapped modulo 2^16, and `from_bytes` then rejected its own crate's
+/// output, with no error at serialization time to say so. In release
+/// builds only, which is why nothing caught it.
 #[test]
 fn commits_for_a_group_too_large_for_a_u16_length_prefix_round_trip() {
     let founder = Identity::generate();

@@ -19,9 +19,13 @@ cargo audit --file crates/core/fuzz/Cargo.lock
 Install cargo-audit and gitleaks before running the gate if absent: its
 local security-tool checks otherwise explicitly skip. The recorded run had
 both installed. The gate checks formatting, Clippy with warnings denied,
-public rustdoc with warnings denied, and release-mode tests. RLN must run
-in release mode; see ENGINEERING-STANDARDS.md for the known debug-assertion
-limitation. This release does not claim debug-mode compatibility.
+public rustdoc with warnings denied, and the test suite in **both release
+and debug** — debug-mode testing was added in this review, because running
+only release is how a `debug_assert!` came to be load-bearing and never
+executed at the same time (see "Corrected results"). `novachannel-rln` is
+still release-only; see ENGINEERING-STANDARDS.md §0.4 for the winterfell
+debug-assertion limitation that makes it so. Every other crate now runs in
+debug on every gate invocation.
 
 ## Verified in this review
 
@@ -44,13 +48,15 @@ A second full review of all five crates found nine defects, recorded in
 full in `ENGINEERING-STANDARDS.md` §6.29 and §6.30. The ones that change
 what this project can be said to do:
 
-- **Groups were unusable past ~16 members.** `wire::Writer::put_var` wrote
-  a `u16` length prefix guarded only by a `debug_assert!`, so in release
-  builds any field over 65535 bytes silently wrapped its prefix. A
-  `Commit` for a 32-leaf group measures ~73KB, so `Commit::to_bytes`
-  emitted bytes `Commit::from_bytes` could not parse, with no error on the
-  write path. `sealed_sender::seal` and `x3dh::initiate` did the same for
-  caller payloads over 64KiB. The prefix is now `u64`, which makes the
+- **Groups were unusable at 16 members and above.**
+  `wire::Writer::put_var` wrote a `u16` length prefix guarded only by a
+  `debug_assert!`, so in release builds any field over 65535 bytes
+  silently wrapped its prefix. Measured: a 32-leaf group's `Commit` is
+  73.4KB and its `Welcome` 291.6KB, and a welcome crosses 64KiB already at
+  16 leaves (147.0KB) because its snapshot serializes the whole ratchet
+  tree. Both emitted bytes their own parsers rejected, with no error on
+  the write path. `sealed_sender::seal` and `x3dh::initiate` did the same
+  for caller payloads over 64KiB. The prefix is now `u64`, which makes the
   truncation impossible by construction rather than documented. **This is
   a breaking wire-format change.**
 - **The group `Welcome` was unauthenticated.** It travels in a
