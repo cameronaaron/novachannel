@@ -64,6 +64,7 @@ quantum-resistant (see §0.2). Concretely:
 | §6.29 A `debug_assert!`-guarded `u16` length prefix silently truncated any field over 64KiB in release; three unbounded attacker-chosen allocations; an unauthenticated group `Welcome`; ORAM bucket occupancy and block length leaking; prekey exhaustion; RNG consumption tracking the DP presence bit | `crates/core/src/wire.rs` (u64 prefix, truncation structurally impossible; `Reader::remaining()` bounds every count-prefixed sequence), `crates/core/tests/wire_limits.rs` (a 32-leaf group's ~73KB commits round-trip; absurd counts rejected; trailing bytes rejected at every public entry point), `crates/core/src/group.rs` (signed `WelcomeSnapshot` bound to its `Commit` by group id, epoch, target leaf and committer identity; `Group::member_identity`), `crates/core/src/prekey.rs` (`peek`/`consume` split so an unauthenticated message cannot burn a one-time prekey), `crates/oram/src/lib.rs` (fixed `block_value_len` + dummy padding to `bucket_capacity`; `every_written_bucket_looks_identical_to_the_server_whatever_it_holds`), `crates/dp/src/lib.rs` (unconditional draw; two tests verified against the pre-fix source), `crates/core/src/kex.rs` (`checked_dh`, RFC 7748 §6.1) |
 | §6.30 The RLN proof-security figure this workspace quoted was wrong in both directions; RLN message binding was not injective | `crates/rln/src/air.rs::default_proof_options` (127, not 148: `min(field_security, query_security) - 1` with `field_security = 64 * 2`; cubic extension measured at 5.6x proving time for one bit and rejected), `air::MIN_CONJECTURED_SECURITY_BITS` (127, was 95 — the verifier's floor is the number that matters), `crates/rln/src/lib.rs::bytes_to_field` (length-seeded, 7 bytes per element; `b"a"`/`b"a\0"` and `v`/`v+p` no longer collide), `crates/rln/tests/rln.rs` (`distinct_messages_do_not_collide_in_the_rate_limit_binding_value`, `a_second_message_in_an_epoch_still_leaks_the_key_when_it_differs_only_by_a_trailing_zero`, `a_proof_generated_below_the_security_floor_is_rejected`) |
 | §6.31 `rln_verify` had never reached the verifier it was named for; a five-byte input aborted the process under `panic = "abort"`; an unbounded allocation in a dependency aborts it in any build | `crates/core/fuzz/fuzz_targets/rln_verify.rs` (splices fuzzer bytes into a genuine proof — coverage 84 -> 2041 edges), `crates/rln/tests/data/seed_proof.bin` + `the_seed_proof_fixture_still_parses_and_verifies` (one fixture, two readers, checked by the gate so it cannot go stale), `crates/rln/src/air.rs::validate_trace_info` (`verify` rejects an impossible trace shape as a `Result` instead of relying on `catch_unwind` over `RlnAir::new`'s asserts) + `a_proof_declaring_an_impossible_trace_shape_is_an_error_not_a_panic`, and `a_known_unbounded_allocation_in_winterfells_verifier_still_aborts_the_process` (subprocess test pinning the upstream DoS `air::verify`'s docs warn about; fails if upstream fixes it) |
+| §6.32 Five more fuzz targets were measuring key generation or bouncing off a first-field check rather than fuzzing their parser | `crates/core/fuzz/fuzz_targets/{prekey_bundle,group_commit,handshake_messages,x3dh_respond,sealed_sender_open,ratchet_open}.rs` (expensive immutable setup cached in a `OnceLock`, mutable state still rebuilt per iteration, each input spliced into a genuine message); measured before/after edge counts and execution counts in `crates/core/fuzz/README.md`'s table — `ratchet_open` went from 644 executions to 2.54M, `group_commit` from 69 covered edges to 3735 |
 | §9 Fair claims about proof/build status | `cargo test -p novachannel-rln --release` documented as the required invocation, with the debug-mode caveat explained rather than hidden |
 
 ---
@@ -2034,3 +2035,66 @@ down; if upstream ever fixes this, the child exits cleanly and the test
 fails, which is the signal to delete both the test and the warning. A
 known limitation with a test that fires when it stops being true is worth
 more than a paragraph that quietly goes stale.
+
+### 6.32 The same blind spot in five more fuzz targets, and why exec count is not coverage
+
+§6.31 found `rln_verify` had never reached the verifier it was named for.
+Checking the *other* seven targets' coverage — rather than their execution
+counts, which is what had been reported as evidence — found the same
+problem in five more, in two different shapes.
+
+**Never reached the parser at all.** `prekey_bundle` and `group_commit`
+build nothing per iteration, so their coverage figures were honest: 185
+and 69 edges, after 11.4 million and 1.9 million executions. Both stop in
+the first field — a `PublicIdentity`'s ML-DSA-87 key is a length-prefixed
+2592-byte field, and a `Commit`'s embedded `LeafKeyPackage` verifies a
+proof-of-possession signature before `read` returns. Random mutation
+produces neither. Splicing each input over a window of a genuine message
+took them to 2410 and 3735 edges.
+
+**Coverage that was mostly key generation.** `handshake_messages`,
+`x3dh_respond`, `sealed_sender_open` and `ratchet_open` generated fresh
+ML-DSA-87 identities on every iteration — `ratchet_open` ran an entire
+three-message handshake, twice, per input. Two costs at once: throughput
+collapsed (`ratchet_open` managed **eight executions a second**, 644 in a
+75-second run, which is running one handshake repeatedly rather than
+fuzzing anything), and the coverage number that was supposed to show the
+parser was being reached was dominated by edges inside key generation
+that light up whatever the input is.
+
+Caching that setup makes the reported coverage *fall* while the target
+does vastly more real work, which is the counterintuitive part worth
+recording: `ratchet_open` went from 2878 edges at 644 executions to 1514
+edges at **2,541,083** — roughly four thousand times the throughput, with
+the handshake's own edges correctly no longer counted as parser coverage.
+`sealed_sender_open` went from 1.6K executions to 488K, `x3dh_respond`
+from 1.8K to 169K. `handshake_messages` gained on both axes (1360 to 2116
+edges, 27.5K to 75.5K executions) because the splice reaches the
+signature-verification path, which outweighs the removed setup.
+
+What must *not* be cached is any state the code under test mutates.
+`ratchet_open` rebuilds a receiving `RatchetedSession` per iteration from
+the cached `ratchet_root`, because `open` advances chain keys and the
+skipped-key cache and a successful open on one input must not decide a
+later input's outcome; `x3dh_respond` refills its one-time prekey store
+for the same reason. Caching the expensive, immutable setup and rebuilding
+only the mutable state is the distinction that makes this safe rather than
+a way of leaking state between inputs.
+
+Three standing rules come out of this, none of which this document had:
+
+1. **Exec count is not coverage.** It measures how fast the harness loops.
+   The two can move in opposite directions, and here they did, in both
+   directions.
+2. **Coverage is not parser coverage.** A target that constructs real
+   cryptographic state per iteration reports that construction as
+   coverage. Ask what fraction of the number is setup.
+3. **Anything behind a length check, a signature, or an AEAD tag is
+   unreachable by random mutation.** Assume it, rather than discovering it
+   after 36 million executions: seed from a genuine message and splice.
+
+No new defects fell out of the five reworked targets in runs of 150-240
+seconds each. That is a weaker statement than it would have been before
+this section, and a more honest one — the previous "all eight targets
+smoke-tested with zero crashes" was substantially a statement about
+targets that were not testing much.

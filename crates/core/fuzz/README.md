@@ -95,15 +95,53 @@ target: `prekey_bundle` 11.4M execs, `group_commit` 1.9M, `mpc_frost_verify`
 39K, `handshake_messages` 28K, `x3dh_respond` 1.8K, `sealed_sender_open`
 1.6K, `ratchet_open` 644 — no crashes in any of them.
 
-`rln_verify` is the exception, and §6.31 is worth reading before trusting
-any of these numbers as coverage. That target embedded a genuine proof
+Those numbers are superseded, and the reason is the most useful thing in
+this file. `rln_verify` turned out to have embedded a genuine proof
 specifically so it could get past the deserializer, never used it, and
 spent its entire life fuzzing four bytes of `Proof::from_bytes` — its
-whole corpus was two-to-four byte inputs. Splicing the fuzzer's bytes into
-the genuine proof instead took it from 84 covered edges to 2041, and it
-found two real defects within seconds. **A target that runs clean may be
-running clean over almost nothing; check what it covers, not just that it
-survives.**
+whole corpus was two-to-four byte inputs (§6.31). Checking the *other*
+targets' coverage rather than their exec counts found the same problem in
+several more, in two different shapes.
+
+**Targets that never reached their parser.** `prekey_bundle` and
+`group_commit` build nothing per iteration, so their coverage was an
+honest measure — and it was 185 and 69 edges, after 11.4 million and 1.9
+million executions respectively. Both bounce off a length or signature
+check in the first field. Splicing fixed both.
+
+**Targets whose coverage was mostly key generation.**
+`handshake_messages`, `x3dh_respond`, `sealed_sender_open` and
+`ratchet_open` generated fresh ML-DSA-87 identities (and, for
+`ratchet_open`, a complete three-message handshake) on *every* iteration.
+That made them slow — `ratchet_open` managed eight executions a second —
+and it inflated the coverage figure that was supposed to show the parser
+was being reached, since key generation lights up hundreds of edges
+whatever the input is. Caching that setup makes the coverage number
+*drop* while the target does far more real work; the lower number is the
+honest one.
+
+| target | edges before | edges after | executions before | executions after |
+| --- | --- | --- | --- | --- |
+| `rln_verify` | 84 | 2041 | — | — |
+| `group_commit` | 69 | 3735 | 1.9M | — |
+| `prekey_bundle` | 185 | 2410 | 11.4M | — |
+| `handshake_messages` | 1360 | 2116 | 27.5K | 75.5K |
+| `ratchet_open` | 2878 | 1514 | 644 | 2.54M |
+| `sealed_sender_open` | 1837 | 1145 | 1.6K | 488K |
+| `x3dh_respond` | 1876 | 1680 | 1.8K | 169K |
+
+(Before/after runs are 75-180s each; executions for the first three were
+not comparable across the change.) No crashes in any of them after the
+rework.
+
+**The lesson, not the numbers: a target that runs clean may be running
+clean over almost nothing.** Exec count measures how fast the harness
+loops, not how much of the parser it reaches, and the two can move in
+opposite directions. When adding or reviewing a target here, check what
+it covers and what fraction of that is setup rather than the code under
+test — and if the code under test sits behind a length check, a
+signature, or an AEAD tag, assume random bytes never get there and splice
+into a genuine message instead.
 
 A smoke test alone is not a clean bill of health — a few seconds of
 fuzzing per target finds the shallow bugs, not the deep ones, which is
