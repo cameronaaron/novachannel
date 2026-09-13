@@ -1,0 +1,8 @@
+# Public inputs for seed_proof.bin, one u64 per line, in the order
+# root, epoch, x, y, nullifier. Regenerate both files together with
+#   cargo run -p novachannel-rln --release --example gen_fuzz_seed
+8990551817337309534
+4582183166585288392
+16198758081854987517
+6616179152081910273
+16159738622640836405

@@ -506,3 +506,194 @@ fn a_proof_generated_below_the_security_floor_is_rejected() {
     );
     air::verify(good_proof, pub_inputs).expect("the default options must verify");
 }
+
+/// The genuine proof `crates/core/fuzz/fuzz_targets/rln_verify.rs` splices
+/// fuzzer bytes into must keep parsing and verifying, and its recorded
+/// public inputs must keep matching it.
+///
+/// This check exists because of how that target failed silently. Feeding a
+/// verifier random bytes only ever exercises the first few bytes of the
+/// deserializer — the target's entire accumulated corpus was two-to-four
+/// byte inputs, and every crash it ever reported was a deserializer
+/// arithmetic panic on four bytes. A genuine proof had been generated
+/// offline for exactly that reason and then never actually used, so the
+/// target spent its whole life never reaching the verifier at all. The
+/// same thing happens again, just as quietly, if this fixture goes stale
+/// under an unrelated change — so it is checked here, in the gate, rather
+/// than trusted to stay valid.
+#[test]
+fn the_seed_proof_fixture_still_parses_and_verifies() {
+    const PROOF_BYTES: &[u8] = include_bytes!("data/seed_proof.bin");
+    const PUBLIC_INPUTS: &str = include_str!("data/seed_public_inputs.txt");
+
+    let values: Vec<u64> = PUBLIC_INPUTS
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+        .map(|l| l.trim().parse().expect("a decimal u64 per line"))
+        .collect();
+    assert_eq!(
+        values.len(),
+        5,
+        "expected root, epoch, x, y, nullifier — one per line"
+    );
+
+    let public = air::PublicInputs {
+        root: BaseElement::new(values[0]),
+        epoch: BaseElement::new(values[1]),
+        x: BaseElement::new(values[2]),
+        y: BaseElement::new(values[3]),
+        nullifier: BaseElement::new(values[4]),
+    };
+
+    let message = novachannel_rln::Message::from_proof_bytes(PROOF_BYTES, public)
+        .expect("the seed proof must still parse");
+    air::verify(message.proof, message.public).expect(
+        "the seed proof must still verify — regenerate it and its public inputs together \
+         with `cargo run -p novachannel-rln --release --example gen_fuzz_seed`",
+    );
+}
+
+/// ...and it must clear the verifier's own security floor, since a seed
+/// that did not would make the spliced fuzzing path reject everything
+/// before reaching a single constraint.
+#[test]
+fn the_seed_proof_fixture_clears_the_security_floor() {
+    const PROOF_BYTES: &[u8] = include_bytes!("data/seed_proof.bin");
+    let dummy = air::PublicInputs {
+        root: BaseElement::ZERO,
+        epoch: BaseElement::ZERO,
+        x: BaseElement::ZERO,
+        y: BaseElement::ZERO,
+        nullifier: BaseElement::ZERO,
+    };
+    let message = novachannel_rln::Message::from_proof_bytes(PROOF_BYTES, dummy).unwrap();
+    assert!(
+        message
+            .proof
+            .conjectured_security::<Blake3_256<BaseElement>>()
+            .bits()
+            >= air::MIN_CONJECTURED_SECURITY_BITS
+    );
+}
+
+/// A proof declaring a trace shape this AIR could never have produced must
+/// be rejected as an error, not by panicking inside `RlnAir::new` and
+/// relying on `verify`'s `catch_unwind` to contain it — that containment
+/// does not exist under `panic = "abort"`, which a size-optimized or
+/// embedded consumer may well build with, turning a malformed proof into a
+/// remote process abort.
+///
+/// The five-byte input below is what `crates/core/fuzz`'s `rln_verify`
+/// target produced within seconds of being fixed to actually reach the
+/// verifier: spliced over the start of a genuine proof, it yields a proof
+/// whose header parses but declares a trace width of 5 against this AIR's
+/// 11. See `ENGINEERING-STANDARDS.md` §6.31.
+#[test]
+fn a_proof_declaring_an_impossible_trace_shape_is_an_error_not_a_panic() {
+    const PROOF_BYTES: &[u8] = include_bytes!("data/seed_proof.bin");
+    let public = air::PublicInputs {
+        root: BaseElement::ZERO,
+        epoch: BaseElement::ZERO,
+        x: BaseElement::ZERO,
+        y: BaseElement::ZERO,
+        nullifier: BaseElement::ZERO,
+    };
+
+    // The exact splice the fuzzer found: offset 0, patch [0x05].
+    let mut spliced = PROOF_BYTES.to_vec();
+    spliced[0] = 0x05;
+
+    let message = novachannel_rln::Message::from_proof_bytes(&spliced, public)
+        .expect("this input's header still parses — that is what makes it interesting");
+    let err = air::verify(message.proof, message.public)
+        .expect_err("a trace width this AIR never produces must not verify");
+    assert!(
+        err.contains("trace width"),
+        "expected a trace-shape rejection, got: {err}"
+    );
+    assert!(
+        !err.contains("panicked"),
+        "the rejection must come from the up-front check, not from catching a panic: {err}"
+    );
+}
+
+/// A named, currently-unfixable remote DoS, pinned by an executable check
+/// rather than left as prose.
+///
+/// `winterfell` 0.13.1's `BatchMerkleProof::read_from`
+/// (`winter-crypto/src/merkle/proofs.rs`) reads an attacker-controlled
+/// count out of a proof and hands it straight to `Vec::with_capacity`,
+/// then does the same again per node vector via `read_many`. That parse
+/// happens *inside* `winterfell::verify` — not in `Proof::from_bytes` —
+/// so `Message::from_proof_bytes`'s guard is upstream of it and cannot
+/// help. Worse, `air::verify`'s `catch_unwind` cannot help either: an
+/// allocation failure calls `handle_alloc_error`, which **aborts** rather
+/// than unwinding, so there is nothing to catch.
+///
+/// Measured, not inferred: the input below makes a normal `--release`
+/// build (no sanitizer) print `memory allocation of 2520802182910816
+/// bytes failed` and die with SIGABRT. It is the exact splice
+/// `crates/core/fuzz`'s `rln_verify` target found once it was fixed to
+/// reach the verifier at all.
+///
+/// This is the same defect class this workspace fixed three times in its
+/// own parsers (`ENGINEERING-STANDARDS.md` §6.29 — bound a declared count
+/// against the bytes actually remaining). It cannot be fixed here:
+/// `Queries`' raw bytes are private, so the only in-crate alternative
+/// would be re-implementing winterfell's wire format to pre-scan it,
+/// duplicating knowledge that drifts on every upgrade. 0.13.1 is the
+/// latest published version, so there is no upgrade to take either.
+///
+/// The check runs in a subprocess so it can assert the abort without
+/// taking the test runner down. **If this test starts failing because the
+/// child exited cleanly, upstream has fixed it** — drop the warning from
+/// `air::verify`'s docs and this test with it.
+#[test]
+fn a_known_unbounded_allocation_in_winterfells_verifier_still_aborts_the_process() {
+    const CHILD_ENV: &str = "NOVACHANNEL_RLN_ALLOC_ABORT_CHILD";
+    const PROOF_BYTES: &[u8] = include_bytes!("data/seed_proof.bin");
+
+    if std::env::var(CHILD_ENV).is_ok() {
+        let offset = u32::from_le_bytes([0x0a, 0x2f, 0x0a, 0x0a]) as usize % PROOF_BYTES.len();
+        let patch = [0x3du8, 0x3d];
+        let mut spliced = PROOF_BYTES.to_vec();
+        let end = (offset + patch.len()).min(spliced.len());
+        spliced[offset..end].copy_from_slice(&patch[..end - offset]);
+
+        let public = air::PublicInputs {
+            root: BaseElement::ZERO,
+            epoch: BaseElement::ZERO,
+            x: BaseElement::ZERO,
+            y: BaseElement::ZERO,
+            nullifier: BaseElement::ZERO,
+        };
+        if let Ok(message) = novachannel_rln::Message::from_proof_bytes(&spliced, public) {
+            let _ = air::verify(message.proof, message.public);
+        }
+        // Reached only if upstream stopped over-allocating.
+        std::process::exit(0);
+    }
+
+    let exe = std::env::current_exe().expect("the test binary knows its own path");
+    let output = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "a_known_unbounded_allocation_in_winterfells_verifier_still_aborts_the_process",
+            "--nocapture",
+        ])
+        .env(CHILD_ENV, "1")
+        .output()
+        .expect("re-run this test binary as a child");
+
+    assert!(
+        !output.status.success(),
+        "the child exited cleanly, so winterfell no longer over-allocates here — \
+         remove this test and the warning on `air::verify`"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("memory allocation of") && stderr.contains("failed"),
+        "expected an allocation failure, got status {:?} and stderr:\n{stderr}",
+        output.status
+    );
+}

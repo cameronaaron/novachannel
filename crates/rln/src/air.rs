@@ -197,10 +197,66 @@ fn step_result(
     )
 }
 
+/// Whether `trace_info` describes a trace shape this AIR could have
+/// produced, as a `Result` rather than as the panic [`RlnAir::new`] would
+/// raise on the same input.
+///
+/// [`RlnAir::new`] has to panic: winterfell's `Air::new` returns `Self`,
+/// not a `Result`, so there is no error channel to report a malformed
+/// `TraceInfo` through — and a `TraceInfo` is reconstructed from
+/// attacker-supplied proof bytes. [`verify`] wraps the whole call in
+/// `catch_unwind` for exactly that reason, which is a real guard in a
+/// normal build and **no guard at all** under `panic = "abort"`: a
+/// consumer building that way (size-optimized or embedded binaries
+/// routinely do) would abort the process on a malformed proof.
+///
+/// So the check runs here first, before winterfell is handed anything,
+/// and rejects cleanly. Found by `crates/core/fuzz`'s `rln_verify` target
+/// once it was fixed to actually reach the verifier — a 5-byte input
+/// (`ENGINEERING-STANDARDS.md` §6.31).
+fn validate_trace_info(trace_info: &TraceInfo) -> Result<(), String> {
+    if trace_info.width() != TRACE_WIDTH {
+        return Err(format!(
+            "proof declares a trace width of {}, not this AIR's {TRACE_WIDTH}",
+            trace_info.width()
+        ));
+    }
+    let trace_len = trace_info.length();
+    if !trace_len.is_multiple_of(BLOCK_LEN) {
+        return Err(format!(
+            "proof declares a trace length of {trace_len}, not a multiple of BLOCK_LEN ({BLOCK_LEN})"
+        ));
+    }
+    let blocks = trace_len / BLOCK_LEN;
+    if blocks <= 2 {
+        return Err(format!(
+            "proof declares a trace length of {trace_len}, too short for even a zero-depth tree"
+        ));
+    }
+    let depth = blocks - 3;
+    if !is_valid_depth(depth) {
+        return Err(format!(
+            "proof declares a trace length of {trace_len}, implying depth {depth}, \
+             which is invalid (depth + 3 must be a power of two)"
+        ));
+    }
+    Ok(())
+}
+
 impl Air for RlnAir {
     type BaseField = BaseElement;
     type PublicInputs = PublicInputs;
 
+    /// # Panics
+    /// Panics on a `TraceInfo` this AIR could not have produced.
+    ///
+    /// It has to be a panic: winterfell's `Air::new` returns `Self`, not a
+    /// `Result`, so there is no error channel — and a `TraceInfo` is
+    /// reconstructed from attacker-supplied proof bytes. [`verify`]
+    /// therefore performs the same checks itself, as a `Result`, before
+    /// handing anything to winterfell, so this is unreachable through
+    /// that path. Relying on [`verify`]'s `catch_unwind` instead would be
+    /// no guard at all under `panic = "abort"`.
     fn new(trace_info: TraceInfo, pub_inputs: PublicInputs, options: ProofOptions) -> Self {
         assert_eq!(TRACE_WIDTH, trace_info.width());
 
@@ -785,7 +841,44 @@ pub fn prove(
 /// taken.
 pub const MIN_CONJECTURED_SECURITY_BITS: u32 = 127;
 
+/// Verifies `proof` against `pub_inputs`.
+///
+/// # A known remote denial of service this function cannot prevent
+/// **A malformed proof can abort the calling process.** `winterfell`
+/// 0.13.1's `BatchMerkleProof::read_from` reads an attacker-controlled
+/// count out of the proof and passes it straight to `Vec::with_capacity`
+/// (and again, per node vector, via `read_many`). A six-byte mutation of
+/// a genuine proof makes a normal release build request ~2.5 petabytes
+/// and die with SIGABRT — measured, not inferred; see
+/// `a_known_unbounded_allocation_in_winterfells_verifier_still_aborts_the_process`
+/// in `crates/rln/tests/rln.rs`, which pins it.
+///
+/// The `catch_unwind` below does **not** contain this, unlike the
+/// deserializer panic [`crate::Message::from_proof_bytes`] guards: an
+/// allocation failure calls `handle_alloc_error`, which aborts rather
+/// than unwinding, so there is nothing to catch. That parse also happens
+/// inside `winterfell::verify` rather than in `Proof::from_bytes`, so it
+/// is downstream of every guard this crate has.
+///
+/// It is not fixable here. `Queries`' raw bytes are private, so the only
+/// in-crate alternative would be re-implementing winterfell's wire format
+/// to pre-scan it — duplicated knowledge that drifts on every dependency
+/// upgrade — and 0.13.1 is the latest published version, so there is no
+/// upgrade to take. It is the same class this workspace fixed three times
+/// in its own parsers (`ENGINEERING-STANDARDS.md` §6.29: bound a declared
+/// count against the bytes actually remaining), present in a dependency.
+///
+/// **A deployment that must not abort on a hostile proof has to isolate
+/// this call** — a separate process it can supervise, or a sandbox with
+/// its own memory limit. Treat any caller of this function as able to be
+/// killed by whoever supplies the proof bytes.
 pub fn verify(proof: Proof, pub_inputs: PublicInputs) -> Result<(), String> {
+    // Before winterfell is handed anything: a malformed trace shape is a
+    // clean rejection here, not a panic inside `RlnAir::new` that only the
+    // `catch_unwind` below would catch — and that `catch_unwind` catches
+    // nothing under `panic = "abort"`. See `validate_trace_info`.
+    validate_trace_info(proof.trace_info())?;
+
     let min_opts =
         winterfell::AcceptableOptions::MinConjecturedSecurity(MIN_CONJECTURED_SECURITY_BITS);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

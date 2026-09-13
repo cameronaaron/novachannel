@@ -27,6 +27,13 @@
 //! - **A real membership registry.** [`merkle::MerkleTree`] is an in-memory
 //!   reference tree; wiring it to a persistent/distributed registry
 //!   (a smart contract, a gossiped log, ...) is out of scope here.
+//! - **A verifier safe to run in-process on hostile input.** A malformed
+//!   proof can abort the calling process through an unbounded allocation
+//!   in `winterfell`'s own query parser, which no guard in this crate can
+//!   contain and which has no fixed upstream release to upgrade to. This
+//!   is stated at [`air::verify`], where trusting it would be the
+//!   mistake, and pinned by a test. A deployment that must not be killed
+//!   by whoever sends it a proof has to isolate that call.
 //!
 //! # Example
 //! See `tests/rln.rs` for a full walkthrough: build a tree, prove

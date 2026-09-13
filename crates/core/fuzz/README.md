@@ -85,12 +85,25 @@ expensive that target's per-iteration setup is) with zero crashes found
 beyond the ones `rln_verify` keeps finding in `winterfell`'s own proof
 deserializer (§3.3/§6.22 — each one handled by `catch_unwind` and
 regression-tested against a normal build, per the section above; a third
-such input, `[0xc1, 0x3b, 0xf5, 0xcc]`, came out of the run below).
+such input, `[0xc1, 0x3b, 0xf5, 0xcc]`, came out of the run below). That
+target no longer feeds raw bytes to the deserializer at all — see §6.31
+and the target's own module docs for why keeping that path made the
+binary abort on startup and explore nothing.
 
 Re-run after the `ENGINEERING-STANDARDS.md` §6.29 fixes, 75 seconds per
 target: `prekey_bundle` 11.4M execs, `group_commit` 1.9M, `mpc_frost_verify`
 39K, `handshake_messages` 28K, `x3dh_respond` 1.8K, `sealed_sender_open`
 1.6K, `ratchet_open` 644 — no crashes in any of them.
+
+`rln_verify` is the exception, and §6.31 is worth reading before trusting
+any of these numbers as coverage. That target embedded a genuine proof
+specifically so it could get past the deserializer, never used it, and
+spent its entire life fuzzing four bytes of `Proof::from_bytes` — its
+whole corpus was two-to-four byte inputs. Splicing the fuzzer's bytes into
+the genuine proof instead took it from 84 covered edges to 2041, and it
+found two real defects within seconds. **A target that runs clean may be
+running clean over almost nothing; check what it covers, not just that it
+survives.**
 
 A smoke test alone is not a clean bill of health — a few seconds of
 fuzzing per target finds the shallow bugs, not the deep ones, which is

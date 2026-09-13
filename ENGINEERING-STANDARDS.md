@@ -63,6 +63,7 @@ quantum-resistant (see §0.2). Concretely:
 | §6.8 Dependency hygiene | every crate's declared dependencies are used; checked by grep audit (§6.8), no dead dependency left unresolved |
 | §6.29 A `debug_assert!`-guarded `u16` length prefix silently truncated any field over 64KiB in release; three unbounded attacker-chosen allocations; an unauthenticated group `Welcome`; ORAM bucket occupancy and block length leaking; prekey exhaustion; RNG consumption tracking the DP presence bit | `crates/core/src/wire.rs` (u64 prefix, truncation structurally impossible; `Reader::remaining()` bounds every count-prefixed sequence), `crates/core/tests/wire_limits.rs` (a 32-leaf group's ~73KB commits round-trip; absurd counts rejected; trailing bytes rejected at every public entry point), `crates/core/src/group.rs` (signed `WelcomeSnapshot` bound to its `Commit` by group id, epoch, target leaf and committer identity; `Group::member_identity`), `crates/core/src/prekey.rs` (`peek`/`consume` split so an unauthenticated message cannot burn a one-time prekey), `crates/oram/src/lib.rs` (fixed `block_value_len` + dummy padding to `bucket_capacity`; `every_written_bucket_looks_identical_to_the_server_whatever_it_holds`), `crates/dp/src/lib.rs` (unconditional draw; two tests verified against the pre-fix source), `crates/core/src/kex.rs` (`checked_dh`, RFC 7748 §6.1) |
 | §6.30 The RLN proof-security figure this workspace quoted was wrong in both directions; RLN message binding was not injective | `crates/rln/src/air.rs::default_proof_options` (127, not 148: `min(field_security, query_security) - 1` with `field_security = 64 * 2`; cubic extension measured at 5.6x proving time for one bit and rejected), `air::MIN_CONJECTURED_SECURITY_BITS` (127, was 95 — the verifier's floor is the number that matters), `crates/rln/src/lib.rs::bytes_to_field` (length-seeded, 7 bytes per element; `b"a"`/`b"a\0"` and `v`/`v+p` no longer collide), `crates/rln/tests/rln.rs` (`distinct_messages_do_not_collide_in_the_rate_limit_binding_value`, `a_second_message_in_an_epoch_still_leaks_the_key_when_it_differs_only_by_a_trailing_zero`, `a_proof_generated_below_the_security_floor_is_rejected`) |
+| §6.31 `rln_verify` had never reached the verifier it was named for; a five-byte input aborted the process under `panic = "abort"`; an unbounded allocation in a dependency aborts it in any build | `crates/core/fuzz/fuzz_targets/rln_verify.rs` (splices fuzzer bytes into a genuine proof — coverage 84 -> 2041 edges), `crates/rln/tests/data/seed_proof.bin` + `the_seed_proof_fixture_still_parses_and_verifies` (one fixture, two readers, checked by the gate so it cannot go stale), `crates/rln/src/air.rs::validate_trace_info` (`verify` rejects an impossible trace shape as a `Result` instead of relying on `catch_unwind` over `RlnAir::new`'s asserts) + `a_proof_declaring_an_impossible_trace_shape_is_an_error_not_a_panic`, and `a_known_unbounded_allocation_in_winterfells_verifier_still_aborts_the_process` (subprocess test pinning the upstream DoS `air::verify`'s docs warn about; fails if upstream fixes it) |
 | §9 Fair claims about proof/build status | `cargo test -p novachannel-rln --release` documented as the required invocation, with the debug-mode caveat explained rather than hidden |
 
 ---
@@ -1953,3 +1954,83 @@ appending a zero byte, with no cryptanalysis of the permutation involved.
 It now absorbs the byte length first and packs seven bytes per element,
 which is injective, putting collision resistance back on the permutation
 where the doc comment always claimed it rested.
+
+### 6.31 A fuzz target that had never reached the code it was named for, and the two defects that hid behind it
+
+§6.29 recorded that coverage-guided fuzzing structurally cannot reach
+fields behind a signature check. `rln_verify` turned out to have a
+sharper version of that problem, and it had been there since the target
+was written.
+
+Feeding a proof verifier random bytes only ever exercises the first few
+bytes of the *deserializer* — every input is rejected long before a
+constraint is checked. The target's author knew this: it embedded a
+genuine ~27KB proof, generated offline by `examples/gen_fuzz_seed` with a
+long doc comment explaining why that had to happen outside the fuzz
+binary. **The constant was then never used.** The only visible symptom
+was a `dead_code` warning on every `cargo fuzz build`. The target's entire
+accumulated corpus was inputs of two to four bytes, and all three crashes
+it had ever reported were the same winterfell deserializer panic on four
+bytes.
+
+Fixed by splicing: the fuzzer's bytes overwrite a chosen window of the
+genuine proof, so mutations land inside something the deserializer
+accepts. Coverage went from 84 edges to **2041** — a 24x increase, and
+the number that shows the target had genuinely never run the verifier.
+
+The raw-bytes path was *removed* rather than kept alongside. Under
+`cargo fuzz`'s forced `panic = "abort"` every known deserializer panic
+aborts the binary on sight, including the ones in the target's own
+corpus, so a run died within the first second and explored nothing. That
+panic class is already closed structurally by `Message::from_proof_bytes`'s
+`catch_unwind`, which is generic over any panic rather than a list of
+known inputs, and the three instances are pinned by regression tests.
+Re-finding a fourth instance of a handled class, at the cost of never
+reaching the verifier, is a bad trade.
+
+The fixture is now a file (`crates/rln/tests/data/seed_proof.bin`) read by
+both the fuzz target and a gate-run test that asserts it still parses and
+verifies. Without that check the seed goes stale under an unrelated change
+and silently returns the target to fuzzing four bytes of deserializer —
+the exact state it was already in, with the exact same lack of any signal.
+
+Within seconds of the fix, the target found two things.
+
+**One this crate could fix.** `RlnAir::new` asserts on trace width,
+length and implied depth, and a `TraceInfo` is reconstructed from
+attacker proof bytes. §6.22 added those guards as deliberate panics —
+winterfell's `Air::new` returns `Self`, not `Result`, so there is no error
+channel — relying on `verify`'s `catch_unwind`. That reasoning holds only
+under `panic = "unwind"`. A consumer building with `panic = "abort"`
+(routine for size-optimized and embedded binaries) gets a process abort
+from a five-byte input. `verify` now runs the same checks itself, as a
+`Result`, before handing anything to winterfell; the asserts remain as
+unreachable invariants.
+
+**One it cannot.** `winterfell` 0.13.1's `BatchMerkleProof::read_from`
+reads an attacker-controlled count and passes it straight to
+`Vec::with_capacity`, then again per node vector via `read_many`. A
+six-byte mutation makes a normal `--release` build (no sanitizer) request
+2520802182910816 bytes and die with SIGABRT. This is the same defect class
+§6.29 fixed three times in this workspace's own parsers — bound a declared
+count against the bytes actually remaining — sitting in a dependency.
+
+Three things make it worse than the deserializer panic §6.22 handled:
+the parse happens inside `winterfell::verify`, not `Proof::from_bytes`,
+so it is downstream of every guard this crate has; `catch_unwind` cannot
+contain it, because an allocation failure calls `handle_alloc_error`,
+which aborts rather than unwinds; and 0.13.1 is the latest published
+version, so there is no upgrade to take. The only in-crate alternative
+would be re-implementing winterfell's wire format to pre-scan it —
+duplicated format knowledge that drifts on every dependency upgrade,
+which §4.2 exists to refuse.
+
+So it is documented at `air::verify`, where trusting the verifier would be
+the mistake, rather than in a changelog nobody reads while integrating —
+and **pinned by an executable test**, per this document's opening rule
+that a standard without a check is a suggestion. The test runs the input
+in a subprocess and asserts the abort, so it does not take the runner
+down; if upstream ever fixes this, the child exits cleanly and the test
+fails, which is the signal to delete both the test and the warning. A
+known limitation with a test that fires when it stops being true is worth
+more than a paragraph that quietly goes stale.
