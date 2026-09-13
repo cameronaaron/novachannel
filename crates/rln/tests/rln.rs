@@ -256,6 +256,24 @@ fn a_second_four_byte_input_that_used_to_panic_winterfells_deserializer_is_rejec
     assert!(novachannel_rln::Message::from_proof_bytes(crash_bytes, dummy_public).is_err());
 }
 
+/// A third such input, found by the same target on a later run. Each of
+/// these is checked in as the fuzz README prescribes: a crash the fuzz
+/// binary reports is verified against a normal, unwind-enabled build
+/// before being called fixed, because `panic = "abort"` in the fuzz
+/// profile means that binary can never stop reporting them.
+#[test]
+fn a_third_four_byte_input_that_used_to_panic_winterfells_deserializer_is_rejected_cleanly() {
+    let crash_bytes: &[u8] = &[0xc1, 0x3b, 0xf5, 0xcc];
+    let dummy_public = air::PublicInputs {
+        root: BaseElement::ZERO,
+        epoch: BaseElement::ZERO,
+        x: BaseElement::ZERO,
+        y: BaseElement::ZERO,
+        nullifier: BaseElement::ZERO,
+    };
+    assert!(novachannel_rln::Message::from_proof_bytes(crash_bytes, dummy_public).is_err());
+}
+
 #[test]
 fn invalid_depths_are_rejected_by_is_valid_depth() {
     // depth + 3 must be a power of two; 2 -> 5 is not.

@@ -82,11 +82,26 @@ time, regardless of whether the library under test catches them.
 All eight targets have been smoke-tested (a few seconds to low tens of
 seconds each, on the order of 10^3–10^6 executions depending on how
 expensive that target's per-iteration setup is) with zero crashes found
-beyond the one `rln_verify` found in `winterfell`'s own proof deserializer
-(§3.3/§6.22, fixed and now regression-tested). A smoke test alone is not a
-clean bill of health — a few seconds of fuzzing per target finds the
-shallow bugs, not the deep ones, which is exactly what continuous fuzzing
-below is for.
+beyond the ones `rln_verify` keeps finding in `winterfell`'s own proof
+deserializer (§3.3/§6.22 — each one handled by `catch_unwind` and
+regression-tested against a normal build, per the section above; a third
+such input, `[0xc1, 0x3b, 0xf5, 0xcc]`, came out of the run below).
+
+Re-run after the `ENGINEERING-STANDARDS.md` §6.29 fixes, 75 seconds per
+target: `prekey_bundle` 11.4M execs, `group_commit` 1.9M, `mpc_frost_verify`
+39K, `handshake_messages` 28K, `x3dh_respond` 1.8K, `sealed_sender_open`
+1.6K, `ratchet_open` 644 — no crashes in any of them.
+
+A smoke test alone is not a clean bill of health — a few seconds of
+fuzzing per target finds the shallow bugs, not the deep ones, which is
+exactly what continuous fuzzing below is for. It is also not *uniformly*
+useful: `group_commit` reached 36M executions across these runs without
+ever parsing past a `LeafKeyPackage`, because doing so requires a
+proof-of-possession signature that verifies, and random mutation will not
+produce one. Everything behind a signature check in a parser is a
+structural blind spot for coverage-guided fuzzing — §6.29 found three
+unbounded allocations there by reading, not by running this. Budget
+attention accordingly.
 
 **Continuous fuzzing runs via [ClusterFuzzLite](https://google.github.io/clusterfuzzlite/)**,
 not a hand-rolled GitHub Actions loop: `.clusterfuzzlite/` (`project.yaml`,

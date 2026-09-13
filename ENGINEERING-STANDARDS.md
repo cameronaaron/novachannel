@@ -61,6 +61,8 @@ quantum-resistant (see §0.2). Concretely:
 | §6.22 A fuzz target found a real remote-DoS panic in `winterfell`'s proof deserializer; `rln::air.rs`/`core::multidevice.rs` coverage gaps closed; post-quantum threshold decryption added to `novachannel-mpc` | `crates/rln/src/lib.rs::Message::from_proof_bytes` + hardened `air::verify` (both `catch_unwind`-wrapped; regression tests replay the exact 4-byte crash inputs `rln_verify`/`mpc_frost_verify` fuzz targets found — see `crates/core/fuzz/fuzz_targets/{rln_verify,mpc_frost_verify}.rs` and that crate's README on why `cargo fuzz`'s forced `panic=abort` can't itself confirm a `catch_unwind` fix); `crates/rln/src/air.rs::tests` (malformed-`TraceInfo` guards) and `crates/rln/tests/rln.rs::each_public_input_is_independently_load_bearing`; `crates/core/src/multidevice.rs::tests`/`crates/core/tests/multidevice.rs` (device-list wire round-trip, unknown-sender rejection, `RemoteAccount::remove_device`/`device_ids`); `crates/mpc/src/threshold_kem.rs` (ML-KEM-1024 per-operator keys + Shamir-shared master secret, no group DKG, security resting on module-LWE per operator instead of Ristretto discrete log — §4.2's "reuse what's already sound" applied to `evaluate`/`lagrange_coefficient_at_zero`) |
 | §6.2 A fix and its regression test are one change | the RLN Merkle off-by-one fix (§6.3) and `valid_membership_proof_verifies` |
 | §6.8 Dependency hygiene | every crate's declared dependencies are used; checked by grep audit (§6.8), no dead dependency left unresolved |
+| §6.29 A `debug_assert!`-guarded `u16` length prefix silently truncated any field over 64KiB in release; three unbounded attacker-chosen allocations; an unauthenticated group `Welcome`; ORAM bucket occupancy and block length leaking; prekey exhaustion; RNG consumption tracking the DP presence bit | `crates/core/src/wire.rs` (u64 prefix, truncation structurally impossible; `Reader::remaining()` bounds every count-prefixed sequence), `crates/core/tests/wire_limits.rs` (a 32-leaf group's ~73KB commits round-trip; absurd counts rejected; trailing bytes rejected at every public entry point), `crates/core/src/group.rs` (signed `WelcomeSnapshot` bound to its `Commit` by group id, epoch, target leaf and committer identity; `Group::member_identity`), `crates/core/src/prekey.rs` (`peek`/`consume` split so an unauthenticated message cannot burn a one-time prekey), `crates/oram/src/lib.rs` (fixed `block_value_len` + dummy padding to `bucket_capacity`; `every_written_bucket_looks_identical_to_the_server_whatever_it_holds`), `crates/dp/src/lib.rs` (unconditional draw; two tests verified against the pre-fix source), `crates/core/src/kex.rs` (`checked_dh`, RFC 7748 §6.1) |
+| §6.30 The RLN proof-security figure this workspace quoted was wrong in both directions; RLN message binding was not injective | `crates/rln/src/air.rs::default_proof_options` (127, not 148: `min(field_security, query_security) - 1` with `field_security = 64 * 2`; cubic extension measured at 5.6x proving time for one bit and rejected), `air::MIN_CONJECTURED_SECURITY_BITS` (127, was 95 — the verifier's floor is the number that matters), `crates/rln/src/lib.rs::bytes_to_field` (length-seeded, 7 bytes per element; `b"a"`/`b"a\0"` and `v`/`v+p` no longer collide), `crates/rln/tests/rln.rs` (`distinct_messages_do_not_collide_in_the_rate_limit_binding_value`, `a_second_message_in_an_epoch_still_leaks_the_key_when_it_differs_only_by_a_trailing_zero`, `a_proof_generated_below_the_security_floor_is_rejected`) |
 | §9 Fair claims about proof/build status | `cargo test -p novachannel-rln --release` documented as the required invocation, with the debug-mode caveat explained rather than hidden |
 
 ---
@@ -1751,3 +1753,203 @@ private items that readers cannot navigate. Correct the links at their
 source and retain `cargo doc --workspace --no-deps --release --locked` with
 `RUSTDOCFLAGS=-D warnings` in scripts/check.sh; do not enable private-item
 documentation or suppress warnings to hide public documentation defects.
+
+### 6.29 A second production review: nine defects, and what fuzzing structurally could not reach
+
+A full read of all five crates against this document's own standards,
+prompted by "make this as close to production-ready as possible." Nine
+defects, each fixed with its regression test in the same commit (§6.2).
+Every test below was run against the pre-fix source and observed to fail
+there; where that check was itself vacuous the first time (stashing the
+source removed the test with it), it was redone by reverting only the
+source line.
+
+**A `debug_assert!` was load-bearing in release.** `wire::Writer::put_var`
+wrote a `u16` length prefix guarded by nothing else. A field over 65535
+bytes silently wrapped its prefix and produced a message no reader could
+parse, with no error anywhere on the write path. This was not a corner:
+a `group::Commit` for a 32-leaf group measures ~73KB, so `Commit::to_bytes`
+emitted unparseable bytes for any realistically sized group — measured, at
+four capacities, before anything was changed. `sealed_sender::seal` and
+`x3dh::initiate` did the same for any caller payload past 64KiB.
+
+The prefix is now `u64`, chosen over `u32` deliberately: `usize` is at most
+64 bits on every target Rust supports, so `bytes.len() as u64` is lossless
+*by construction* and `put_var` needs no failure path. A `u32` prefix would
+have needed a fallible writer, making every `to_bytes` in the crate return
+`Result` to report a condition no caller can reach. §6.10 again — the
+structural invariant beats the documented rule, and here it was also the
+better API. Six bytes per variable-length field, under 1% on the
+multi-kilobyte post-quantum key material that dominates every message.
+
+**Three unbounded attacker-chosen allocations.** `Commit`'s path length,
+`UpdatePathNode`'s ciphertext count and `SignedDeviceList`'s entry count
+each drove a `Vec::with_capacity` from a raw `u32` — up to four billion
+elements reserved before one byte of them was read. Measured on this
+machine, a 10.8 TiB reservation *succeeds* (macOS maps it lazily), so the
+honest statement of impact is not "crashes here" but "aborts wherever a
+reservation that size fails" — a memory cgroup, strict overcommit, a
+fuzzer's malloc limit. Closed by `Reader::remaining()`: every element of
+every such sequence costs at least one wire byte, so a count larger than
+the bytes left is provably unsatisfiable.
+
+**Why the existing fuzz targets never found it.** `group_commit` has run
+36 million executions without reaching `path_len`, and would not reach it
+in any amount of time: getting there requires a `LeafKeyPackage` whose
+proof-of-possession signature *verifies*, which random mutation will not
+produce. Signature-gated parsing is a structural blind spot for coverage-
+guided fuzzing, and the fields behind such a gate need reading, not more
+CPU. Noted here because the reflex on finding a parser bug is "add a fuzz
+target," and for this class that reflex is wrong.
+
+**Two ratchet state-machine faults.** `open` accepts records on the
+previous epoch's receive chain so records in flight across a transition
+still deliver; a peer holding that chain's keys could therefore seal a
+well-formed *step 1* on it, and `advance_epoch` would re-derive an epoch
+number already in use — two differently-keyed chains labelled with the
+same epoch, and a send chain the peer can no longer read. Step 1 is now
+accepted only on the current epoch. Separately, the incremental step-2
+path consumed `self.pending` before parsing the reconstructed reply, so a
+malformed reconstruction destroyed the ephemeral KEX material and
+stranded a step a retry could still have completed.
+
+**An unauthenticated group `Welcome`.** `WelcomeSnapshot::read` already
+carried a comment observing that a `Welcome` arrives through a
+sender-anonymous envelope and "anyone who knows the joining member's
+published `LeafKeyPackage` can construct a `Welcome` that decrypts
+cleanly... with arbitrary contents" — and used that observation only to
+validate `capacity` and `target_leaf`. The tree, epoch, epoch secret and
+transcript hash a joiner builds their whole group state from were
+unauthenticated bytes, bound to the accompanying `Commit` by nothing. The
+snapshot is now signed by the committer and `join` checks four bindings
+before believing any of it. A correct observation that stops one step
+short of its own conclusion is the failure mode to watch for here: the
+comment was right and the code was not.
+
+`Group::member_identity` was added in the same change. `Group::open`
+returned a leaf index with no API mapping it to a member, so a received
+group message was unattributable and a joiner had nothing to pin the
+committer against — in a crate whose entire trust model is "the caller
+pins identities."
+
+**One-time prekeys could be burned by anyone.** `x3dh::respond` deleted
+the referenced prekey before the init message's AEAD tag proved anything,
+so any party who could reach a responder could exhaust its published
+supply with garbage and downgrade every later honest session to the
+no-OPK path — a forward-secrecy loss forced by an unauthenticated
+attacker. The secret is genuinely needed to derive the key that
+authenticates the message, so the fix is not to defer the use but to
+split it: `peek` to run the exchange, `consume` only once the key has
+opened it.
+
+**Bucket occupancy and block length leaked out of the ORAM.**
+`EncryptingServerStorage` sealed each block's contents and stopped there.
+`Client::evict_path` writes back however many stash blocks were eligible,
+0 to Z, and that count reached the server directly; `V = Vec<u8>` was
+sealed at whatever length it happened to have. Both correlate with the
+access pattern the crate's opening paragraph says a server learns nothing
+about. Standard Path ORAM writes exactly Z encrypted slots per bucket and
+is defined over fixed-size blocks for this reason. Now: a fixed
+`block_value_len`, `tag || id || length || value` padded to it, and every
+bucket written back holding exactly `bucket_capacity` ciphertexts with
+encrypted dummies making up the difference. `Client` and the Merkle layer
+above it needed no change, which is the composability claim §6.10 already
+made about this split, tested rather than assumed.
+
+**Randomness consumption tracked the secret bit.**
+`DummyScheduler::decide` was `has_real_message || rng.random_bool(p)`,
+which short-circuits: a busy slot drew nothing, an empty slot drew a
+sample. The count of values pulled from the caller's generator therefore
+tracked the presence bit the whole crate exists to hide. Equivalent in
+return value, not equivalent in what it leaks, and one discarded sample
+per slot removes the question.
+
+**Two overflow-before-bounds-check reorderings.** `group::spliced`
+computed `capacity - 1 + leaf` before range-checking `leaf`;
+`oram::depth_for_capacity` used `(n as f64).log2().ceil()`, exact for the
+powers of two it is usually handed but not across the `u64` range, where a
+value above `2^53` can round down to a depth too small to hold what was
+asked for.
+
+Other hardening in the same pass, none of it fixing a known live attack:
+`kex::checked_dh` rejects an X25519 exchange whose output is the all-zero
+point (RFC 7748 §6.1), checked on the output rather than against a
+hand-transcribed twelve-entry small-order table — one wrong byte in such a
+table silently weakens the check it exists to perform, and an output test
+cannot be transcribed wrong; `PublicIdentity::verify` moved to
+ed25519-dalek's `verify_strict`; two missing canonicality checks
+(`Commit::from_bytes` and `PreKeyBundle::from_bytes` accepted trailing
+bytes); and `SignedDeviceList` gained the public `to_bytes`/`from_bytes`
+its own module docs described but had no way to perform.
+
+`Identity`'s `Drop` impl was **deleted**, not repaired. It called
+`sk.to_bytes()` — which copies the secret out — and zeroized the copy,
+clearing nothing while reading as though it cleared something, at the cost
+of an extra copy of a secret key per drop. The thing that actually clears
+the material is `ZeroizeOnDrop` on the dependency key types, enabled by
+the cargo features §6.19 turned on for exactly that purpose. A static
+assertion that both types still implement it replaces the impl, so the
+real mechanism is checked at compile time. §0.2: delete what doesn't do
+what it says rather than patching it into looking correct.
+
+### 6.30 The proof-security number this workspace has been quoting was wrong in both directions
+
+§6.20 recorded raising `novachannel-rln` "from ~96 to ~148 conjectured
+bits." Both numbers were wrong, and the error was the same one each time:
+they came from `num_queries * log2(blowup_factor) + grinding_factor`,
+which is only the *query* term of winterfell's actual computation. The
+real formula (`winter-air`'s `ConjecturedSecurity::compute`) is
+
+```text
+min(min(field_security, query_security) - 1, hash_collision_resistance)
+```
+
+with `field_security = base_field_bits * field_extension_degree`. Over
+64-bit Goldilocks under a quadratic extension that is `64 * 2 = 128`, so
+the default yields `min(min(128, 148) - 1, 128) = 127` — the field, not
+the query count, has been the binding term all along, and 148 was never
+achievable at any query count. Downward, the pre-hardening default
+(`FieldExtension::None`) was worth `min(64, 96) - 1 = 63` bits, not ~96.
+§6.20 therefore achieved considerably more than it claimed (63 to 127)
+while landing one bit under this workspace's 128-bit bar rather than
+twenty over it.
+
+This surfaced from a change that had nothing to do with it. `air::verify`
+accepted any proof at `MinConjecturedSecurity(95)`, which is the number
+that actually matters — a proof carries the `ProofOptions` it was made
+under, so a prover picks its own security level and the verifier's floor
+is the only thing that rejects a deliberately weak one. Raising that floor
+to the documented 128 made every test in the crate fail, with winterfell
+reporting "127 bits." §0.5, in the other direction: the instrument was
+right and the expectation was wrong.
+
+`FieldExtension::Cubic` does reach exactly 128 — capped there by
+Blake3_256's collision resistance, so 128 is the ceiling for this hash —
+and every test passes under it. Rejected on measurement: **5.6x the
+proving time** (5.4ms median to 29.8ms) and 18% more proof size, for one
+bit, on an operation a rate-limited action pays per message and a
+constrained mobile prover pays a multiple of again. One bit of conjectured
+security does not buy a 5.6x latency regression on the operation this
+crate exists to perform. Recorded in `default_proof_options` so it is not
+retried blind (§0.3).
+
+The floor is now 127, pinned to exactly what the default achieves: tight
+enough to reject the 63-bit configurations the old floor admitted, honest
+about where the ceiling is. Both measurement examples now read the number
+off `Proof::conjectured_security` rather than re-deriving it, which is the
+actual lesson — a formula that disagrees with the library it describes is
+not a measurement, and printing it alongside real byte counts made it look
+like one for two releases.
+
+**A second RLN defect, found reading the same crate.** `bytes_to_field`
+produces the message-binding `x` of every rate-limit share and was not
+injective in two independent ways: it zero-padded the final 8-byte chunk,
+so `b"a"` and `b"a\0"` absorbed identically, and it read each chunk as a
+full `u64` reduced mod the Goldilocks prime, so any `v` and `v + p`
+collided. RLN extracts a member's key only from two shares with
+*different* `x`. Either collision therefore buys a second message in an
+epoch — the one thing the scheme is named for preventing — for the cost of
+appending a zero byte, with no cryptanalysis of the permutation involved.
+It now absorbs the byte length first and packs seven bytes per element,
+which is injective, putting collision resistance back on the permutation
+where the doc comment always claimed it rested.
