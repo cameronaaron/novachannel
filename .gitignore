@@ -1,0 +1,23 @@
+# Build artifacts
+/target/
+**/target/
+
+# Cargo.lock is intentionally tracked for this workspace (it's an
+# application/protocol repo, not a published library, so we want
+# reproducible builds) — do not ignore it.
+
+# Editors / OS
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+*.rs.bk
+
+# Local env / secrets
+.env
+*.pem
+*.key
+
+# Logs and scratch output from running examples/binaries locally
+*.log

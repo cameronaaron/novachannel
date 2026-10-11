@@ -1,0 +1,317 @@
+//! Regression tests for the wire-format defects in
+//! `crates/core/src/wire.rs`'s module docs and `ENGINEERING-STANDARDS.md`
+//! §6.29: variable-length fields over the old `u16` prefix silently
+//! truncated it in release builds, and an attacker-chosen count drove an
+//! unbounded `Vec::with_capacity` before any element was read.
+//!
+//! Every test here fails against the pre-fix code.
+
+use novachannel::group::{Commit, Group, LeafKeyPackage, MyLeafKeyPackage, Welcome};
+use novachannel::identity::Identity;
+use novachannel::multidevice::{DeviceId, DeviceListEntry, SignedDeviceList};
+use novachannel::prekey::{DhIdentity, OneTimePreKeyStore, PreKeyBundle, SignedPreKey};
+use novachannel::sealed_sender::{self, SenderCertificate};
+use novachannel::x3dh;
+
+/// A group whose messages exceed 65535 bytes. Measured largest message with
+/// every leaf occupied:
+///
+/// | leaves | commit | welcome |
+/// | --- | --- | --- |
+/// | 4 | 21.9 KB | 36.5 KB |
+/// | 16 | 45.1 KB | 147.0 KB |
+/// | 32 | 73.4 KB | 291.6 KB |
+/// | 64 | 128.2 KB | 579.4 KB |
+///
+/// A commit's path update carries one hybrid ciphertext per blank-subtree
+/// resolution, which grows with the tree; a welcome serializes the whole
+/// tree and grows faster.
+///
+/// So the old `u16` prefix broke **welcomes at 16 leaves and commits at
+/// 32**: `to_bytes` emitted a prefix wrapped mod 2^16 and `from_bytes`
+/// rejected the crate's own output, with no error at serialization time,
+/// and only in release builds, so nothing caught it.
+#[test]
+fn commits_for_a_group_too_large_for_a_u16_length_prefix_round_trip() {
+    let founder = Identity::generate();
+    let mut group = Group::create(&founder, 32).unwrap();
+
+    let mut largest = 0usize;
+    for _ in 1..32 {
+        let member = Identity::generate();
+        let kp = MyLeafKeyPackage::generate(&member);
+        let (commit, welcome) = group.propose_add(&founder, kp.public()).unwrap();
+
+        let commit_bytes = commit.to_bytes();
+        largest = largest.max(commit_bytes.len());
+        Commit::from_bytes(&commit_bytes).expect("a commit must parse back from its own bytes");
+
+        let welcome_bytes = welcome.to_bytes();
+        Welcome::from_bytes(&welcome_bytes).expect("a welcome must parse back from its own bytes");
+    }
+
+    assert!(
+        largest > u16::MAX as usize,
+        "this test only proves anything if the commits actually exceed the old \
+         u16 prefix; largest was {largest} bytes"
+    );
+}
+
+/// The same property one level down: a `LeafKeyPackage` is mostly ML-DSA-87
+/// material (near 9KB), so this pins the encoding of the piece every
+/// `Commit` and `Welcome` embeds.
+#[test]
+fn a_leaf_key_package_round_trips_through_its_public_bytes() {
+    let id = Identity::generate();
+    let kp = MyLeafKeyPackage::generate(&id);
+    let bytes = kp.public().to_bytes();
+    let parsed = LeafKeyPackage::from_bytes(&bytes).unwrap();
+    assert_eq!(parsed.to_bytes(), bytes);
+}
+
+/// Sealed sender's payload is caller-sized; before the fix, anything over
+/// 65535 bytes wrapped its prefix into an envelope `open` couldn't parse,
+/// while `seal` reported success.
+#[test]
+fn a_sealed_envelope_larger_than_the_old_u16_prefix_opens_correctly() {
+    let issuer = Identity::generate();
+    let sender = Identity::generate();
+    let recipient_spk = SignedPreKey::generate(&Identity::generate());
+    let certificate = SenderCertificate::issue(&issuer, sender.public(), 100);
+
+    for len in [65_535usize, 65_536, 300_000] {
+        let plaintext = vec![0x5Au8; len];
+        let envelope = sealed_sender::seal(
+            &recipient_spk.sealing_public_key(),
+            &certificate,
+            &plaintext,
+        )
+        .unwrap();
+        let opened = sealed_sender::open(&recipient_spk, &envelope).unwrap();
+        assert_eq!(opened.plaintext, plaintext, "len={len}");
+    }
+}
+
+/// Same defect, same shape, on X3DH's initial application payload.
+#[test]
+fn an_x3dh_initial_payload_larger_than_the_old_u16_prefix_survives_the_round_trip() {
+    let responder_identity = Identity::generate();
+    let responder_dh = DhIdentity::generate();
+    let responder_spk = SignedPreKey::generate(&responder_identity);
+    let mut opks = OneTimePreKeyStore::new();
+
+    let initiator_identity = Identity::generate();
+    let initiator_dh = DhIdentity::generate();
+
+    let bundle = PreKeyBundle::build(
+        responder_identity.public(),
+        &responder_dh,
+        &responder_spk,
+        None,
+    );
+
+    let payload = vec![0xC3u8; 200_000];
+    let initiated = x3dh::initiate(
+        &initiator_identity.public(),
+        &initiator_dh,
+        &bundle,
+        &payload,
+    )
+    .unwrap();
+    let responded = x3dh::respond(
+        &responder_dh,
+        &responder_spk,
+        &mut opks,
+        &initiated.message.bytes,
+    )
+    .unwrap();
+    assert_eq!(responded.initial_payload, payload);
+}
+
+/// A commit declaring a four-billion-entry path must be a parse error, not
+/// a reservation. Built by patching a real commit's `path_len` in place,
+/// walking the signed layout exactly; asserting the value found there
+/// proves the right field is patched (§0.5: validate the instrument).
+#[test]
+fn a_commit_declaring_an_absurd_path_length_is_rejected_without_reserving_for_it() {
+    let founder = Identity::generate();
+    let joiner = Identity::generate();
+    let joiner_kp = MyLeafKeyPackage::generate(&joiner);
+    let mut group = Group::create(&founder, 4).unwrap();
+    let (commit, _welcome) = group.propose_add(&founder, joiner_kp.public()).unwrap();
+    let bytes = commit.to_bytes();
+
+    let path_len_offset = commit_path_len_offset(&bytes);
+    let declared = u32::from_be_bytes(
+        bytes[path_len_offset..path_len_offset + 4]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(
+        declared, 2,
+        "instrument check: a 4-leaf group's direct path from leaf 0 is 2 nodes; \
+         if this is not 2 the test is patching the wrong field"
+    );
+
+    let mut patched = bytes;
+    patched[path_len_offset..path_len_offset + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+    assert!(
+        Commit::from_bytes(&patched).is_err(),
+        "an update path longer than the whole message must not parse"
+    );
+}
+
+/// Walks a serialized `Commit` to `path_len` inside its signed section,
+/// mirroring `Commit::write`: `var(signed) || HybridSignature`, where
+/// `signed` is
+/// `CONTEXT || group_id(16) || from_epoch(8) || sender_leaf(4) || op || path_len(4) || nodes`.
+fn commit_path_len_offset(bytes: &[u8]) -> usize {
+    const CONTEXT: &[u8] = b"novachannel group v1 commit";
+    const VAR_PREFIX: usize = 8;
+
+    let mut pos = VAR_PREFIX; // past the signed section's own length prefix
+    pos += CONTEXT.len() + 16 + 8 + 4;
+    assert_eq!(bytes[pos], 0, "expected a GroupOp::Add tag");
+    pos += 1 + 4; // op tag + leaf_index
+
+    // LeafKeyPackage := PublicIdentity | NodePublicKey | HybridSignature
+    let skip_var = |pos: &mut usize| {
+        let len = u64::from_be_bytes(bytes[*pos..*pos + VAR_PREFIX].try_into().unwrap()) as usize;
+        *pos += VAR_PREFIX + len;
+    };
+    pos += 32; // PublicIdentity.ed25519
+    skip_var(&mut pos); // PublicIdentity.ml_dsa
+    pos += 32; // NodePublicKey.dh_public
+    skip_var(&mut pos); // NodePublicKey.kem_public
+    pos += 64; // pop.ed25519
+    skip_var(&mut pos); // pop.ml_dsa
+
+    pos
+}
+
+/// The same unbounded-count defect in `SignedDeviceList`, reached through
+/// the public byte serialization this change also added.
+#[test]
+fn a_device_list_declaring_an_absurd_entry_count_is_rejected_without_reserving_for_it() {
+    let account = Identity::generate();
+    let device_identity = Identity::generate();
+    let device_dh = DhIdentity::generate();
+    let list = SignedDeviceList::issue(
+        &account,
+        1,
+        vec![DeviceListEntry {
+            device_id: DeviceId(1),
+            identity: device_identity.public(),
+            dh_identity: device_dh.public(),
+        }],
+    );
+    let bytes = list.to_bytes();
+
+    // Layout: version(8) || count(4) || entries... — patch the count.
+    let declared = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
+    assert_eq!(declared, 1, "instrument check: one entry was issued");
+
+    let mut patched = bytes.clone();
+    patched[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
+    assert!(SignedDeviceList::from_bytes(&patched).is_err());
+
+    // And the honest list still round-trips and verifies.
+    let parsed = SignedDeviceList::from_bytes(&bytes).unwrap();
+    assert_eq!(parsed.version, 1);
+    parsed.verify(&account.public()).unwrap();
+    assert!(parsed.verify(&Identity::generate().public()).is_err());
+}
+
+/// One value, one encoding: appending bytes to a valid message must fail at
+/// every public deserializer, so deduplicating or pinning by bytes can't be
+/// fooled.
+#[test]
+fn trailing_bytes_are_rejected_at_every_public_deserialization_entry_point() {
+    let founder = Identity::generate();
+    let joiner = Identity::generate();
+    let joiner_kp = MyLeafKeyPackage::generate(&joiner);
+    let mut group = Group::create(&founder, 4).unwrap();
+    let (commit, welcome) = group.propose_add(&founder, joiner_kp.public()).unwrap();
+
+    let identity = Identity::generate();
+    let dh = DhIdentity::generate();
+    let spk = SignedPreKey::generate(&identity);
+    let bundle = PreKeyBundle::build(identity.public(), &dh, &spk, None);
+    let account = Identity::generate();
+    let list = SignedDeviceList::issue(
+        &account,
+        1,
+        vec![DeviceListEntry {
+            device_id: DeviceId(1),
+            identity: identity.public(),
+            dh_identity: dh.public(),
+        }],
+    );
+
+    let with_trailing = |mut b: Vec<u8>| {
+        b.push(0xFF);
+        b
+    };
+
+    assert!(Commit::from_bytes(&with_trailing(commit.to_bytes())).is_err());
+    assert!(Welcome::from_bytes(&with_trailing(welcome.to_bytes())).is_err());
+    assert!(PreKeyBundle::from_bytes(&with_trailing(bundle.to_bytes())).is_err());
+    assert!(SignedDeviceList::from_bytes(&with_trailing(list.to_bytes())).is_err());
+    assert!(LeafKeyPackage::from_bytes(&with_trailing(joiner_kp.public().to_bytes())).is_err());
+
+    // ...and each still parses without the extra byte, so the assertions
+    // above are about the trailing byte and not about a broken encoding.
+    assert!(Commit::from_bytes(&commit.to_bytes()).is_ok());
+    assert!(Welcome::from_bytes(&welcome.to_bytes()).is_ok());
+    assert!(PreKeyBundle::from_bytes(&bundle.to_bytes()).is_ok());
+    assert!(SignedDeviceList::from_bytes(&list.to_bytes()).is_ok());
+    assert!(LeafKeyPackage::from_bytes(&joiner_kp.public().to_bytes()).is_ok());
+}
+
+/// Every remaining fixed-width count is bounded where values enter it, so
+/// none can truncate like the `u16` prefix did. These are caller
+/// configuration errors, hence refusals rather than parse errors, but they
+/// are checked.
+#[test]
+fn counts_that_go_on_the_wire_as_fixed_width_are_bounded_where_they_enter() {
+    use novachannel::group::MAX_CAPACITY;
+    use novachannel::multidevice::MAX_DEVICES;
+
+    let founder = Identity::generate();
+
+    // A group capacity larger than any joiner would accept a welcome for
+    // must not be creatable either — the two ends used to disagree.
+    assert!(Group::create(&founder, MAX_CAPACITY * 2).is_err());
+    assert!(Group::create(&founder, MAX_CAPACITY.next_power_of_two()).is_ok());
+
+    // And the device-list count, whose `u32` appears both in the signed
+    // bytes and on the wire.
+    let dh = DhIdentity::generate();
+    let entry = DeviceListEntry {
+        device_id: DeviceId(1),
+        identity: founder.public(),
+        dh_identity: dh.public(),
+    };
+    let at_limit = vec![entry; MAX_DEVICES];
+    let list = SignedDeviceList::issue(&founder, 1, at_limit);
+    assert_eq!(list.entries().len(), MAX_DEVICES);
+    let parsed = SignedDeviceList::from_bytes(&list.to_bytes()).unwrap();
+    assert_eq!(parsed.entries().len(), MAX_DEVICES);
+    parsed.verify(&founder.public()).unwrap();
+}
+
+/// The other half: issuing past the bound refuses rather than truncating
+/// the `u32` count in the signed bytes and wire format.
+#[test]
+#[should_panic(expected = "may name at most")]
+fn issuing_a_device_list_past_the_bound_refuses_rather_than_truncating() {
+    use novachannel::multidevice::MAX_DEVICES;
+    let account = Identity::generate();
+    let dh = DhIdentity::generate();
+    let entry = DeviceListEntry {
+        device_id: DeviceId(1),
+        identity: account.public(),
+        dh_identity: dh.public(),
+    };
+    SignedDeviceList::issue(&account, 1, vec![entry; MAX_DEVICES + 1]);
+}

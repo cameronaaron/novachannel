@@ -1,0 +1,43 @@
+name: ClusterFuzzLite batch fuzzing
+
+# Unattended fuzzing every 6 hours, an hour per target, with the corpus kept
+# between runs as Actions artifacts. OSS-Fuzz requires a significant user
+# base; ClusterFuzzLite needs no acceptance. See crates/core/fuzz/README.md.
+
+on:
+  schedule:
+    - cron: "0 0/6 * * *"
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: "Seconds to fuzz each target"
+        required: false
+        default: "3600"
+
+permissions: read-all
+
+jobs:
+  BatchFuzzing:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer:
+          - address
+    steps:
+      - name: Build fuzzers (${{ matrix.sanitizer }})
+        id: build
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: rust
+          sanitizer: ${{ matrix.sanitizer }}
+
+      - name: Run fuzzers (${{ matrix.sanitizer }})
+        id: run
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: ${{ github.event.inputs.fuzz_seconds || 3600 }}
+          mode: "batch"
+          sanitizer: ${{ matrix.sanitizer }}
+          output-sarif: true
